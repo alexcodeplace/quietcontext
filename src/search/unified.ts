@@ -40,6 +40,18 @@ export interface SearchAllSourcesOpts {
   configDir?: string;
   /** Detected platform adapter — used for adapter-aware auto-memory. */
   adapter?: AutoMemoryAdapter;
+  /**
+   * Per-project scope for the ContentStore filter (#737). Only honoured
+   * when a `sessionDB` is also supplied (the 2-step IN-clause needs the
+   * SessionDB to translate `project_dir` → list of session ids).
+   *
+   *   - `undefined` — no project filter, today's behaviour.
+   *   - `null`      — cross-project recall in shared-DB mode (also no filter).
+   *   - `string`    — restrict ContentStore results to chunks attributed to
+   *                   session ids whose events match this `project_dir`,
+   *                   plus legacy `session_id=''` chunks (public surface).
+   */
+  projectScope?: string | null;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -67,6 +79,7 @@ export function searchAllSources(opts: SearchAllSourcesOpts): UnifiedSearchResul
     projectDir,
     configDir,
     adapter,
+    projectScope,
   } = opts;
 
   const results: UnifiedSearchResult[] = [];
@@ -75,9 +88,30 @@ export function searchAllSources(opts: SearchAllSourcesOpts): UnifiedSearchResul
   // (we don't know exact indexing time, but all content is from current session)
   const sessionStartTime = new Date().toISOString();
 
+  // ── Project scope (#737) ──
+  // Resolve the per-project session-id allow-set ONCE, before the
+  // ContentStore call. `projectScope === null` means cross-project recall —
+  // an explicit "no filter" choice surfaced by the ctx_search caller — and
+  // `undefined` falls back to today's unfiltered behaviour.
+  let sessionIdAllowSet: Set<string> | undefined;
+  if (typeof projectScope === "string" && sessionDB) {
+    try {
+      sessionIdAllowSet = new Set(sessionDB.getSessionIdsForProject(projectScope));
+    } catch (e) {
+      if (DEBUG) process.stderr.write(`[ctx] getSessionIdsForProject failed: ${e}\n`);
+    }
+  }
+
   // ── Source 1: ContentStore (always, both modes) ──
   try {
-    const storeResults = store.searchWithFallback(query, limit, source, contentType);
+    const storeResults = store.searchWithFallback(
+      query,
+      limit,
+      source,
+      contentType,
+      "like",
+      sessionIdAllowSet,
+    );
     results.push(
       ...storeResults.map((r: SearchResult) => ({
         title: r.title,

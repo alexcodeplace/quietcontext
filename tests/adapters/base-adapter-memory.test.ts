@@ -47,7 +47,7 @@ describe("BaseAdapter memory/config defaults", () => {
   });
 });
 
-// Issue #649 — CONTEXT_MODE_DATA_DIR universal storage override.
+// Issue #649 — QUIET_CONTEXT_DATA_DIR universal storage override.
 //
 // Several adapters (Pi, OMP, Gemini CLI, Codex, Cursor, …) hardcode their
 // storage root to `~/.<platform>/context-mode/sessions/` with no env-var
@@ -55,7 +55,7 @@ describe("BaseAdapter memory/config defaults", () => {
 // context-mode storage at a writable volume without patching source or
 // changing the host platform's own config-dir variable.
 //
-// Contract for CONTEXT_MODE_DATA_DIR:
+// Contract for QUIET_CONTEXT_DATA_DIR:
 //   - Unset / empty / whitespace-only → use platform-native default (no-op).
 //   - Set                              → `<DATA_DIR>/context-mode/sessions/`
 //                                        for getSessionDir(), and
@@ -65,8 +65,8 @@ describe("BaseAdapter memory/config defaults", () => {
 //     (~ expands to homedir, relative paths resolve against cwd).
 //   - getConfigDir() is platform-native (settings.json, hooks.json) and is
 //     NOT relocated — only context-mode-owned state moves.
-describe("BaseAdapter — CONTEXT_MODE_DATA_DIR override (#649)", () => {
-  const ENV_KEY = "CONTEXT_MODE_DATA_DIR";
+describe("BaseAdapter — QUIET_CONTEXT_DATA_DIR override (#649)", () => {
+  const ENV_KEY = "QUIET_CONTEXT_DATA_DIR";
   let original: string | undefined;
 
   beforeEach(() => {
@@ -79,7 +79,7 @@ describe("BaseAdapter — CONTEXT_MODE_DATA_DIR override (#649)", () => {
     else process.env[ENV_KEY] = original;
   });
 
-  it("getSessionDir uses CONTEXT_MODE_DATA_DIR root when set (overrides homedir)", () => {
+  it("getSessionDir uses QUIET_CONTEXT_DATA_DIR root when set (overrides homedir)", () => {
     const adapter = new TestAdapter([".pi"]);
     process.env[ENV_KEY] = "/tmp/custom-data";
     expect(adapter.getSessionDir()).toBe(
@@ -123,7 +123,7 @@ describe("BaseAdapter — CONTEXT_MODE_DATA_DIR override (#649)", () => {
     expect(adapter.getMemoryDir()).toBe(join(homedir(), ".pi", "memory"));
   });
 
-  it("getConfigDir is NOT relocated by CONTEXT_MODE_DATA_DIR (platform-native settings stay put)", () => {
+  it("getConfigDir is NOT relocated by QUIET_CONTEXT_DATA_DIR (platform-native settings stay put)", () => {
     const adapter = new TestAdapter([".pi"]);
     process.env[ENV_KEY] = "/tmp/custom-data";
     // settings.json belongs with the platform install, not with context-mode
@@ -169,10 +169,10 @@ describe("BaseAdapter — adapter-storage interface narrowing (C2)", () => {
 //   - Two distinct projectDirs                  → two distinct paths
 //   - Same projectDir on repeat calls           → identical path (deterministic)
 //
-// `CONTEXT_MODE_DATA_DIR` continues to relocate the root; the hash suffix
+// `QUIET_CONTEXT_DATA_DIR` continues to relocate the root; the hash suffix
 // sits underneath whichever root is active.
 describe("BaseAdapter — getMemoryDir project scoping (#663)", () => {
-  const ENV_KEY = "CONTEXT_MODE_DATA_DIR";
+  const ENV_KEY = "QUIET_CONTEXT_DATA_DIR";
   let original: string | undefined;
 
   beforeEach(() => {
@@ -215,7 +215,7 @@ describe("BaseAdapter — getMemoryDir project scoping (#663)", () => {
     expect(adapter.getMemoryDir()).toBe(join(homedir(), ".claude", "memory"));
   });
 
-  it("hash suffix lives under CONTEXT_MODE_DATA_DIR root when env is set", () => {
+  it("hash suffix lives under QUIET_CONTEXT_DATA_DIR root when env is set", () => {
     const adapter = new TestAdapter([".pi"]);
     process.env[ENV_KEY] = "/tmp/custom-data";
     const projectDir = "/Users/test/projects/delta";

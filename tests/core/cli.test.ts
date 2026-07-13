@@ -1187,13 +1187,13 @@ describe("start.mjs CLI self-heal", () => {
   test("start.mjs invokes assertPluginCacheIntegrity with stderr + exit 2 on failure (Algo-D4)", () => {
     // Wiring check on the bootstrapper itself: the start.mjs body must
     // import the helper, call it, and on `!ok` write a structured stderr
-    // block (CONTEXT_MODE_PARTIAL_INSTALL) then process.exit(2). The
+    // block (QUIET_CONTEXT_PARTIAL_INSTALL) then process.exit(2). The
     // structured marker lets external monitoring grep for the exact
     // failure mode without parsing free-form text.
     const src = readFileSync(resolve(ROOT, "start.mjs"), "utf-8");
     expect(src).toContain("plugin-cache-integrity.mjs");
     expect(src).toContain("assertPluginCacheIntegrity");
-    expect(src).toContain("CONTEXT_MODE_PARTIAL_INSTALL");
+    expect(src).toContain("QUIET_CONTEXT_PARTIAL_INSTALL");
     expect(src).toMatch(/process\.exit\(\s*2\s*\)/);
   });
 

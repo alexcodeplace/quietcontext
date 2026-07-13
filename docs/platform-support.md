@@ -282,7 +282,7 @@ Google Antigravity is an AI-powered IDE by Google/DeepMind. It shares the `~/.ge
 
 **Detection:**
 - Auto-detected via MCP protocol handshake (`clientInfo.name: "antigravity-client"`)
-- Fallback: `CONTEXT_MODE_PLATFORM=antigravity` environment variable override
+- Fallback: `QUIET_CONTEXT_PLATFORM=antigravity` environment variable override
 
 **Routing Instructions:**
 - `GEMINI.md` auto-written at project root on first MCP server startup
@@ -603,7 +603,7 @@ The hook adapter exists only to satisfy the interface contract — every parser 
 
 **Detection:**
 - Auto-detected via the presence of `~/.config/zed/`
-- Override via `CONTEXT_MODE_PLATFORM=zed`
+- Override via `QUIET_CONTEXT_PLATFORM=zed`
 
 **Notes / Caveats:**
 - No hook adapter implies no automatic routing — the model must follow AGENTS.md voluntarily
@@ -643,7 +643,7 @@ The hook adapter exists only to satisfy the interface contract — every parser 
 **Detection (priority order, listed BEFORE `pi` so OMP is never misclassified):**
 - `OMP_PROCESSING_AGENT_DIR` env var (high confidence)
 - `~/.omp/` directory presence (medium confidence)
-- `CONTEXT_MODE_PLATFORM=omp` override
+- `QUIET_CONTEXT_PLATFORM=omp` override
 
 **Notes / Caveats:**
 - No hook adapter implies no automatic routing — the model must follow `PI.md` voluntarily (~60% compliance)

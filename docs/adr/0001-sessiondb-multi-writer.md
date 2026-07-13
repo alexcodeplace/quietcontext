@@ -25,7 +25,7 @@ disk SQLite content store unbounded the WAL — readers held shared locks
 indefinitely so `wal_checkpoint(TRUNCATE)` never fired, the only
 existing truncation path is `closeDB`'s checkpoint on graceful exit
 (which #559's zombie servers never reached), and the result was
-238MB+ WAL files plus `ctx_search` hangs.
+238MB+ WAL files plus `search` hangs.
 
 v1.0.129 added a tmpdir skip-gate to both primitives because the test
 suite (which opens many DBs on tmp paths in the same process) tripped

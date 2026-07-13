@@ -36,7 +36,7 @@ function resolveClaudeConfigDir() {
 // the env auto-set in that case; getProjectDir() defends a second time inside
 // server.ts via resolveProjectDir(). See src/util/project-dir.ts.
 const isPluginInstallPath = (p) =>
-  /[/\\]\.claude[/\\]plugins[/\\](cache|marketplaces)[/\\]/.test(p);
+  /[/\\]\.(claude|codex)[/\\]plugins[/\\](cache|marketplaces)[/\\]/.test(p);
 const safeOriginalCwd = isPluginInstallPath(originalCwd) ? null : originalCwd;
 
 if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
@@ -46,8 +46,8 @@ if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
 // Platform-agnostic project dir — guaranteed to be set for ALL platforms.
 // Adapters may set their own env var (GEMINI_PROJECT_DIR, etc.) but this
 // is the universal fallback so server.ts getProjectDir() never relies on cwd().
-if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
-  process.env.CONTEXT_MODE_PROJECT_DIR = safeOriginalCwd;
+if (!process.env.QUIET_CONTEXT_PROJECT_DIR && safeOriginalCwd) {
+  process.env.QUIET_CONTEXT_PROJECT_DIR = safeOriginalCwd;
 }
 
 // Routing instructions file auto-write DISABLED for all platforms (#158, #164).
@@ -77,18 +77,60 @@ if (typeof globalThis.Bun === "undefined" && process.platform === "linux") {
       stdio: ["pipe", "inherit", "inherit"],
       env: process.env,
     });
+    const _keepAlive = setInterval(() => {}, 2147483647);
+    let _escTerm;
+    let _escKill;
+    let _tearingDown = false;
+    // #862: propagate parent death to the Bun child. When the MCP client (e.g.
+    // Claude Code) exits, its end of our stdin pipe closes. The original proxy
+    // ignored that ("end" was a no-op) and parked forever — so the child was
+    // never told the session was gone: its stdin (this pipe) stayed open and its
+    // direct parent (us) stayed alive, defeating BOTH paths of the child's
+    // lifecycle guard (the stdio-EOF assist AND the ppid poll). The pair
+    // orphaned to init and pinned a CPU core indefinitely. We now forward EOF
+    // (graceful self-reap via the child's own watchdog), then escalate
+    // SIGTERM → SIGKILL so a wedged child can never outlive its client. Still
+    // re-execs under Bun first, so #564's SIGSEGV avoidance is untouched.
+    const teardown = () => {
+      if (_tearingDown) return;
+      _tearingDown = true;
+      clearInterval(_keepAlive);
+      try {
+        if (child.stdin && !child.stdin.destroyed) child.stdin.end();
+      } catch {}
+      // NOT unref'd: these short-lived timers are what hold the event loop
+      // open through the teardown window (≤5 s). Liveness must not depend on
+      // the top-level `await new Promise()` below surviving a future refactor
+      // — if escalation is ever skipped, #862's orphan returns. child.on(
+      // "exit") clears both the instant the child reaps cleanly.
+      _escTerm = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+      }, 2000);
+      _escKill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        process.exit(0);
+      }, 5000);
+    };
     process.stdin.on("data", (chunk) => {
       if (!child.stdin.destroyed) child.stdin.write(chunk);
     });
-    process.stdin.on("end", () => {});
-    const _keepAlive = setInterval(() => {}, 2147483647);
+    // EOF, pipe close, or pipe error all mean the client is gone — tear down.
+    process.stdin.on("end", teardown);
+    process.stdin.on("close", teardown);
+    process.stdin.on("error", teardown);
     child.on("exit", (code) => {
       clearInterval(_keepAlive);
+      if (_escTerm) clearTimeout(_escTerm);
+      if (_escKill) clearTimeout(_escKill);
       process.exit(code ?? 0);
     });
     // Prevent rest of start.mjs from running — child owns the MCP session.
     process.stdin.resume();
-    await new Promise(() => {}); // park this process forever
+    await new Promise(() => {}); // park until the child exits (see child 'exit')
   }
 }
 
@@ -121,11 +163,33 @@ if (cacheMatch) {
       });
       const newest = dirs[dirs.length - 1];
       if (newest && newest !== myVersion) {
+        // Issue #727: normalize hooks.json + plugin.json in the newest version
+        // dir BEFORE updating the registry. CC's auto-update carries forward
+        // files from the old cache dir, including hooks.json and plugin.json
+        // with absolute paths baked to the old version. start.mjs's Self-heal
+        // Layer 5 would catch this, but plugin.json's stale mcpServers path
+        // prevents the new start.mjs from ever booting — chicken-and-egg.
+        // Fix: normalize from HERE (the old start.mjs that CC CAN still launch)
+        // so the new dir's files are correct before the next session reads them.
+        const newestDir = resolve(cacheParent, newest);
+        try {
+          // #713: use narrow helper — wide normalizeHooksOnStartup would
+          // write plugin.json on the NEW cache dir, the exact #711 poison
+          // vector. Only hooks.json needs the placeholder→absolute rewrite
+          // pre-bump to close the first-hook-fire window.
+          const { normalizeHooksJsonOnly } = await import("./hooks/normalize-hooks.mjs");
+          normalizeHooksJsonOnly({
+            pluginRoot: newestDir,
+            nodePath: process.execPath,
+            platform: process.platform,
+          });
+        } catch { /* best effort — never block startup */ }
+
         const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
         for (const [key, entries] of Object.entries(ip.plugins || {})) {
           if (key !== "context-mode@context-mode") continue;
           for (const entry of entries) {
-            entry.installPath = resolve(cacheParent, newest);
+            entry.installPath = newestDir;
             entry.version = newest;
             entry.lastUpdated = new Date().toISOString();
           }
@@ -253,11 +317,11 @@ try {
   if (existsSync(oldBashHook)) {
     try { unlinkSync(oldBashHook); } catch {}
   }
-  if (!existsSync(healHookPath)) {
-    if (!existsSync(globalHooksDir)) mkdirSync(globalHooksDir, { recursive: true });
-    const healScript = `#!/usr/bin/env node
+  if (!existsSync(globalHooksDir)) mkdirSync(globalHooksDir, { recursive: true });
+  const healScript = `#!/usr/bin/env node
 // context-mode plugin cache self-heal (auto-deployed)
 // Fixes anthropics/claude-code#46915: auto-update breaks CLAUDE_PLUGIN_ROOT
+// Issue #727: also normalizes stale version paths in existing installPaths
 // Honors CLAUDE_CONFIG_DIR (#577) — checked at this script's runtime so users
 // who set CLAUDE_CONFIG_DIR after install still get healed correctly.
 // Pure Node.js — no bash/shell dependency.
@@ -274,8 +338,25 @@ try{
     if(k!=="context-mode@context-mode")continue;
     for(const e of es){
       const p=e.installPath;
-      if(!p||existsSync(p))continue;
+      if(!p)continue;
       if(!resolve(p).startsWith(cacheRoot+sep))continue;
+      if(existsSync(p)){
+        // Issue #727: normalize stale version paths in existing installPaths.
+        // CC's auto-update can carry forward hooks.json/plugin.json with paths
+        // baked to a previous version dir. Import normalize-hooks from the
+        // installPath itself and let it detect + rewrite stale segments.
+        try{
+          // #713: narrow helper only — installPath belongs to a different
+          // version's cache dir; writing plugin.json there is the #711 vector.
+          const nhPath=join(p,"hooks","normalize-hooks.mjs");
+          if(existsSync(nhPath)){
+            const mod=await import(nhPath);
+            const fn=mod.normalizeHooksJsonOnly||mod.normalizeHooksOnStartup;
+            if(fn)fn({pluginRoot:p,nodePath:process.execPath,platform:process.platform});
+          }
+        }catch{}
+        continue;
+      }
       const parent=dirname(p);
       if(!existsSync(parent))continue;
       try{if(lstatSync(p).isSymbolicLink())unlinkSync(p)}catch{}
@@ -287,6 +368,13 @@ try{
   }
 }catch{}
 `;
+  // Deploy or update the heal hook when content changes (not just when missing).
+  // Allows new heal logic (e.g. #727 path normalization) to propagate on next boot.
+  let needsWrite = !existsSync(healHookPath);
+  if (!needsWrite) {
+    try { needsWrite = readFileSync(healHookPath, "utf-8") !== healScript; } catch { needsWrite = true; }
+  }
+  if (needsWrite) {
     writeFileSync(healHookPath, healScript, { mode: 0o755 });
   }
 
@@ -339,27 +427,9 @@ try{
 
 // ── Self-heal Layer 5: Windows hooks.json + plugin.json normalization (#378) ──
 // Static committed files use ${CLAUDE_PLUGIN_ROOT} placeholder + bare `node`.
-// On Windows + Claude Code this hits cjs/loader:1479 because:
-//   1. bare `node` may not resolve via PATH (Git Bash, see #369)
-//   2. ${CLAUDE_PLUGIN_ROOT} can hit MSYS path mangling (#372)
-//   3. backslash paths corrupt under shell quoting
-// Rewrites placeholders to absolute paths using process.execPath (Datadog
-// model). Idempotent — only writes when needed. Survives upgrades because
-// it runs at every MCP boot.
-//
-// Skip under vitest: server.test.ts spawns this script from the repo root,
-// and a mutated .claude-plugin/plugin.json poisons sibling tests that read
-// the file (cli.test.ts). VITEST is inherited by spawned subprocesses.
-if (!process.env.VITEST) {
-  try {
-    const { normalizeHooksOnStartup } = await import("./hooks/normalize-hooks.mjs");
-    normalizeHooksOnStartup({
-      pluginRoot: __dirname,
-      nodePath: process.execPath,
-      platform: process.platform,
-    });
-  } catch { /* best effort — never block server startup */ }
-}
+// Keep plugin manifests immutable at runtime. Codex launches the fork with
+// explicit paths, so rewriting hooks/plugin metadata on every MCP boot only
+// creates noisy filesystem mutations and can poison later tests or sessions.
 
 // Ensure native dependencies + ABI compatibility (shared with hooks via ensure-deps.mjs)
 // ensure-deps handles better-sqlite3 install + ABI cache/rebuild automatically (#148, #203)
@@ -388,21 +458,51 @@ import "./hooks/ensure-deps.mjs";
   const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
   const IS_WIN32 = process.platform === "win32";
   const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
+  const NPM_FLAGS = ["--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"];
+  // #861: on Windows the npm shim is `npm.cmd`, which needs `shell: true` to
+  // run — but Node DROPS the `cwd` option when `shell: true`, so the spawned
+  // cmd.exe inherits an arbitrary working dir (C:\Windows under Claude Code).
+  // `npm install` then tries to create `C:\Windows\node_modules` → EPERM on
+  // every boot, and a cmd.exe window flashes each time. Prefer running npm's
+  // own CLI through node directly (no `.cmd` shim, no shell): `shell: false`
+  // honors `cwd` and `windowsHide` suppresses the console window. Fall back to
+  // the shim only when npm-cli.js can't be located, so a working host (e.g. a
+  // POSIX layout where npm-cli.js isn't beside node) can never regress.
+  const NPM_CLI_JS = resolve(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  const useNodeCli = existsSync(NPM_CLI_JS);
   for (const pkg of NPM_INSTALL_BG_PKGS) {
     if (existsSync(resolve(__dirname, "node_modules", pkg))) continue;
     try {
-      const child = spawn(
-        NPM_BIN,
-        ["install", pkg, "--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"],
-        {
-          cwd: __dirname,
-          stdio: "ignore",
-          detached: true,
-          // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
-          shell: IS_WIN32,
-        },
-      );
-      child.on("error", () => { /* best effort — npm missing, broken cache, etc. */ });
+      const child = useNodeCli
+        ? spawn(process.execPath, [NPM_CLI_JS, "install", pkg, ...NPM_FLAGS], {
+            cwd: __dirname,
+            stdio: "ignore",
+            detached: true,
+            shell: false,
+            windowsHide: true,
+          })
+        : spawn(NPM_BIN, ["install", pkg, ...NPM_FLAGS], {
+            cwd: __dirname,
+            stdio: "ignore",
+            detached: true,
+            // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
+            shell: IS_WIN32,
+            windowsHide: true,
+          });
+      // #861: this EPERM was invisible for months behind stdio:"ignore" + an
+      // empty error handler. Surface both spawn failures and non-zero exits.
+      child.on("error", (err) => {
+        process.stderr.write(
+          `[context-mode] background install of ${pkg} failed to spawn: ${err?.message ?? err}\n`,
+        );
+      });
+      child.on("exit", (code) => {
+        if (code) {
+          process.stderr.write(
+            `[context-mode] background install of ${pkg} exited with code ${code}\n`,
+          );
+        }
+      });
       child.unref();
     } catch { /* best effort — never block MCP boot */ }
   }
@@ -415,19 +515,35 @@ if (!existsSync(resolve(__dirname, "cli.bundle.mjs")) && existsSync(resolve(__di
   if (process.platform !== "win32") chmodSync(shimPath, 0o755);
 }
 
+// ── Self-heal partial install from marketplace clone ──
+// Runs BEFORE the Algo-D4 integrity check so a fixable partial install
+// gets repaired rather than just reported. Best-effort and idempotent;
+// the integrity check below remains the authoritative gate that decides
+// whether boot proceeds. See hooks/heal-partial-install.mjs for the
+// failure-mode description and module contract.
+if (!process.env.VITEST) {
+  try {
+    const { healPartialInstallFromMarketplace } = await import(
+      "./hooks/heal-partial-install.mjs"
+    );
+    healPartialInstallFromMarketplace({ pluginRoot: __dirname });
+  } catch { /* best effort, never block boot */ }
+}
+
 // ── Algo-D4: plugin cache integrity check ──
 // Verify boot-critical siblings exist BEFORE importing server.bundle.mjs.
 // Without this, a partial install (#550) gives an opaque downstream
 // stack trace from `import("./server.bundle.mjs")`. With it, we emit a
-// structured CONTEXT_MODE_PARTIAL_INSTALL stderr block + exit 2 so
+// structured QUIET_CONTEXT_PARTIAL_INSTALL stderr block + exit 2 so
 // external monitoring grep + the user both see the actionable signal.
 //
 // Runs AFTER the heal layers above so missing files they can fix
-// (cli.bundle.mjs shim, dangling symlinks) get a chance first. Helper
-// is shared with `ctx doctor` (Algo-D5) — single source of truth so
-// boot + diagnostic agree byte-for-byte. Skipped under VITEST so the
-// repo's own test invocations against in-tree start.mjs don't fail
-// when running before `npm run build` produces the bundles.
+// (cli.bundle.mjs shim, dangling symlinks, partial-install copy from
+// the marketplace clone) get a chance first. Helper is shared with
+// `ctx doctor` (Algo-D5) — single source of truth so boot + diagnostic
+// agree byte-for-byte. Skipped under VITEST so the repo's own test
+// invocations against in-tree start.mjs don't fail when running before
+// `npm run build` produces the bundles.
 if (!process.env.VITEST) {
   try {
     const { assertPluginCacheIntegrity, formatPartialInstallReport } =
@@ -446,7 +562,7 @@ if (!process.env.VITEST) {
     // The helper itself failing is unexpected — keep boot moving rather
     // than blocking on a check infrastructure bug. The downstream
     // import will still surface the actual missing-bundle error.
-    if (process.env.CONTEXT_MODE_DEBUG) {
+    if (process.env.QUIET_CONTEXT_DEBUG) {
       process.stderr.write(`[start.mjs] integrity check skipped: ${err}\n`);
     }
   }

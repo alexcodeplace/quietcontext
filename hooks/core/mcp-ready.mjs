@@ -11,19 +11,29 @@
  * Sentinel path: <tmpRoot>/context-mode-mcp-ready-<MCP_PID>
  * Scan: glob all context-mode-mcp-ready-* files, probe each PID.
  */
-import { readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const SENTINEL_PREFIX = "context-mode-mcp-ready-";
 
 /**
+ * Sentinel freshness window (#844). The MCP server refreshes its sentinel's
+ * mtime every 30s while alive (see `main()` in src/server.ts). A sentinel
+ * touched within this window is treated as a live server even when
+ * `process.kill(pid, 0)` cannot see the PID — e.g. a sandbox sharing /tmp
+ * across an isolated PID namespace, where the live host PID is invisible.
+ * 90s = 3x the server refresh interval, tolerant of scheduler jitter / load.
+ */
+const SENTINEL_FRESH_MS = 90_000;
+
+/**
  * Resolve the temp root — hardcoded /tmp on Unix to avoid TMPDIR mismatch.
- * Tests may override via CONTEXT_MODE_MCP_SENTINEL_DIR to isolate scan from
+ * Tests may override via QUIET_CONTEXT_MCP_SENTINEL_DIR to isolate scan from
  * leftover sentinels in the real /tmp.
  */
 export function sentinelDir() {
-  const override = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+  const override = process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
   if (override && override.length > 0) return override;
   return process.platform === "win32" ? tmpdir() : "/tmp";
 }
@@ -54,23 +64,42 @@ export function sentinelPath() {
  *
  * Handles:
  * - PPID mismatch (WSL2 shell wrappers) — no ppid dependency
- * - Stale sentinels (SIGKILL, OOM) — PID liveness check
+ * - Stale sentinels (SIGKILL, OOM) — PID liveness check + age threshold
  * - TMPDIR mismatch — hardcoded /tmp on Unix
+ * - Shared /tmp across isolated PID namespaces (#844) — a live host PID is
+ *   invisible to `kill(pid, 0)` from a sandbox, so a recently-refreshed
+ *   sentinel is trusted instead of being deleted.
  */
 export function isMCPReady() {
   try {
     const dir = sentinelDir();
     const files = readdirSync(dir).filter(f => f.startsWith(SENTINEL_PREFIX));
+    const now = Date.now();
     for (const f of files) {
       const fullPath = join(dir, f);
+      let pid;
       try {
-        const pid = parseInt(readFileSync(fullPath, "utf8"), 10);
-        if (isNaN(pid)) continue;
-        process.kill(pid, 0); // throws if process doesn't exist
-        return true;
+        pid = parseInt(readFileSync(fullPath, "utf8"), 10);
       } catch {
-        // Dead PID or unreadable — clean up stale sentinel
-        try { unlinkSync(fullPath); } catch {}
+        // Unreadable (torn mid-write) — leave it for the owner / a later scan.
+        continue;
+      }
+      if (isNaN(pid)) continue;
+      try {
+        process.kill(pid, 0); // throws if the PID is not signalable from here
+        return true;          // same-namespace liveness confirmed
+      } catch (err) {
+        // EPERM: the process exists but is owned by another user → alive.
+        if (err && err.code === "EPERM") return true;
+        // ESRCH (or anything else): the PID is invisible from THIS namespace.
+        // That is NOT proof the server is dead — a shared /tmp across isolated
+        // PID namespaces (#844) hides a live host PID. Trust a recently
+        // refreshed sentinel rather than delete a live server's marker.
+        let ageMs = Infinity;
+        try { ageMs = now - statSync(fullPath).mtimeMs; } catch { /* stat failed → treat as stale */ }
+        if (ageMs < SENTINEL_FRESH_MS) return true;
+        // Old AND unprobeable → genuinely stale (crash / OOM / SIGKILL) → clean up.
+        try { unlinkSync(fullPath); } catch { /* best effort */ }
       }
     }
     return false;

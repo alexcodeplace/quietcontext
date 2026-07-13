@@ -16,25 +16,20 @@
  *   - Session dir: ~/.config/opencode/context-mode/sessions/
  */
 
-/** Strip JSONC comments (// and /* *​/) and trailing commas for JSON.parse. */
-function stripJsonComments(str: string): string {
-  return str
-    .replace(/\/\/.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/,(\s*[}\]])/g, "$1");
-}
 import {
   readFileSync,
   writeFileSync,
   mkdirSync,
   copyFileSync,
   accessSync,
+  existsSync,
   constants,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
+import { stripJsonComments } from "../../util/jsonc.js";
 
 import type {
   HookAdapter,
@@ -227,39 +222,57 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   // ── Configuration ──────────────────────────────────────
 
   getSettingsPath(): string {
-    // OpenCode uses opencode.json in the project root or .opencode/opencode.json
-    return this.settingsPath ?? resolve(`${this.platform}.json`);
+    if (this.settingsPath) return this.settingsPath;
+    // Edge case (#849): writeSettings() called without a prior readSettings()
+    // (which is what populates this.settingsPath). Never create a `.json` that
+    // would shadow an existing `.jsonc` — OpenCode merges the project-root
+    // `.jsonc` LAST, so it is the authoritative config
+    // (refs/platforms/opencode/packages/opencode/src/config/config.ts:406-408
+    // + paths.ts:15-22). Prefer the existing `.jsonc` as the write target.
+    const jsoncPath = resolve(`${this.platform}.jsonc`);
+    if (existsSync(jsoncPath)) return jsoncPath;
+    return resolve(`${this.platform}.json`);
   }
 
   private paths(): string[] {
+    // `.jsonc` is listed BEFORE `.json` so it is selected as the write target
+    // when both exist (#849). OpenCode loads the project-root `.json` then
+    // `.jsonc` and merges `.jsonc` last — scalars override-last, arrays concat
+    // (refs/platforms/opencode/packages/opencode/src/config/config.ts:406-408,
+    // 258-260 + paths.ts:15-22). The `.jsonc` is therefore the authoritative
+    // file holding the user's real config; a `.json` is often an empty/auto-
+    // generated placeholder. Writing into the placeholder would create a
+    // file that shadows the user's real `.jsonc`. Preferring `.jsonc` for the
+    // write target avoids that silent config destruction. Read order is
+    // irrelevant for the plugin early-return (hasContextModePlugin) path.
     if (this.platform === "kilo") {
       // Kilo runtime accepts `.kilo/`, `.kilocode/`, and `.opencode/` as
       // project config dirs (refs/platforms/kilo/packages/opencode/src/
       // kilocode/config/config.ts:50,408). Mirror that here so context-mode
       // discovers config regardless of which suffix the user adopted.
       return [
-        resolve("kilo.json"),
         resolve("kilo.jsonc"),
-        resolve(".kilo", "kilo.json"),
+        resolve("kilo.json"),
         resolve(".kilo", "kilo.jsonc"),
-        resolve(".kilocode", "kilo.json"),
+        resolve(".kilo", "kilo.json"),
         resolve(".kilocode", "kilo.jsonc"),
-        join(homedir(), ".config", "kilo", "kilo.json"),
+        resolve(".kilocode", "kilo.json"),
         join(homedir(), ".config", "kilo", "kilo.jsonc"),
+        join(homedir(), ".config", "kilo", "kilo.json"),
       ];
     }
     return [
-      resolve("opencode.json"),
       resolve("opencode.jsonc"),
-      resolve(".opencode", "opencode.json"),
+      resolve("opencode.json"),
       resolve(".opencode", "opencode.jsonc"),
-      join(homedir(), ".config", "opencode", "opencode.json"),
+      resolve(".opencode", "opencode.json"),
       join(homedir(), ".config", "opencode", "opencode.jsonc"),
+      join(homedir(), ".config", "opencode", "opencode.json"),
     ];
   }
 
   getSessionDir(): string {
-    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // Issue #649: honor QUIET_CONTEXT_DATA_DIR universal storage override
     // ahead of OpenCode/Kilo's XDG-rooted default. opencode.json + plugin
     // discovery stay under getConfigDir() so OpenCode itself sees its own
     // config in the expected location.

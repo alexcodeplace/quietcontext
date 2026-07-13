@@ -3,11 +3,11 @@
  *
  * For every (host, foreign) pair of registered platforms with host ≠ foreign:
  *   1. With foreign's workspace vars set to "/leak", host's workspace var
- *      (if any) set to "/own", CONTEXT_MODE_PROJECT_DIR set to "/escape":
+ *      (if any) set to "/own", QUIET_CONTEXT_PROJECT_DIR set to "/escape":
  *      - resolveProjectDir({ env, strictPlatform: host }) returns "/own"
  *        if host has a workspace var, else "/escape".
  *   2. Result is NEVER "/leak".
- *   3. With ONLY CONTEXT_MODE_PROJECT_DIR="/escape" set, result is "/escape"
+ *   3. With ONLY QUIET_CONTEXT_PROJECT_DIR="/escape" set, result is "/escape"
  *      for every host (universal escape hatch invariant).
  *
  * Generates 15 × 14 × 3 = 630 assertions from one parameterized test. Adding
@@ -69,7 +69,7 @@ describe("resolveProjectDir matrix — MUST-3 invariant (issue #545)", () => {
         // Build adversarial env: every foreign workspace var = /leak/<name>,
         // host's own first workspace var (if any) = /own, escape = /escape.
         const env: Record<string, string> = {
-          CONTEXT_MODE_PROJECT_DIR: "/escape",
+          QUIET_CONTEXT_PROJECT_DIR: "/escape",
         };
         for (const fv of foreignVars) env[fv] = `/leak/${fv}`;
         if (ownVars.length > 0) env[ownVars[0]] = "/own";
@@ -103,9 +103,9 @@ describe("resolveProjectDir matrix — MUST-3 invariant (issue #545)", () => {
         assertions++;
 
         // Assert 3 (per-pair flavor of the universal escape hatch): with
-        // ONLY CONTEXT_MODE_PROJECT_DIR set, every host returns /escape.
+        // ONLY QUIET_CONTEXT_PROJECT_DIR set, every host returns /escape.
         // Voiding the foreign env to confirm escape hatch is universal.
-        const escapeOnlyEnv: Record<string, string> = { CONTEXT_MODE_PROJECT_DIR: "/escape-only" };
+        const escapeOnlyEnv: Record<string, string> = { QUIET_CONTEXT_PROJECT_DIR: "/escape-only" };
         // To keep the assertion strict per-pair, also confirm foreign's
         // workspace vars don't slip through when escape hatch is the only
         // candidate beyond noise (set foreign's first workspace var as a

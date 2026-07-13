@@ -98,7 +98,7 @@ describe("resolveProjectDir", () => {
     const result = resolveProjectDir({
       env: {
         CLAUDE_PROJECT_DIR: "/Users/x/proj",
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0", // poisoned
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0", // poisoned
       },
       cwd: "/some/cwd",
       pwd: undefined,
@@ -110,7 +110,7 @@ describe("resolveProjectDir", () => {
     const result = resolveProjectDir({
       env: {
         CLAUDE_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
       },
       cwd: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
       pwd: "/Users/x/Server/realproj",
@@ -224,7 +224,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
     expect(result).toBe("/Users/x/own-qwen-project");
   });
 
-  it("strictPlatform=zed (no workspace var) falls through CONTEXT_MODE_PROJECT_DIR > pwd > cwd", () => {
+  it("strictPlatform=zed (no workspace var) falls through QUIET_CONTEXT_PROJECT_DIR > pwd > cwd", () => {
     const result = resolveProjectDir({
       env: {
         // Foreign workspace vars leaked everywhere — none must win.
@@ -236,7 +236,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
         OPENCODE_PROJECT_DIR: "/leak/opencode",
         CURSOR_CWD: "/leak/cursor",
         // Universal escape hatch.
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       },
       cwd: "/some/cwd",
       pwd: undefined,
@@ -248,7 +248,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
   it("non-strict mode preserves the EXACT legacy candidate order (semver lock)", () => {
     // Today's literal order from src/util/project-dir.ts:138-153:
     //   CLAUDE_PROJECT_DIR > GEMINI_PROJECT_DIR > VSCODE_CWD > OPENCODE_PROJECT_DIR
-    //   > PI_PROJECT_DIR > IDEA_INITIAL_DIRECTORY > CURSOR_CWD > CONTEXT_MODE_PROJECT_DIR
+    //   > PI_PROJECT_DIR > IDEA_INITIAL_DIRECTORY > CURSOR_CWD > QUIET_CONTEXT_PROJECT_DIR
     const env = {
       CLAUDE_PROJECT_DIR: "/p1",
       GEMINI_PROJECT_DIR: "/p2",
@@ -257,7 +257,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
       PI_PROJECT_DIR: "/p5",
       IDEA_INITIAL_DIRECTORY: "/p6",
       CURSOR_CWD: "/p7",
-      CONTEXT_MODE_PROJECT_DIR: "/p8",
+      QUIET_CONTEXT_PROJECT_DIR: "/p8",
     };
     // First wins.
     expect(resolveProjectDir({ env, cwd: "/x", pwd: undefined })).toBe("/p1");

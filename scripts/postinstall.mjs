@@ -364,10 +364,20 @@ try { healBetterSqlite3Binding(pkgRoot); } catch { /* best effort — don't bloc
 const TMPDIR_UPGRADE_RE = /[/\\]context-mode-upgrade-\d+[/\\]?$/;
 if (isGlobalInstall() && !TMPDIR_UPGRADE_RE.test(pkgRoot)) {
   try {
+    // #738: probe for Bun ≥1.0 so the post-install hooks.json rewrite picks
+    // the faster runtime where available. Probe failures (e.g. build not
+    // present yet during `npm install` itself) fall through to nodePath.
+    let jsRuntimePath;
+    try {
+      const { resolveHookRuntime } = await import("../build/runtime.js");
+      const r = resolveHookRuntime();
+      if (r.isBun) jsRuntimePath = r.path;
+    } catch { /* best effort — fall through */ }
     const { normalizeHooksOnStartup } = await import("../hooks/normalize-hooks.mjs");
     normalizeHooksOnStartup({
       pluginRoot: pkgRoot,
       nodePath: process.execPath,
+      jsRuntimePath,
       platform: process.platform,
     });
   } catch { /* best effort — never block install */ }

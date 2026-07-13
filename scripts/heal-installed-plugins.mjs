@@ -205,8 +205,6 @@ export function healSettingsEnabledPlugins({ settingsPath, pluginKey }) {
 //   - `src/cli.ts` upgrade() (post-bump)
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Matches `<sep>context-mode-upgrade-<digits><sep>`. OS-agnostic. */
-const TMPDIR_UPGRADE_RE = /[/\\]context-mode-upgrade-\d+[/\\]/;
 const PLACEHOLDER_ARG = "${CLAUDE_PLUGIN_ROOT}/start.mjs";
 
 /**
@@ -262,10 +260,13 @@ export function healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKe
   const before = ours.args;
   const after = before.map((a) => {
     if (typeof a !== "string") return a;
-    // Detect tmpdir-prefixed `context-mode-upgrade-<digits>` paths and
-    // rewrite to the literal placeholder that survives upgrades. Only
-    // rewrites when the trailing component is `start.mjs` (our entrypoint).
-    if (TMPDIR_UPGRADE_RE.test(a) && /[/\\]start\.mjs$/.test(a)) {
+    // Already the placeholder — nothing to heal.
+    if (a === PLACEHOLDER_ARG) return a;
+    // Issue #711: any absolute path ending in start.mjs should be the
+    // placeholder. Catches tmpdir paths (context-mode-upgrade-<digits>)
+    // AND stale versioned cache-dir paths (.../1.0.103/start.mjs) that
+    // normalizeHooksOnStartup baked in during a prior upgrade.
+    if (/[/\\]start\.mjs$/.test(a)) {
       return PLACEHOLDER_ARG;
     }
     return a;
@@ -369,14 +370,16 @@ export function healMcpJsonArgs({ pluginRoot, pluginCacheRoot, pluginKey }) {
   const before = ours.args;
   const after = before.map((a) => {
     if (typeof a !== "string") return a;
+    // Already the placeholder — nothing to heal.
+    if (a === PLACEHOLDER_ARG) return a;
     // Drift shape #1 (issue #531 / commit aea633c): bare relative `./start.mjs`.
-    // Resolved against session CWD (not pluginRoot) → MODULE_NOT_FOUND.
     if (a === "./start.mjs" || a === "start.mjs") {
       return PLACEHOLDER_ARG;
     }
-    // Drift shape #2 (mirror of healPluginJsonMcpServers / #523):
-    // tmpdir-prefixed `<...>/context-mode-upgrade-<digits>/start.mjs`.
-    if (TMPDIR_UPGRADE_RE.test(a) && /[/\\]start\.mjs$/.test(a)) {
+    // Issue #711: any absolute path ending in start.mjs should be the
+    // placeholder. Catches tmpdir paths AND stale versioned cache-dir
+    // paths (.../1.0.103/start.mjs) from prior upgrades.
+    if (/[/\\]start\.mjs$/.test(a)) {
       return PLACEHOLDER_ARG;
     }
     return a;
@@ -430,6 +433,18 @@ export function healClaudeJsonMcpArgs({ dotClaudeJsonPath, pluginCacheParent, ne
   }
 
   const cacheParentFwd = pluginCacheParent.replace(/\\/g, "/");
+  // Post-resolve containment on newArg. ~/.claude.json is locally user-
+  // writable (same trust boundary as installed_plugins.json), and the
+  // `suffix` slice is derived from arg strings inside the existing config.
+  // A crafted arg like
+  //   .../cache/<owner>/<plugin>/1.0.0/../../../evil/start.mjs
+  // slices to suffix="../../../evil/start.mjs", and resolve(newPluginRoot,
+  // suffix) normalizes to an attacker-chosen .mjs path outside the plugin
+  // cache. Writing that path back into ~/.claude.json mutates the mcpServers
+  // args so the next MCP boot spawns from the attacker path. Reject any
+  // suffix that escapes newPluginRoot.
+  const newPluginRootResolved = resolve(newPluginRoot);
+  const newPluginRootWithSep = newPluginRootResolved + sep;
 
   let mutated = false;
   for (const srv of Object.values(servers)) {
@@ -444,6 +459,12 @@ export function healClaudeJsonMcpArgs({ dotClaudeJsonPath, pluginCacheParent, ne
       if (slashIdx < 0) continue;
       const suffix = rel.slice(slashIdx + 1);
       const newArg = resolve(newPluginRoot, suffix);
+      if (
+        newArg !== newPluginRootResolved &&
+        !(newArg + sep).startsWith(newPluginRootWithSep)
+      ) {
+        continue;
+      }
       if (newArg !== arg) {
         srv.args[i] = newArg;
         mutated = true;

@@ -31,7 +31,7 @@ import { resolveClaudeConfigDir } from "../../util/claude-config.js";
 import { checkPluginCacheIntegritySync } from "../../util/plugin-cache-integrity.js";
 
 import {
-  buildNodeCommand,
+  buildHookRuntimeCommand,
   type HookAdapter,
   type HookParadigm,
   type PlatformCapabilities,
@@ -100,7 +100,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   }
 
   getSessionDir(): string {
-    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // Issue #649: honor QUIET_CONTEXT_DATA_DIR universal storage override
     // before falling back to the Claude-rooted default. The override moves
     // ONLY context-mode-owned state; settings.json + CLAUDE_CONFIG_DIR stay
     // intact below.
@@ -117,20 +117,21 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
-    // Algo-D3: every command flows through `buildNodeCommand` (defined in
-    // src/adapters/types.ts), which:
-    //   - quotes both nodePath and scriptPath (#548 — Windows pluginRoots
-    //     with spaces no longer fall through extractHookScriptPath's
-    //     ambiguous-tail fallback),
+    // Algo-D3: every command flows through `buildHookRuntimeCommand`
+    // (defined in src/adapters/types.ts), which:
+    //   - quotes both runtime path and scriptPath (#548 — Windows
+    //     pluginRoots with spaces no longer fall through
+    //     extractHookScriptPath's ambiguous-tail fallback),
     //   - swaps backslashes for forward slashes (#372 MSYS path mangling),
-    //   - uses `process.execPath` instead of bare `node` (#369 PATH
-    //     resolution on Git Bash).
+    //   - resolves the JS runtime via `resolveHookRuntime`: Bun ≥1.0 when
+    //     available, else `process.execPath` (#369 PATH resolution on Git
+    //     Bash, #738 bun cold-start win).
     // Pre-D3 we hand-rolled `node "${pluginRoot}/hooks/X.mjs"` for all
-    // five events; bare `node` made claude-code the lone outlier and
+    // six events; bare `node` made claude-code the lone outlier and
     // dropping the execPath swap re-opened the Windows class. Algo-D3.5
     // (CI invariant in tests/adapters/claude-code.test.ts) locks this in
     // for adapter #16.
-    const preToolUseCommand = buildNodeCommand(`${pluginRoot}/hooks/pretooluse.mjs`);
+    const preToolUseCommand = buildHookRuntimeCommand(`${pluginRoot}/hooks/pretooluse.mjs`);
     const preToolUseMatchers = [...PRE_TOOL_USE_MATCHERS];
 
     return {
@@ -144,7 +145,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: buildNodeCommand(`${pluginRoot}/hooks/posttooluse.mjs`),
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/posttooluse.mjs`),
             },
           ],
         },
@@ -155,7 +156,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: buildNodeCommand(`${pluginRoot}/hooks/precompact.mjs`),
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/precompact.mjs`),
             },
           ],
         },
@@ -166,7 +167,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: buildNodeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`),
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`),
             },
           ],
         },
@@ -177,7 +178,18 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
           hooks: [
             {
               type: "command",
-              command: buildNodeCommand(`${pluginRoot}/hooks/sessionstart.mjs`),
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/sessionstart.mjs`),
+            },
+          ],
+        },
+      ],
+      Stop: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/stop.mjs`),
             },
           ],
         },
@@ -489,10 +501,18 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
       }
     }
 
-    // If plugin hooks.json already covers all required hooks, skip settings.json
-    // registration entirely (Issue #198). Plugin installs don't need settings.json
-    // entries — hooks.json with ${CLAUDE_PLUGIN_ROOT} is the source of truth.
-    const pluginHooks = this.readPluginHooks(pluginRoot);
+    // If plugin hooks.json already covers all required hooks AND context-mode is
+    // actually installed as a Claude Code plugin (present in enabledPlugins), skip
+    // settings.json registration — hooks.json with ${CLAUDE_PLUGIN_ROOT} is the
+    // source of truth for plugin installs (Issue #198).
+    //
+    // Standalone / MacPorts installs are NOT in enabledPlugins. For those, the
+    // hooks/hooks.json shipped in the npm package is never consulted by Claude Code
+    // (it uses ${CLAUDE_PLUGIN_ROOT} which is only set in plugin mode). We must
+    // always write absolute-path hook commands to settings.json in that case.
+    const pluginRegistration = this.checkPluginRegistration();
+    const isPluginInstall = pluginRegistration.status === "pass";
+    const pluginHooks = isPluginInstall ? this.readPluginHooks(pluginRoot) : undefined;
     if (pluginHooks) {
       const allCovered = REQUIRED_HOOKS.every((ht) =>
         this.checkHookType(undefined, pluginHooks, ht),

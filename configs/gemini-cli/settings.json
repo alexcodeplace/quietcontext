@@ -23,6 +23,17 @@
         ]
       }
     ],
+    "AfterModel": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-mode hook gemini-cli aftermodel"
+          }
+        ]
+      }
+    ],
     "PreCompress": [
       {
         "matcher": "",

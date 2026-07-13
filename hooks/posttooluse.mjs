@@ -21,7 +21,7 @@ await runHook(async () => {
     getInputProjectDir,
   } = await import("./session-helpers.mjs");
   const { createSessionLoaders, attributeAndInsertEvents } = await import("./session-loaders.mjs");
-  const { dirname, resolve } = await import("node:path");
+  const { dirname, resolve, basename } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
   const { readFileSync, unlinkSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -71,12 +71,23 @@ await runHook(async () => {
         const colonIdx = rejectedData.indexOf(":");
         const rejTool = colonIdx > 0 ? rejectedData.slice(0, colonIdx) : rejectedData;
         const rejReason = colonIdx > 0 ? rejectedData.slice(colonIdx + 1) : "denied";
-        db.insertEvent(sessionId, {
-          type: "rejected",
-          category: "rejected-approach",
-          data: `${rejTool}: ${rejReason}`,
-          priority: 2,
-        }, "PreToolUse");
+        // v1.0.160: route through attributeAndInsertEvents so the bridge wire
+        // receives this event too. db.insertEvent only writes locally — the
+        // dashboard's rejection-rate widget needs the platform row.
+        attributeAndInsertEvents(
+          db,
+          sessionId,
+          [{
+            type: "rejected",
+            category: "rejected-approach",
+            data: `${rejTool}: ${rejReason}`,
+            priority: 2,
+          }],
+          input,
+          projectDir,
+          "PreToolUse",
+          resolveProjectAttributions,
+        );
       }
     } catch { /* best-effort */ }
 
@@ -108,17 +119,24 @@ await runHook(async () => {
           const summary = redirectData.slice(i3 + 1);
           const bytesAvoided = Number.parseInt(bytesRaw, 10);
           if (Number.isFinite(bytesAvoided) && bytesAvoided > 0) {
-            db.insertEvent(
+            // v1.0.160: route through wire — context-saving (byte-accounting)
+            // widget on the platform reads category='redirect' rows. event
+            // carries bytes_avoided so the bytesList branch in
+            // attributeAndInsertEvents stamps the column.
+            attributeAndInsertEvents(
+              db,
               sessionId,
-              {
+              [{
                 type,
                 category: "redirect",
                 data: `${tool}: ${summary}`,
                 priority: 2,
-              },
+                bytes_avoided: bytesAvoided,
+              }],
+              input,
+              projectDir,
               "PreToolUse",
-              undefined,
-              { bytesAvoided, bytesReturned: 0 },
+              resolveProjectAttributions,
             );
           }
         }
@@ -140,16 +158,63 @@ await runHook(async () => {
         if (startTime && !isNaN(startTime)) {
           const duration = Date.now() - startTime;
           if (duration > 5000) {
-            db.insertEvent(sessionId, {
-              type: "tool_latency",
-              category: "latency",
-              data: `${toolName}: ${duration}ms`,
-              priority: 3,
-            }, "PostToolUse");
+            // v1.0.160: route through wire — slow-tool insights need this row.
+            attributeAndInsertEvents(
+              db,
+              sessionId,
+              [{
+                type: "tool_latency",
+                category: "latency",
+                data: `${toolName}: ${duration}ms`,
+                priority: 3,
+              }],
+              input,
+              projectDir,
+              "PostToolUse",
+              resolveProjectAttributions,
+            );
           }
         }
       }
     } catch { /* latency tracking is best-effort */ }
+
+    // ─── Retrieval bridge: emit the "With context-mode" (bytes_retrieved) row ───
+    // The MCP server appended ctx_search / ctx_fetch_and_index response bytes to
+    // a marker keyed by the session DB basename (the hook NEVER fires for the
+    // plugin's own MCP tools, so this is the only place that signal can enter
+    // the forward stream). Consume + emit one forwardable event so the platform
+    // kept_out_pct goes "measured". Mirrors the redirect-marker handshake above.
+    try {
+      const marker = resolve(tmpdir(), `context-mode-retrieval-${basename(dbPath)}.txt`);
+      let retrievedBytes = 0;
+      try {
+        const raw = readFileSync(marker, "utf-8");
+        for (const line of raw.split("\n")) {
+          const n = parseInt(line, 10);
+          if (Number.isFinite(n) && n > 0) retrievedBytes += n;
+        }
+        unlinkSync(marker); // consume-once — next fire cannot re-forward
+      } catch { /* no marker — phantom-event guard */ }
+      if (retrievedBytes > 0) {
+        // session-loaders stamps bytes_retrieved onto the platform payload from
+        // this in-memory field (session_events has no such column — forward-only).
+        attributeAndInsertEvents(
+          db,
+          sessionId,
+          [{
+            type: "mcp_tool_call",
+            category: "retrieval",
+            data: `retrieval: ${retrievedBytes} bytes accessed`,
+            priority: 2,
+            bytes_retrieved: retrievedBytes,
+          }],
+          input,
+          projectDir,
+          "PostToolUse",
+          resolveProjectAttributions,
+        );
+      }
+    } catch { /* best-effort — never block the hook */ }
 
     db.close();
   } catch {

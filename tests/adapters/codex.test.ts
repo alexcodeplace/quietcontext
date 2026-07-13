@@ -883,12 +883,8 @@ describe("Codex sessionstart hook script", () => {
   });
 });
 
-// Pins the #492 follow-up invariants:
-//   1. configs/codex/hooks.json PreToolUse matcher equals
-//      PRE_TOOL_USE_MATCHER_PATTERN in src/adapters/codex/index.ts
-//   2. configs/codex/hooks.json declares a PreCompact entry that routes
-//      to `context-mode hook codex precompact`
-//   3. README.md documents the same matcher (JSON-escaped form)
+// quietcontext intentionally ships no Codex hook registrations. Keep the
+// README drift check, but assert that the active Codex hook surface stays empty.
 describe("Codex matcher parity + config integrity", () => {
   const repoRoot = resolve(__dirname, "..", "..");
   const adapterSrcPath = join(repoRoot, "src", "adapters", "codex", "index.ts");
@@ -904,22 +900,18 @@ describe("Codex matcher parity + config integrity", () => {
     return m[1].replace(/\\\\/g, "\\");
   }
 
-  it("hooks.json PreToolUse matcher equals the adapter constant", () => {
-    const constant = readMatcherConstant();
+  it("quiet Codex hooks.json has no PreToolUse routing matcher", () => {
     const parsed = JSON.parse(readFileSync(hooksConfigPath, "utf8")) as {
-      hooks: { PreToolUse: Array<{ matcher: string }> };
+      hooks: { PreToolUse?: Array<{ matcher: string }> };
     };
-    const cfgMatcher = parsed.hooks.PreToolUse[0]?.matcher;
-    expect(cfgMatcher).toBe(constant);
+    expect(parsed.hooks.PreToolUse ?? []).toEqual([]);
   });
 
-  it("hooks.json declares PreCompact wired to the precompact hook command", () => {
+  it("quiet Codex hooks.json has no PreCompact registration", () => {
     const parsed = JSON.parse(readFileSync(hooksConfigPath, "utf8")) as {
       hooks: { PreCompact?: Array<{ hooks: Array<{ type: string; command: string }> }> };
     };
-    expect(parsed.hooks.PreCompact).toBeDefined();
-    const entry = parsed.hooks.PreCompact?.[0];
-    expect(entry?.hooks?.[0]?.command).toBe("context-mode hook codex precompact");
+    expect(parsed.hooks.PreCompact ?? []).toEqual([]);
   });
 
   it("README documents the same Codex PreToolUse matcher as the adapter", () => {
@@ -964,30 +956,21 @@ describe("Codex matcher #547 — is_exact_matcher charset compliance", () => {
     expect(runtimeMatcher).toMatch(EXACT_MATCHER_CHARSET);
   });
 
-  it("configs/codex/hooks.json PreToolUse matcher passes is_exact_matcher charset", () => {
+  it("quiet configs/codex/hooks.json has no PreToolUse matcher", () => {
     const path = resolve(__dirname, "..", "..", "configs", "codex", "hooks.json");
     const parsed = JSON.parse(readFileSync(path, "utf8")) as {
-      hooks: { PreToolUse: Array<{ matcher: string }> };
+      hooks: { PreToolUse?: Array<{ matcher: string }> };
     };
-    const matcher = parsed.hooks.PreToolUse[0]?.matcher ?? "";
-    expect(matcher).toMatch(EXACT_MATCHER_CHARSET);
+    expect(parsed.hooks.PreToolUse ?? []).toEqual([]);
   });
 
-  it("hooks/hooks.json (universal bundle) MCP catch-all matcher passes is_exact_matcher charset", () => {
-    // hooks/hooks.json is the universal bundled file Codex ALSO loads via
-    // the plugin cache. The MCP catch-all matcher must drop the lookahead so
-    // Codex's regex crate does not reject the file at boot. Claude Code
-    // continues to treat the literal `mcp__` as a substring matcher.
+  it("quiet universal hooks.json has no MCP catch-all matcher", () => {
+    // hooks/hooks.json is intentionally empty so the plugin cannot inject
+    // routing or lifecycle context into Codex.
     const path = resolve(__dirname, "..", "..", "hooks", "hooks.json");
     const parsed = JSON.parse(readFileSync(path, "utf8")) as {
-      hooks: { PreToolUse: Array<{ matcher: string }> };
+      hooks: { PreToolUse?: Array<{ matcher: string }> };
     };
-    const matchers = (parsed.hooks.PreToolUse ?? []).map((e) => e.matcher);
-    // Whichever entry was the external-MCP catch-all must now be charset-clean.
-    const mcpCatchAll = matchers.find(
-      (m) => m && m.startsWith("mcp__") && !m.includes("ctx_"),
-    );
-    expect(mcpCatchAll, "expected an mcp__ catch-all matcher in hooks.json").toBeDefined();
-    expect(mcpCatchAll).toMatch(EXACT_MATCHER_CHARSET);
+    expect(parsed.hooks.PreToolUse ?? []).toEqual([]);
   });
 });

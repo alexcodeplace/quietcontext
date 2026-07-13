@@ -65,7 +65,7 @@ describe("sessionstart.mjs — snapshot-consumed event (D2 PRD Phase 6.2)", () =
       CLAUDE_CONFIG_DIR: join(fakeHome, ".claude"),
       CLAUDE_PROJECT_DIR: fakeProject,
       CLAUDE_SESSION_ID: sessionId,
-      CONTEXT_MODE_SESSION_SUFFIX: "",
+      QUIET_CONTEXT_SESSION_SUFFIX: "",
     };
   });
 

@@ -3,7 +3,7 @@
  * detectPlatform() and the env-var priority chain.
  *
  * The adjacent detect.test.ts covers env vars, clientInfo, and the
- * CONTEXT_MODE_PLATFORM override — but the ~80 lines of `~/.<platform>`
+ * QUIET_CONTEXT_PLATFORM override — but the ~80 lines of `~/.<platform>`
  * and `~/.config/<platform>` existsSync checks (detect.ts:128-210) are
  * not exercised. These tests mock `node:fs` to force each branch
  * deterministically and lock the priority ordering.
@@ -27,7 +27,7 @@ const existsSyncMock = vi.mocked(fs.existsSync);
 // Derived from detect.ts's source-of-truth list so renames can't drift.
 const ALL_PLATFORM_ENV_VARS = [
   ...[...PLATFORM_ENV_VARS.values()].flatMap((vars) => vars.map((v) => v.name)),
-  "CONTEXT_MODE_PLATFORM",
+  "QUIET_CONTEXT_PLATFORM",
 ];
 
 describe("detectPlatform — config directory branches", () => {
@@ -113,9 +113,9 @@ describe("detectPlatform — config directory branches", () => {
     expect(signal.confidence).toBe("high");
   });
 
-  it("CONTEXT_MODE_PLATFORM override wins over a matching config dir", () => {
+  it("QUIET_CONTEXT_PLATFORM override wins over a matching config dir", () => {
     forceDir(resolve(home, ".claude"));
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity";
+    process.env.QUIET_CONTEXT_PLATFORM = "antigravity";
     expect(detectPlatform().platform).toBe("antigravity");
   });
 

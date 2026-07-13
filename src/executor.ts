@@ -43,9 +43,10 @@ export function buildScriptFilename(
 ): string {
   if (platform === "win32" && language === "shell") {
     const shellName = shellPath?.toLowerCase() ?? "";
-    return shellName.includes("powershell") || shellName.includes("pwsh")
-      ? "script.ps1"
-      : "script";
+    if (shellName.includes("powershell") || shellName.includes("pwsh")) return "script.ps1";
+    const shellBase = shellName.split(/[\\/]/).pop() ?? shellName;
+    if (shellBase === "cmd" || shellBase === "cmd.exe") return "script.cmd";
+    return "script";
   }
   return `script.${SCRIPT_EXT[language]}`;
 }
@@ -73,6 +74,23 @@ export function buildShellScriptContent(
   return `export PATH=${quoteForPosixShell(inheritedPath)}\n${code}`;
 }
 
+function isPowerShell(shellPath: string | null | undefined): boolean {
+  const shellName = shellPath?.toLowerCase() ?? "";
+  return shellName.includes("powershell") || shellName.includes("pwsh");
+}
+
+export function buildPowerShellScriptContent(code: string): string {
+  // Prefix a UTF-8 BOM so Windows PowerShell 5.1 reliably detects the script
+  // file as UTF-8 (without it, 5.1 falls back to the ANSI code page and
+  // mangles non-ASCII characters in the script body).
+  return [
+    "\uFEFF[Console]::InputEncoding = [System.Text.UTF8Encoding]::new()",
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()",
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new()",
+    code,
+  ].join("\n");
+}
+
 /**
  * Resolve the real OS temp directory, bypassing any TMPDIR env override.
  * os.tmpdir() reads TMPDIR from the environment, which some shells/tools
@@ -91,6 +109,89 @@ const OS_TMPDIR = (() => {
   } catch { /* fall through */ }
   return "/tmp";
 })();
+
+/**
+ * Pure helper — exported for unit testing. Issue #782.
+ *
+ * On Windows, the sandbox shell runtime is Git Bash. A bare `mvn` invocation
+ * runs Maven's POSIX shell script, which on the `mingw=true` branch (uname →
+ * MINGW64_NT-*) fails to convert `CLASSWORLDS_JAR` from a POSIX path
+ * (`/c/tools/maven/boot/plexus-classworlds-*.jar`) to a Windows path. Native
+ * `java.exe` then can't resolve the bootstrap jar → ClassNotFoundException for
+ * `org.codehaus.plexus.classworlds.launcher.Launcher`.
+ *
+ * The third-way fix (issue Option C): rewrite the bare `mvn` token to `mvn.cmd`,
+ * the native Windows launcher that uses Windows-native paths and bypasses the
+ * broken mingw shell branch entirely. This does NOT touch the global MSYS
+ * path-conversion env (MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL), which #826/#791
+ * deliberately leave unset so native git.exe launched from bash keeps its
+ * /tmp→C:\ argument conversion. Re-enabling global suppression would re-break
+ * native git; rewriting only the mvn token keeps both correct.
+ *
+ * Only a `mvn` that starts a command (start of string, or after a shell
+ * separator `&& | ; ( newline`) is rewritten. `mvnw`, `mvnd`, `mymvn`,
+ * paths like `./mvnw`, and an already-`mvn.cmd` token are left untouched
+ * (the token must be exactly `mvn` followed by whitespace or end-of-string).
+ */
+export function rewriteWindowsBuildTools(
+  code: string,
+  platform: NodeJS.Platform,
+): string {
+  if (platform !== "win32") return code;
+  // Rewrite a bare `mvn` command token to `mvn.cmd` (Maven's native Windows launcher).
+  // Algorithmic (no regex): only at a command-start position (string start or right
+  // after a shell separator ; & | ( newline, skipping leading spaces/tabs) and only
+  // when the token is exactly `mvn` followed by whitespace or end — leaves
+  // mvnw / mvnd / ./mvnw / already-mvn.cmd untouched.
+  const SEP = new Set([";", "&", "|", "(", "\n"]);
+  let out = "";
+  let atStart = true;
+  let i = 0;
+  while (i < code.length) {
+    const ch = code[i];
+    if (atStart && (ch === " " || ch === "\t")) {
+      out += ch;
+      i++;
+      continue;
+    }
+    if (atStart && code.startsWith("mvn", i)) {
+      const after = code[i + 3];
+      if (after === undefined || after === " " || after === "\t" || after === "\n") {
+        out += "mvn.cmd";
+        i += 3;
+        atStart = false;
+        continue;
+      }
+    }
+    out += ch;
+    atStart = SEP.has(ch);
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Remove a sandbox temp dir, retrying on Windows. Issue #788.
+ *
+ * On Windows, a child process that opened SQLite databases inside the sandbox
+ * can leave `*-wal` / `*-shm` files with handles that linger briefly after the
+ * process exits. A single `rmSync` then throws EBUSY/EPERM/ENOTEMPTY and the
+ * old silent `catch {}` swallowed it, leaking `.ctx-mode-*` directories under
+ * `%TEMP%`. Node's `rmSync({ maxRetries, retryDelay })` is purpose-built for
+ * exactly this Windows-handle race, so let it back off and retry.
+ */
+function cleanupTmpDir(tmpDir: string): void {
+  try {
+    rmSync(tmpDir, {
+      recursive: true,
+      force: true,
+      maxRetries: isWin ? 8 : 2,
+      retryDelay: 100,
+    });
+  } catch {
+    /* best-effort — OS will reclaim %TEMP% eventually */
+  }
+}
 
 /** Kill process tree — on Windows uses taskkill /T; on Unix kills the process group. */
 function killTree(proc: ReturnType<typeof spawn>): void {
@@ -191,28 +292,28 @@ export class PolyglotExecutor {
         return await this.#compileAndRun(filePath, tmpDir, timeout);
       }
 
-      // Shell commands run in the project directory so git, relative paths,
-      // and other project-aware tools work naturally. Non-shell languages
-      // run in the temp directory where their script file is written.
-      // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers)
-      // pin shell cwd without mutating process-wide state.
-      const cwd = language === "shell"
-        ? (cwdOverride ?? this.#projectRoot)
-        : tmpDir;
+      // Every language runs in the project directory so git, relative paths,
+      // and other project-aware tools resolve naturally. The script FILE lives
+      // in the sandbox tmpDir and is passed to the runtime by absolute path
+      // (see buildCommand), so cwd is free to be the project root.
+      //
+      // Issue #788 — previously only `shell` used the project root; non-shell
+      // runtimes (python/js/ts/…) used tmpDir, so repo-relative checks like
+      // `pathlib.Path("package.json").exists()` silently failed depending on
+      // the chosen language. Unifying cwd removes that surprise.
+      // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
+      // cwd without mutating process-wide state.
+      const cwd = cwdOverride ?? this.#projectRoot;
       const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
-        try {
-          rmSync(tmpDir, { recursive: true, force: true });
-        } catch { /* ignore */ }
+        cleanupTmpDir(tmpDir);
       }
 
       return result;
     } catch (err) {
-      try {
-        rmSync(tmpDir, { recursive: true, force: true });
-      } catch { /* ignore */ }
+      cleanupTmpDir(tmpDir);
       throw err;
     }
   }
@@ -254,9 +355,17 @@ export class PolyglotExecutor {
       ),
     );
     if (language === "shell") {
+      const shellPath = this.#runtimes.shell;
+      // #782 — on Windows Git Bash, rewrite bare `mvn` → `mvn.cmd` so Maven
+      // uses its native Windows launcher (correct path handling) instead of
+      // the broken mingw shell branch. No-op on non-Windows.
+      const rewritten = rewriteWindowsBuildTools(code, process.platform);
+      const shellCode = isWin && isPowerShell(shellPath)
+        ? buildPowerShellScriptContent(rewritten)
+        : rewritten;
       writeFileSync(
         fp,
-        buildShellScriptContent(code, process.env.PATH, process.platform),
+        buildShellScriptContent(shellCode, process.env.PATH, process.platform),
         { encoding: "utf-8", mode: 0o700 },
       );
     } else {
@@ -370,8 +479,20 @@ export class PolyglotExecutor {
           resolved = true;
           if (proc.pid) this.#backgroundedPids.add(proc.pid);
           proc.unref();
-          proc.stdout!.destroy();
-          proc.stderr!.destroy();
+          // Do NOT destroy stdout/stderr — closing the read end of the pipe
+          // sends SIGPIPE to the child on its next write, killing it.
+          // Instead, replace the data listeners with no-op drains that
+          // consume the stream without accumulating buffers. This keeps
+          // the pipe open and prevents the child from blocking on a full
+          // pipe buffer.
+          if (proc.stdout) {
+            proc.stdout.removeAllListeners("data");
+            proc.stdout.on("data", () => {});
+          }
+          if (proc.stderr) {
+            proc.stderr.removeAllListeners("data");
+            proc.stderr.on("data", () => {});
+          }
           const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
           const rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
           res({
@@ -584,10 +705,19 @@ export class PolyglotExecutor {
       env["PATH"] = isWin ? "" : "/usr/local/bin:/usr/bin:/bin";
     }
 
-    // Windows-critical env vars and path fixes
+    // Windows-critical PATH fixes.
     if (isWin) {
-      env["MSYS_NO_PATHCONV"] = "1";
-      env["MSYS2_ARG_CONV_EXCL"] = "*";
+      // Do not carry global MSYS path-conversion blockers into Git Bash.
+      // Native Windows tools launched from bash (notably git.exe) need MSYS
+      // to convert /tmp-style arguments to Windows paths so sibling tools see
+      // the same filesystem location (#791).
+      for (const key of Object.keys(env)) {
+        const upper = key.toUpperCase();
+        if (upper === "MSYS_NO_PATHCONV" || upper === "MSYS2_ARG_CONV_EXCL") {
+          delete env[key];
+        }
+      }
+
       const gitUsrBin = "C:\\Program Files\\Git\\usr\\bin";
       const gitBin = "C:\\Program Files\\Git\\bin";
       if (!env["PATH"].includes(gitUsrBin)) {

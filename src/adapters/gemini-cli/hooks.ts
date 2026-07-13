@@ -1,4 +1,4 @@
-import { buildNodeCommand } from "../types.js";
+import { buildHookRuntimeCommand } from "../types.js";
 
 /**
  * adapters/gemini-cli/hooks — Gemini CLI hook definitions and matchers.
@@ -12,7 +12,12 @@ import { buildNodeCommand } from "../types.js";
  * Gemini CLI hook system reference:
  *   - Hooks are registered in ~/.gemini/settings.json under "hooks" key
  *   - Each hook type maps to an array of { matcher, hooks } entries
- *   - Hook names: BeforeAgent, BeforeTool, AfterTool, PreCompress, SessionStart
+ *   - Hook names: BeforeAgent, BeforeTool, AfterTool, AfterModel, PreCompress, SessionStart
+ *   - AfterModel fires per model call inside the stream loop
+ *     (packages/core/src/core/geminiChat.ts:1213); payload carries
+ *     llm_request + llm_response (hooks/types.ts:692-695) whose
+ *     usageMetadata + resolved model drive per-turn token/cost capture
+ *     (refs: docs/prds/2026-06-paid-observability/adapter-matrix/gemini-cli.md).
  *   - Input: JSON on stdin
  *   - Output: JSON on stdout (or empty for passthrough)
  *   - BeforeAgent fires when user submits a prompt — input.prompt carries
@@ -30,6 +35,7 @@ export const HOOK_TYPES = {
   BEFORE_AGENT: "BeforeAgent",
   BEFORE_TOOL: "BeforeTool",
   AFTER_TOOL: "AfterTool",
+  AFTER_MODEL: "AfterModel",
   PRE_COMPRESS: "PreCompress",
   SESSION_START: "SessionStart",
 } as const;
@@ -66,6 +72,7 @@ export const HOOK_SCRIPTS: Record<HookType, string> = {
   [HOOK_TYPES.BEFORE_AGENT]: "beforeagent.mjs",
   [HOOK_TYPES.BEFORE_TOOL]: "beforetool.mjs",
   [HOOK_TYPES.AFTER_TOOL]: "aftertool.mjs",
+  [HOOK_TYPES.AFTER_MODEL]: "aftermodel.mjs",
   [HOOK_TYPES.PRE_COMPRESS]: "precompress.mjs",
   [HOOK_TYPES.SESSION_START]: "sessionstart.mjs",
 };
@@ -83,6 +90,7 @@ export const REQUIRED_HOOKS: HookType[] = [
 /** Optional hooks that enhance functionality but aren't critical. */
 export const OPTIONAL_HOOKS: HookType[] = [
   HOOK_TYPES.AFTER_TOOL,
+  HOOK_TYPES.AFTER_MODEL,
   HOOK_TYPES.PRE_COMPRESS,
 ];
 
@@ -108,11 +116,21 @@ export function isContextModeHook(
  * Build the hook command string for a given hook type.
  * Uses absolute node path to avoid PATH issues (homebrew, nvm, volta, etc.).
  * Falls back to CLI dispatcher if pluginRoot is not provided.
+ *
+ * Issue #712: gemini-cli hook scripts live under `hooks/gemini-cli/<script>`
+ * on disk (verified via the published `files` field in package.json and
+ * HOOK_MAP in src/cli.ts which uses the same subdir for the CLI
+ * dispatcher form). The introducing commit (f5c9d02) carried claude-code's
+ * flat `hooks/<script>` shape over without accounting for the platform
+ * subdir, causing `ctx doctor` to FAIL every hook on every install
+ * (paths pointed at `<pluginRoot>/hooks/<script>` which never exist for
+ * gemini-cli). `setHookPermissions` in index.ts already uses the correct
+ * subdir, so this restores three-callsite parity.
  */
 export function buildHookCommand(hookType: HookType, pluginRoot?: string): string {
   const scriptName = HOOK_SCRIPTS[hookType];
   if (pluginRoot && scriptName) {
-    return buildNodeCommand(`${pluginRoot}/hooks/${scriptName}`);
+    return buildHookRuntimeCommand(`${pluginRoot}/hooks/gemini-cli/${scriptName}`);
   }
   return `context-mode hook gemini-cli ${hookType.toLowerCase()}`;
 }

@@ -38,6 +38,7 @@ import type {
   HookParadigm,
   PlatformCapabilities,
   DiagnosticResult,
+  HealthCheck,
   PreToolUseEvent,
   PostToolUseEvent,
   PreCompactEvent,
@@ -268,6 +269,17 @@ export class GeminiCLIAdapter extends BaseAdapter implements HookAdapter {
           ],
         },
       ],
+      [GEMINI_HOOK_NAMES.AFTER_MODEL]: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildGeminiHookCommand(GEMINI_HOOK_NAMES.AFTER_MODEL, pluginRoot),
+            },
+          ],
+        },
+      ],
       [GEMINI_HOOK_NAMES.PRE_COMPRESS]: [
         {
           matcher: "",
@@ -381,6 +393,45 @@ export class GeminiCLIAdapter extends BaseAdapter implements HookAdapter {
     }
 
     return results;
+  }
+
+  /**
+   * Adapter-defined health checks (Algo-D1) — mirrors claude-code's override
+   * at src/adapters/claude-code/index.ts:275.
+   *
+   * Issue #712 motivation: gemini-cli's hook scripts ship under
+   * `<pluginRoot>/hooks/gemini-cli/<scriptName>` (see HOOK_MAP in
+   * src/cli.ts and `setHookPermissions` in this file). The legacy doctor
+   * path (`getHookScriptPaths` -> `extractHookScriptPath`) round-trips
+   * through `buildHookCommand` -> command-string parsing, so a missing
+   * platform subdir in the emit was invisible to the doctor until a user
+   * installed globally and observed FAIL lines. This override drops the
+   * round-trip: HOOK_SCRIPTS is the single source of truth and we probe
+   * `existsSync(join(pluginRoot, "hooks", "gemini-cli", scriptName))`
+   * directly, so a future regression in the command emit cannot make the
+   * doctor lie about hook health.
+   *
+   * Adding a new hook event in HOOK_SCRIPTS auto-extends doctor coverage
+   * here — no parallel hardcoded list to maintain.
+   */
+  getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
+    return Object.entries(GEMINI_HOOK_SCRIPTS).map(
+      ([hookType, scriptName]) => {
+        const absolutePath = join(pluginRoot, "hooks", "gemini-cli", scriptName);
+        return {
+          name: `Hook script: ${hookType} (${scriptName})`,
+          check: () => {
+            if (existsSync(absolutePath)) {
+              return { status: "OK" as const, detail: absolutePath };
+            }
+            return {
+              status: "FAIL" as const,
+              detail: `not found at ${absolutePath}`,
+            };
+          },
+        };
+      },
+    );
   }
 
   checkPluginRegistration(): DiagnosticResult {

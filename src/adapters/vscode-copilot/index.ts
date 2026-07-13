@@ -86,7 +86,7 @@ export class VSCodeCopilotAdapter extends CopilotBaseAdapter {
   }
 
   getSessionDir(): string {
-    // Issue #649: CONTEXT_MODE_DATA_DIR wins over both the .github project
+    // Issue #649: QUIET_CONTEXT_DATA_DIR wins over both the .github project
     // dir and the ~/.vscode fallback so dev-container/CI users can pin
     // storage to a writable volume regardless of whether a .github tree
     // happens to exist in cwd.

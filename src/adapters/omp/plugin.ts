@@ -25,15 +25,17 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
-import { extractEvents } from "../../session/extract.js";
+import { extractEvents, buildAgentUsageEvent } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { OMPAdapter } from "./index.js";
+import { parseOmpUsage } from "./usage.js";
 
 // ── Tool-name normalization ─────────────────────────────
 // OMP uses lowercase tool names (refs/.../hooks/types.ts:451 example
@@ -73,6 +75,59 @@ let _dbPath = "";
 let _sessionId = "";
 
 const _ompAdapter = new OMPAdapter();
+
+// ── MCP self-registration (issue #677) ───────────────────
+// The `omp plugin install context-mode` path wires THIS extension factory
+// (so routing hooks fire), but never creates the MCP config — so the 11
+// `ctx_*` tools stay unreachable even though curl/wget are blocked. Register
+// the server ourselves on plugin load, ONLY when absent (never clobber a
+// user's existing entry). Takes effect on the next OMP restart, same as the
+// manual mcp.json workaround the issue documents.
+const MCP_SERVER_NAME = "context-mode";
+// plugin.js ships at <pkg>/build/adapters/omp/plugin.js; the MCP server
+// bundle sits at the package root (<pkg>/server.bundle.mjs) — three up.
+const SERVER_BUNDLE_RELATIVE = "../../../server.bundle.mjs";
+
+function resolveServerBundle(): string | null {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const bundle = resolve(here, SERVER_BUNDLE_RELATIVE);
+    return existsSync(bundle) ? bundle : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ensure `~/.omp/agent/mcp.json` registers the context-mode MCP server.
+ *
+ * Uses `node <abs>/server.bundle.mjs` rather than the `context-mode` bin:
+ * under the plugin install the package lives in `~/.omp/plugins/node_modules`
+ * and its bin is NOT on PATH, so the bare command would fail to spawn (the
+ * exact symptom reported on issue #677). Best effort — never throws, never
+ * breaks plugin load.
+ */
+function ensureMcpServerRegistered(): void {
+  try {
+    const bundle = resolveServerBundle();
+    if (!bundle) return; // bundle missing → nothing safe to register
+
+    const settings = _ompAdapter.readSettings() ?? {};
+    const mcpServers =
+      (settings.mcpServers as Record<string, unknown> | undefined) ?? {};
+    if (MCP_SERVER_NAME in mcpServers) return; // already present — don't clobber
+
+    mcpServers[MCP_SERVER_NAME] = {
+      type: "stdio",
+      command: "node",
+      args: [bundle],
+    };
+    settings.mcpServers = mcpServers;
+    _ompAdapter.writeSettings(settings as Record<string, unknown>);
+  } catch {
+    // best effort — a registration failure must never break plugin load
+  }
+}
 
 function getSessionDir(): string {
   const dir = _ompAdapter.getSessionDir();
@@ -164,6 +219,15 @@ type ToolResultEvent = {
   isError?: boolean;
 };
 type ToolCallEventResult = { block?: boolean; reason?: string };
+// turn_end / agent_end usage-bearing event. Shape is intentionally loose — the
+// pure parseOmpUsage() (usage.ts) does the null-safe field extraction. Refs:
+// AssistantMessage (refs/platforms/omp/packages/ai/src/types.ts:505-541),
+// Usage (refs/.../packages/catalog/src/types.ts:100-145).
+type TurnEndEvent = {
+  type?: string;
+  message?: unknown;
+  messages?: unknown;
+};
 type HookEventCtx = Record<string, unknown> | undefined;
 type HookHandler<E, R = void> = (event: E, ctx: HookEventCtx) => R | undefined | Promise<R | undefined>;
 
@@ -172,6 +236,10 @@ export interface MinimalHookAPI {
   on(event: "session_before_compact", handler: HookHandler<{ type: "session_before_compact" }>): void;
   on(event: "tool_call", handler: HookHandler<ToolCallEvent, ToolCallEventResult>): void;
   on(event: "tool_result", handler: HookHandler<ToolResultEvent>): void;
+  // turn_end carries a single per-turn AssistantMessage with `.usage`/`.model`
+  // (refs/.../extensibility/shared-events.ts:204-208). agent_end carries
+  // `messages: AssistantMessage[]` (:191-194) — both flow through parseOmpUsage.
+  on(event: "turn_end", handler: HookHandler<TurnEndEvent>): void;
   on(event: string, handler: (...args: unknown[]) => unknown): void;
 }
 
@@ -189,6 +257,11 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
   // earlier `OMP_PROJECT_DIR` read was an EM mistake — no upstream code
   // ever sets it. Drop it; fall through PI_PROJECT_DIR → cwd().
   const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
+
+  // Self-register the MCP server so `ctx_*` tools are reachable under the
+  // plugin install path, not just the manual MCP-only path (issue #677).
+  ensureMcpServerRegistered();
+
   const db = getOrCreateDB(projectDir);
 
   // ── 1. session_start — initialize session row ─────────
@@ -277,6 +350,31 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
       db.incrementCompactCount(_sessionId);
     } catch {
       // best effort
+    }
+    return undefined;
+  });
+
+  // ── 5. turn_end — per-turn token + provider cost capture ──
+  // OMP exposes REAL per-turn tokens AND a provider-computed USD cost on the
+  // completed turn's AssistantMessage (`event.message.usage` / `.model`),
+  // delivered INCREMENTALLY per turn (matrix §2,§5). parseOmpUsage maps that to
+  // the buildAgentUsageEvent counts (Usage.cacheWrite→cache_creation,
+  // cacheRead→cache_read, cost.total→native_cost_usd). buildAgentUsageEvent
+  // prefers the native cost over the local price table and returns null on an
+  // all-zero turn. We persist via db.insertEvent — the SessionDB-backed forward
+  // path used everywhere in this in-process plugin runtime (the .mjs
+  // attributeAndInsertEvents helper is the Claude-hook analogue, not reachable
+  // here). Best-effort: a usage parse must never break the turn.
+  pi.on("turn_end", (event) => {
+    try {
+      if (!_sessionId) return undefined;
+      const counts = parseOmpUsage(event);
+      if (counts === null) return undefined;
+      const usageEvent = buildAgentUsageEvent(counts);
+      if (usageEvent === null) return undefined;
+      db.insertEvent(_sessionId, usageEvent as SessionEvent, "PostToolUse");
+    } catch {
+      // best effort — never break the turn on cost capture
     }
     return undefined;
   });

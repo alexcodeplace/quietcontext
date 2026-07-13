@@ -58,9 +58,9 @@ beforeAll(async () => {
 //
 // Use an isolated temp dir for sentinels so the directory scan in isMCPReady()
 // is not polluted by leftover sentinels from real MCP servers running on the
-// developer's machine. The hook honors CONTEXT_MODE_MCP_SENTINEL_DIR.
+// developer's machine. The hook honors QUIET_CONTEXT_MCP_SENTINEL_DIR.
 const _sentinelDir = mkdtempSync(join(tmpdir(), "ctx-test-sentinels-"));
-process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = _sentinelDir;
+process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR = _sentinelDir;
 const mcpSentinel = resolve(_sentinelDir, `context-mode-mcp-ready-${process.pid}`);
 
 beforeEach(() => {
@@ -74,7 +74,7 @@ afterEach(() => {
 
 afterAll(() => {
   try { rmSync(_sentinelDir, { recursive: true, force: true }); } catch {}
-  delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+  delete process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
 });
 
 describe("routePreToolUse", () => {
@@ -420,10 +420,10 @@ describe("routePreToolUse", () => {
     });
   });
 
-  // ─── Subagent ctx_commands omission (#233) ──────────────
+  // ─── Compact routing contract ───────────────────────────
 
-  describe("Subagent ctx_commands omission (#233)", () => {
-    it("Agent subagent prompt omits ctx_commands", () => {
+  describe("compact routing contract", () => {
+    it("Agent subagent prompt omits maintenance commands", () => {
       const result = routePreToolUse("Agent", {
         prompt: "Search the codebase",
         subagent_type: "general-purpose",
@@ -431,26 +431,33 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       const prompt = (result!.updatedInput as Record<string, string>).prompt;
-      expect(prompt).not.toContain("<ctx_commands>");
-      expect(prompt).toContain("<tool_selection_hierarchy>");
+      expect(prompt).not.toContain("maintenance:");
+      expect(prompt).toContain("<context_mode>");
     });
 
-    it("ROUTING_BLOCK constant includes ctx_commands for main session", () => {
-      expect(ROUTING_BLOCK).toContain("<ctx_commands>");
-      expect(ROUTING_BLOCK).toContain("ctx stats");
+    it("main session keeps routing rules without verbose wrappers", () => {
+      expect(ROUTING_BLOCK).toContain("<context_mode>");
+      expect(ROUTING_BLOCK).toContain("maintenance:");
+      expect(ROUTING_BLOCK).toContain("ctx_stats");
+      expect(ROUTING_BLOCK).toContain("ctx_execute");
+      expect(ROUTING_BLOCK).toContain("Native Write/Edit");
+      expect(ROUTING_BLOCK).not.toContain("<context_window_protection>");
+      expect(ROUTING_BLOCK).not.toContain("<tool_selection_hierarchy>");
+      expect(ROUTING_BLOCK).not.toContain("<ctx_commands>");
     });
 
-    it("createRoutingBlock with includeCommands: false omits section", () => {
+    it("subagent routing omits maintenance commands", () => {
       const t = (name: string) => `mcp__test__${name}`;
       const block = createRoutingBlock(t, { includeCommands: false });
-      expect(block).not.toContain("<ctx_commands>");
-      expect(block).toContain("<tool_selection_hierarchy>");
+      expect(block).not.toContain("maintenance:");
+      expect(block).toContain("<context_mode>");
     });
 
-    it("createRoutingBlock default includes ctx_commands", () => {
+    it("createRoutingBlock uses platform-specific tool names", () => {
       const t = (name: string) => `mcp__test__${name}`;
       const block = createRoutingBlock(t);
-      expect(block).toContain("<ctx_commands>");
+      expect(block).toContain("mcp__test__ctx_execute");
+      expect(block).toContain("mcp__test__ctx_search");
     });
   });
 
@@ -575,10 +582,10 @@ describe("routePreToolUse", () => {
       );
       previousHome = process.env.HOME;
       previousCodexHome = process.env.CODEX_HOME;
-      previousPlatform = process.env.CONTEXT_MODE_PLATFORM;
+      previousPlatform = process.env.QUIET_CONTEXT_PLATFORM;
       process.env.HOME = homeDir;
       process.env.CODEX_HOME = codexDir;
-      process.env.CONTEXT_MODE_PLATFORM = "codex";
+      process.env.QUIET_CONTEXT_PLATFORM = "codex";
     });
 
     afterEach(() => {
@@ -586,8 +593,8 @@ describe("routePreToolUse", () => {
       else process.env.HOME = previousHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previousCodexHome;
-      if (previousPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
-      else process.env.CONTEXT_MODE_PLATFORM = previousPlatform;
+      if (previousPlatform === undefined) delete process.env.QUIET_CONTEXT_PLATFORM;
+      else process.env.QUIET_CONTEXT_PLATFORM = previousPlatform;
       try { rmSync(projectDir, { recursive: true, force: true }); } catch {}
       try { rmSync(homeDir, { recursive: true, force: true }); } catch {}
     });
@@ -616,30 +623,18 @@ describe("routePreToolUse", () => {
     //   - file writes go through the native Write/Edit tool
     //   - ctx_execute / ctx_execute_file / Bash subprocesses do not persist edits
     //   - artifacts get written to files (path + 1-line description returned)
-    it("file_writing_policy points file writes at native Write/Edit tools", () => {
-      expect(ROUTING_BLOCK).toContain("<file_writing_policy>");
-      expect(ROUTING_BLOCK).toContain("File writes use the native Write or Edit tool");
-      // semantic intent: ctx_execute family must not be used for file writes —
-      // expressed positively as "do not persist edits to the host filesystem"
-      expect(ROUTING_BLOCK).toContain("ctx_execute");
+    it("routes file writes to native Write/Edit tools", () => {
+      expect(ROUTING_BLOCK).toContain("Native Write/Edit");
       expect(ROUTING_BLOCK).toContain("do not persist edits");
     });
 
-    it("when_not_to_use redirects ctx_execute away from file creation", () => {
-      // Replaces the old `<forbidden_actions>` container; same semantic intent
-      // (do not pick ctx_execute for file creation) expressed via WHEN NOT.
-      expect(ROUTING_BLOCK).toContain("<when_not_to_use>");
-      expect(ROUTING_BLOCK).toContain("for file writes");
-      expect(ROUTING_BLOCK).toContain("analysis, processing, and computation only");
+    it("keeps processing in the sandbox", () => {
+      expect(ROUTING_BLOCK).toContain("raw bytes stay in the sandbox");
+      expect(ROUTING_BLOCK).toContain("only derived output enters context");
     });
 
-    it("artifact_policy points artifacts at files with file-path return shape", () => {
-      // Replaces the old "Write artifacts ... NEVER inline" wording.
-      // The semantic intent — write artifacts to files, return only the path
-      // plus a 1-line description — is asserted via the positive surface.
-      expect(ROUTING_BLOCK).toContain(
-        "Write artifacts (code, configs, PRDs) to files",
-      );
+    it("keeps artifact output on disk", () => {
+      expect(ROUTING_BLOCK).toContain("Artifacts go to files");
       expect(ROUTING_BLOCK).toContain("file path + 1-line description");
     });
   });
@@ -742,10 +737,10 @@ describe("routePreToolUse", () => {
       expect(fired).toEqual(expected);
     });
 
-    it("honors CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY to tune cadence", () => {
-      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+    it("honors QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY to tune cadence", () => {
+      const prev = process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
       try {
-        process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = "3";
+        process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = "3";
         const calls = Array.from({ length: 7 }, (_, i) =>
           routePreToolUse(`mcp__notion__tool_${i}`, {}),
         );
@@ -753,17 +748,17 @@ describe("routePreToolUse", () => {
         // period=3 → fires on calls 1, 4, 7 (indices 0, 3, 6).
         expect(fired).toEqual([true, false, false, true, false, false, true]);
       } finally {
-        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
-        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+        if (prev === undefined) delete process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = prev;
       }
     });
 
     it("falls back to default cadence on invalid env values", () => {
-      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+      const prev = process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
       try {
         // Out-of-range, NaN, negative — all coerce to the default (10).
         for (const v of ["0", "-1", "9999", "not-a-number", ""]) {
-          process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = v;
+          process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = v;
           resetGuidanceThrottle();
           const first = routePreToolUse("mcp__slack__a", {});
           const second = routePreToolUse("mcp__slack__b", {});
@@ -772,8 +767,8 @@ describe("routePreToolUse", () => {
           expect(second, `value=${JSON.stringify(v)}`).toBeNull();
         }
       } finally {
-        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
-        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+        if (prev === undefined) delete process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = prev;
       }
     });
 
@@ -888,13 +883,13 @@ describe("mcp-ready: contract", () => {
     let originalEnv: string | undefined;
     beforeEach(() => {
       originalPlatform = process.platform;
-      originalEnv = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
-      delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+      originalEnv = process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
+      delete process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
     });
     afterEach(() => {
       Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
       if (originalEnv !== undefined) {
-        process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = originalEnv;
+        process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR = originalEnv;
       }
     });
 
@@ -1048,8 +1043,8 @@ describe("buildSecurityWarningContext — agent-facing security warning (#558)",
       }));
       `,
       {
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundle,
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: missingBundle,
       },
     );
     expect(r.parsed.failed).toBe(true);

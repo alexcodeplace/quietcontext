@@ -8,7 +8,7 @@ User says: "triage issue #N", "fix issue #N", "analyze issue #N"
 
 ### 1. Gather Intelligence (ONE batch call)
 
-Use `ctx_batch_execute` to gather everything in ONE call:
+Use `batch` to gather everything in ONE call:
 
 ```javascript
 commands: [
@@ -91,7 +91,7 @@ with hard evidence. We shipped inheritEnvKeys because an LLM said Claude Code st
 | **Bug report** | Reproduce locally with a failing test or command | Run the exact steps from the report. If it doesn't fail, the bug may not exist. |
 | **Feature request claiming behavior X** | Prove behavior X actually happens | Check official docs, source code, or web search. NOT LLM knowledge — LLMs hallucinate platform behavior. |
 | **Feature request claiming perf issue** | Benchmark the actual impact | Measure before/after. No "it should be faster" — show numbers. |
-| **"Tool X sets env var Y"** | Find it in official source | `ctx_fetch_and_index` the platform's docs/source. Grep their repo. If you can't find it, it probably doesn't exist. |
+| **"Tool X sets env var Y"** | Find it in official source | `fetch-index` the platform's docs/source. Grep their repo. If you can't find it, it probably doesn't exist. |
 
 **Verification Steps:**
 

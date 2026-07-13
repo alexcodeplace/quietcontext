@@ -1,4 +1,4 @@
-import { buildNodeCommand, parseNodeCommand } from "../types.js";
+import { buildHookRuntimeCommand, parseNodeCommand } from "../types.js";
 
 /**
  * adapters/claude-code/hooks — Claude Code hook definitions and matchers.
@@ -29,6 +29,7 @@ export const HOOK_TYPES = {
   PRE_COMPACT: "PreCompact",
   SESSION_START: "SessionStart",
   USER_PROMPT_SUBMIT: "UserPromptSubmit",
+  STOP: "Stop",
 } as const;
 
 export type HookType = (typeof HOOK_TYPES)[keyof typeof HOOK_TYPES];
@@ -116,6 +117,7 @@ export const HOOK_SCRIPTS: Record<HookType, string> = {
   PreCompact: "precompact.mjs",
   SessionStart: "sessionstart.mjs",
   UserPromptSubmit: "userpromptsubmit.mjs",
+  Stop: "stop.mjs",
 };
 
 // ─────────────────────────────────────────────────────────
@@ -133,6 +135,7 @@ export const OPTIONAL_HOOKS: HookType[] = [
   HOOK_TYPES.POST_TOOL_USE,
   HOOK_TYPES.PRE_COMPACT,
   HOOK_TYPES.USER_PROMPT_SUBMIT,
+  HOOK_TYPES.STOP,
 ];
 
 /**
@@ -162,7 +165,7 @@ export function isContextModeHook(
 export function buildHookCommand(hookType: HookType, pluginRoot?: string): string {
   if (pluginRoot) {
     const scriptName = HOOK_SCRIPTS[hookType];
-    return buildNodeCommand(`${pluginRoot}/hooks/${scriptName}`);
+    return buildHookRuntimeCommand(`${pluginRoot}/hooks/${scriptName}`);
   }
   return `context-mode hook claude-code ${hookType.toLowerCase()}`;
 }

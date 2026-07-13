@@ -7,10 +7,54 @@
 
 import { writeFileSync } from "node:fs";
 
+// ── Leg-boundary helpers (#780) ──
+// The current Claude Code session_id persists across `--continue` legs, so the
+// events array can carry rows written in a PRIOR leg. The last `session_start`
+// lifecycle event (emitted by the prior leg's SessionStart, before this leg's
+// directive is built — sessionstart.mjs:206/258, 277/293) is the boundary that
+// opened the current leg. Rows with created_at < boundary are prior-leg.
+function computeLegBoundary(events) {
+  let boundary = null;
+  for (const ev of events) {
+    if (ev.category === "session_start" && ev.created_at) boundary = ev.created_at;
+  }
+  return boundary;
+}
+
+// True when an event was written in a leg strictly before the current one.
+// No boundary (first leg) → nothing is prior-leg, so everything stays current.
+function isPriorLeg(ev, boundary) {
+  return boundary != null && ev.created_at != null && ev.created_at < boundary;
+}
+
+// ── Data References sizing (#840) ──
+// Inlining every captured tool-output verbatim defeats context-mode's own
+// raw-bytes-stay-out principle. Inline only a small recent window; reference
+// large blobs with a one-line pointer. The full payloads stay queryable in
+// FTS5 via ctx_search(source: "session-events").
+const DATA_REF_INLINE_MAX = 8; // most-recent captures rendered inline
+const DATA_REF_ENTRY_MAX = 150; // per-entry char cap before it is referenced
+
+function renderDataReferences(entries, push, searchHint) {
+  const recent = entries.slice(-DATA_REF_INLINE_MAX);
+  for (const ev of recent) {
+    const raw = ev.data ?? "";
+    const text = raw.length > DATA_REF_ENTRY_MAX
+      ? `${raw.substring(0, DATA_REF_ENTRY_MAX - 3)}… (${raw.length} bytes — query ${searchHint})`
+      : raw;
+    push(`- ${text}`);
+  }
+  const older = entries.length - recent.length;
+  if (older > 0) {
+    push(`- … ${older} older captures kept in the sandbox — query ${searchHint}.`);
+  }
+}
+
 // ── Group events by category and extract metadata ──
 export function groupEvents(events) {
   const grouped = {};
   let lastPrompt = "";
+  const legBoundary = computeLegBoundary(events);
   for (const ev of events) {
     if (ev.category === "prompt") {
       lastPrompt = ev.data;
@@ -25,13 +69,13 @@ export function groupEvents(events) {
     const base = path?.split(/[/\\]/).pop()?.trim();
     if (base && !base.includes("*")) fileNames.add(base);
   }
-  return { grouped, lastPrompt, fileNames };
+  return { grouped, lastPrompt, fileNames, legBoundary };
 }
 
 // ── Write session events as markdown for FTS5 auto-indexing ──
 // Structured with H2 headings per category — optimal for FTS5 chunking.
 export function writeSessionEventsFile(events, eventsPath) {
-  const { grouped, lastPrompt, fileNames } = groupEvents(events);
+  const { grouped, lastPrompt, fileNames, legBoundary } = groupEvents(events);
 
   const lines = [];
   lines.push("# Session Resume");
@@ -149,10 +193,23 @@ export function writeSessionEventsFile(events, eventsPath) {
   }
 
   if (grouped.subagent?.length > 0) {
-    lines.push("## Subagent Tasks");
-    lines.push("");
-    for (const ev of grouped.subagent) lines.push(`- ${ev.data}`);
-    lines.push("");
+    // #780 — only current-leg subagent events are "current". Prior-leg ones
+    // are reframed as history so stale [completed]/[launched] labels are not
+    // re-injected as if the agent ran in this conversation.
+    const currentSub = grouped.subagent.filter(ev => !isPriorLeg(ev, legBoundary));
+    const priorSub = grouped.subagent.filter(ev => isPriorLeg(ev, legBoundary));
+    if (currentSub.length > 0) {
+      lines.push("## Subagent Tasks");
+      lines.push("");
+      for (const ev of currentSub) lines.push(`- ${ev.data}`);
+      lines.push("");
+    }
+    if (priorSub.length > 0) {
+      lines.push("## Subagent Tasks (earlier session — not current)");
+      lines.push("");
+      for (const ev of priorSub) lines.push(`- ${ev.data}`);
+      lines.push("");
+    }
   }
 
   if (grouped.skill?.length > 0) {
@@ -180,7 +237,11 @@ export function writeSessionEventsFile(events, eventsPath) {
   if (grouped.data?.length > 0) {
     lines.push("## Data References");
     lines.push("");
-    for (const ev of grouped.data) lines.push(`- ${ev.data}`);
+    renderDataReferences(
+      grouped.data,
+      (l) => lines.push(l),
+      'ctx_search(source: "session-events")',
+    );
     lines.push("");
   }
 
@@ -212,8 +273,10 @@ export function writeSessionEventsFile(events, eventsPath) {
 
 // ── Build session guide — actionable narrative for LLM to continue from ──
 export function buildSessionDirective(source, eventMeta, toolNamer) {
-  const { grouped, lastPrompt, fileNames } = eventMeta;
+  const { grouped, lastPrompt, fileNames, legBoundary } = eventMeta;
   const isCompact = source === "compact";
+  const searchTool = toolNamer ? toolNamer("ctx_search") : "ctx_search";
+  const dataSearchHint = `${searchTool}(source: "session-events")`;
 
   let block = `\n<session_knowledge source="${isCompact ? "compact" : "continue"}">`;
   block += `\n<session_guide>`;
@@ -333,14 +396,23 @@ export function buildSessionDirective(source, eventMeta, toolNamer) {
     block += `\n`;
   }
 
-  // 9. Subagent tasks
+  // 9. Subagent tasks — #780: prior-leg events are NOT current work. Render
+  //    only current-leg subagents under "Subagent Tasks"; reframe prior-leg
+  //    ones so stale [completed]/[launched] labels don't read as this leg's.
   if (grouped.subagent?.length > 0) {
-    block += `\n## Subagent Tasks`;
-    for (const ev of grouped.subagent) {
-      const text = ev.data.length > 120 ? ev.data.substring(0, 117) + "..." : ev.data;
-      block += `\n- ${text}`;
+    const fmt = (ev) => ev.data.length > 120 ? ev.data.substring(0, 117) + "..." : ev.data;
+    const currentSub = grouped.subagent.filter(ev => !isPriorLeg(ev, legBoundary));
+    const priorSub = grouped.subagent.filter(ev => isPriorLeg(ev, legBoundary));
+    if (currentSub.length > 0) {
+      block += `\n## Subagent Tasks`;
+      for (const ev of currentSub) block += `\n- ${fmt(ev)}`;
+      block += `\n`;
     }
-    block += `\n`;
+    if (priorSub.length > 0) {
+      block += `\n## Subagent Tasks (earlier session — not current)`;
+      for (const ev of priorSub) block += `\n- ${fmt(ev)}`;
+      block += `\n`;
+    }
   }
 
   // 10. Skills invoked
@@ -363,13 +435,10 @@ export function buildSessionDirective(source, eventMeta, toolNamer) {
     block += `\n`;
   }
 
-  // 12. Data references
+  // 12. Data references — #840: reference (don't inline) large tool-outputs.
   if (grouped.data?.length > 0) {
     block += `\n## Data References`;
-    for (const ev of grouped.data) {
-      const text = ev.data.length > 150 ? ev.data.substring(0, 147) + "..." : ev.data;
-      block += `\n- ${text}`;
-    }
+    renderDataReferences(grouped.data, (l) => { block += `\n${l}`; }, dataSearchHint);
     block += `\n`;
   }
 
@@ -417,7 +486,6 @@ export function buildSessionDirective(source, eventMeta, toolNamer) {
   // Search on demand — detailed data lives in FTS5
   block += `\n<session_search>`;
   block += `\nDetailed session data is indexed in context-mode FTS5 (source: "session-events").`;
-  const searchTool = toolNamer ? toolNamer("ctx_search") : "ctx_search";
   block += `\nUse ${searchTool}(queries: [...], source: "session-events") when you need specifics.`;
   block += `\nDo NOT call ctx_index() — data is already indexed.`;
   block += `\n</session_search>`;

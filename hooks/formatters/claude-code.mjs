@@ -54,14 +54,50 @@ export function formatDecision(decision) {
         },
       };
 
-    case "modify":
+    case "modify": {
       if (isHeadless()) return null;
+
+      // Tool-aware modify handling:
+      //
+      // - Bash redirect (updatedInput.command): CC v2.1.x ignores
+      //   `updatedInput.command` substitution under `permissionDecision: "allow"`
+      //   — original command runs unchanged. Verified via /diagnose Phase 4
+      //   forced-deny probe: only `permissionDecision: "deny"` is honored for
+      //   Bash blocking. Emit deny + extract echo payload into
+      //   `permissionDecisionReason`.
+      //
+      // - Agent prompt injection (updatedInput.prompt): CC honors allow+updatedInput
+      //   for the Agent tool — the modified prompt actually reaches the subagent.
+      //   Keep the original modify shape so subagent routing-block injection works.
+      //
+      // - Any other shape: pass through as modify (no command, no prompt — let
+      //   CC decide if the field is honored).
+      const ui = decision.updatedInput ?? {};
+      const isBashCommandRedirect = "command" in ui;
+      if (!isBashCommandRedirect) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            updatedInput: ui,
+          },
+        };
+      }
+      // routing.mjs wraps the redirect guidance in `echo "..."` form.
+      // Extract the quoted payload as the deny reason. Fall back to a generic
+      // ADR-0003 CASE A message if the shape doesn't match.
+      const cmd = ui.command ?? "";
+      const m = cmd.match(/^echo\s+"(.+)"$/s);
+      const reason = m
+        ? m[1]
+        : "Redirected to ctx_execute / ctx_fetch_and_index. Call ctx_execute(language, code) to fetch and derive your answer in one round trip, or call ctx_fetch_and_index(url, source) when you want to query the response later via ctx_search. Both have full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH).";
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
-          updatedInput: decision.updatedInput,
+          permissionDecision: "deny",
+          permissionDecisionReason: reason,
         },
       };
+    }
 
     case "context":
       return {

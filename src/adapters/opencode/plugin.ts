@@ -26,7 +26,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
-import { extractEvents, extractUserEvents } from "../../session/extract.js";
+import { extractEvents, extractUserEvents, parseOpencodeUsage, buildAgentUsageEvent } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
@@ -110,6 +110,19 @@ interface AfterHookOutput {
   title: string;
   output: string;
   metadata: any;
+}
+
+/**
+ * OpenCode generic bus `event` hook — single parameter.
+ * The plugin SDK delivers every bus Event here (refs/platforms/opencode/
+ * packages/plugin/src/index.ts:224). We narrow to `message.updated`, whose
+ * `properties.info` is the full assistant Message carrying tokens/cost/modelID.
+ */
+interface EventHookInput {
+  event?: {
+    type?: string;
+    properties?: { info?: { sessionID?: string } & Record<string, unknown> };
+  };
 }
 
 /** OpenCode experimental.session.compacting — first parameter */
@@ -377,14 +390,14 @@ async function createContextModePlugin(ctx: PluginContext) {
     // transport. This is the plugin-only bridge for #574: OpenCode/Kilo
     // call ctx_* tools in-process through Hooks.tool instead of spawning
     // a separate MCP child per session.
-    const prevEmbedded = process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
-    process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = "1";
+    const prevEmbedded = process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS;
+    process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS = "1";
     let mod: typeof import("../../server.js");
     try {
       mod = await import("../../server.js");
     } finally {
-      if (prevEmbedded === undefined) delete process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
-      else process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
+      if (prevEmbedded === undefined) delete process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS;
+      else process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
     }
     const tools: Record<string, NativeToolDefinition> = {};
 
@@ -407,9 +420,10 @@ async function createContextModePlugin(ctx: PluginContext) {
             ? (inputSchema._def.shape as () => unknown)()
             : {};
 
-      const argsForHost = platform === "kilo"
-        ? zod3ShapeToV4(shape as Record<string, unknown>)
-        : shape as Record<string, unknown>;
+      // Both KiloCode and recent OpenCode bundle Zod v4 in-host; v3 schemas
+      // crash with `n._zod.def` undefined. Gate widened from kilo-only (#632)
+      // because every consumer of this file is an OpenCode-family host.
+      const argsForHost = zod3ShapeToV4(shape as Record<string, unknown>);
 
       tools[registered.name] = {
         description: String(config.description ?? ""),
@@ -524,6 +538,43 @@ async function createContextModePlugin(ctx: PluginContext) {
         }
       } catch {
         // Silent — session capture must never break the tool call
+      }
+    },
+
+    // ── event: per-turn token + cost capture (paid-observability) ───
+    // The generic bus `event` hook (refs/platforms/opencode/packages/plugin/
+    // src/index.ts:224) delivers every Event; we filter `message.updated`
+    // (published on each assistant-message update incl. step-finish —
+    // session.ts:673) and read tokens/cost/modelID off properties.info
+    // (assistant filter via role; refs stream.transport.ts:214-216).
+    //
+    // CAVEAT (refs processor.ts:717-718): message-level `.tokens` is the LAST
+    // step's snapshot (overwritten per step-finish), while `.cost` is
+    // cumulative for the turn. parseOpencodeUsage passes `.cost` through as
+    // native_cost_usd so the billed $ stays exact despite the token snapshot
+    // being last-step only. `message.updated` fires multiple times per turn;
+    // because tokens are a terminal snapshot and cost is cumulative, the last
+    // event for a message carries the final figures — re-emitting on each
+    // update is idempotent at the cost column and merely refreshes the
+    // last-step token telemetry. db.insertEvent both persists locally AND
+    // forwards to the platform (the TS-plugin equivalent of the .mjs
+    // attributeAndInsertEvents path).
+    event: async (input: EventHookInput) => {
+      try {
+        const ev = input?.event;
+        if (!ev || ev.type !== "message.updated") return;
+        const sessionId = ev.properties?.info?.sessionID;
+        if (!sessionId || typeof sessionId !== "string") return;
+
+        const counts = parseOpencodeUsage(ev);
+        if (!counts) return;
+        const usageEvent = buildAgentUsageEvent(counts);
+        if (!usageEvent) return;
+
+        db.ensureSession(sessionId, projectDir);
+        db.insertEvent(sessionId, usageEvent, "MessageUpdated");
+      } catch {
+        // Silent — usage capture must never break the session.
       }
     },
 

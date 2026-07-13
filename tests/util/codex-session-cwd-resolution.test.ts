@@ -146,12 +146,12 @@ describe("resolveCodexSessionCwd", () => {
 });
 
 describe("resolveProjectDir({strictPlatform: 'codex'})", () => {
-  it("honors CONTEXT_MODE_PROJECT_DIR env (universal escape hatch)", () => {
+  it("honors QUIET_CONTEXT_PROJECT_DIR env (universal escape hatch)", () => {
     const codexHome = makeCodexHome();
     writeSession(codexHome, "fresh", "/from/session", new Date());
 
     const result = resolveProjectDir({
-      env: { CONTEXT_MODE_PROJECT_DIR: "/from/env" },
+      env: { QUIET_CONTEXT_PROJECT_DIR: "/from/env" },
       cwd: "/cwd",
       pwd: "/pwd",
       strictPlatform: "codex",

@@ -48,7 +48,7 @@ import { ROUTING_BLOCK } from "../../hooks/routing-block.mjs";
 // ─── Shared setup ───────────────────────────────────────────────────────────
 const runtimes = detectRuntimes();
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const STORAGE_ENV_KEY = "CONTEXT_MODE_DIR";
+const STORAGE_ENV_KEY = "QUIET_CONTEXT_DIR";
 const savedStorageEnv = process.env[STORAGE_ENV_KEY];
 
 afterEach(() => {
@@ -101,8 +101,8 @@ describe("storage path resolution", () => {
     expect(
       resolveDefaultSessionDir({
         configDir: ".ignored",
-        configDirEnv: "CONTEXT_MODE_TEST_CONFIG_DIR",
-        env: { CONTEXT_MODE_TEST_CONFIG_DIR: configRoot },
+        configDirEnv: "QUIET_CONTEXT_TEST_CONFIG_DIR",
+        env: { QUIET_CONTEXT_TEST_CONFIG_DIR: configRoot },
       }),
     ).toBe(join(configRoot, "context-mode", "sessions"));
   });
@@ -112,8 +112,8 @@ describe("storage path resolution", () => {
     const root = resolve(tmpdir(), "context-mode-storage-root");
     const defaultDir = () => resolveDefaultSessionDir({
       configDir: ".ignored",
-      legacySessionDirEnv: "CONTEXT_MODE_TEST_SESSION_DIR",
-      env: { CONTEXT_MODE_TEST_SESSION_DIR: legacyDir },
+      legacySessionDirEnv: "QUIET_CONTEXT_TEST_SESSION_DIR",
+      env: { QUIET_CONTEXT_TEST_SESSION_DIR: legacyDir },
     });
 
     delete process.env[STORAGE_ENV_KEY];
@@ -126,7 +126,7 @@ describe("storage path resolution", () => {
     expect(resolveSessionStorageDir(defaultDir).path).toBe(join(root, "sessions"));
   });
 
-  test("uses CONTEXT_MODE_DIR as the single root for sessions, content, and stats", () => {
+  test("uses QUIET_CONTEXT_DIR as the single root for sessions, content, and stats", () => {
     const root = resolve(tmpdir(), "context-mode-storage-root");
     process.env[STORAGE_ENV_KEY] = root;
 
@@ -150,7 +150,7 @@ describe("storage path resolution", () => {
     });
   });
 
-  test("treats blank CONTEXT_MODE_DIR as default and reports ignored metadata", () => {
+  test("treats blank QUIET_CONTEXT_DIR as default and reports ignored metadata", () => {
     process.env[STORAGE_ENV_KEY] = " \t ";
     const defaultSessionsDir = join(tmpdir(), "context-mode-default", "sessions");
 
@@ -171,18 +171,18 @@ describe("storage path resolution", () => {
       ignoredEnvVar: STORAGE_ENV_KEY,
       ignoredReason: "empty",
     });
-    expect(describeStorageDirectorySource(session)).toBe("default; ignored empty CONTEXT_MODE_DIR");
+    expect(describeStorageDirectorySource(session)).toBe("default; ignored empty QUIET_CONTEXT_DIR");
 
     const err = new StorageDirectoryError("session", session.path, STORAGE_ENV_KEY, undefined, undefined, session);
-    expect(formatStorageDirectoryError(err)).toContain("Ignored empty CONTEXT_MODE_DIR; using adapter default.");
+    expect(formatStorageDirectoryError(err)).toContain("Ignored empty QUIET_CONTEXT_DIR; using adapter default.");
   });
 
-  test("rejects a relative CONTEXT_MODE_DIR", () => {
+  test("rejects a relative QUIET_CONTEXT_DIR", () => {
     process.env[STORAGE_ENV_KEY] = "relative/path";
 
     expect(() => resolveSessionStorageDir(() => "/ignored")).toThrow(StorageDirectoryError);
     expect(() => resolveSessionStorageDir(() => "/ignored")).toThrow(
-      "CONTEXT_MODE_DIR must be an absolute path.",
+      "QUIET_CONTEXT_DIR must be an absolute path.",
     );
   });
 
@@ -928,7 +928,7 @@ print(f"count: {data['count']}")
 //
 // Mirrors the executeFile relative-path resolution tests (line ~598). Confirms
 // that ctx_index resolves a relative `path` argument against the detected
-// project directory (CLAUDE_PROJECT_DIR / *_PROJECT_DIR / CONTEXT_MODE_PROJECT_DIR
+// project directory (CLAUDE_PROJECT_DIR / *_PROJECT_DIR / QUIET_CONTEXT_PROJECT_DIR
 // → cwd fallback) instead of the MCP server process cwd. End-to-end via
 // JSON-RPC against a freshly spawned server with an injected project dir.
 
@@ -954,7 +954,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         CLAUDE_PROJECT_DIR: projectDirEnv,
       },
     });
@@ -1138,7 +1138,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
   test("no *_PROJECT_DIR env set → relative path falls back to spawned-server cwd", async () => {
     // Strip every project-dir env the resolver chain consults (see
     // server.ts getProjectDir) so resolution is forced down to process.cwd().
-    // start.mjs would re-set CONTEXT_MODE_PROJECT_DIR and CLAUDE_PROJECT_DIR
+    // start.mjs would re-set QUIET_CONTEXT_PROJECT_DIR and CLAUDE_PROJECT_DIR
     // from originalCwd — that originalCwd is the `cwd` we hand to spawn(),
     // which is exactly what we want to assert on.
     const fallbackCwd = mkdtempSync(join(tmpdir(), "ctx-index-cwdfallback-"));
@@ -1157,7 +1157,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
       if (k === "VSCODE_CWD") continue;
       strippedEnv[k] = v;
     }
-    strippedEnv.CONTEXT_MODE_DISABLE_VERSION_CHECK = "1";
+    strippedEnv.QUIET_CONTEXT_DISABLE_VERSION_CHECK = "1";
 
     const proc = spawn("node", [mcpEntry], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -1222,14 +1222,14 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
   // ── JetBrains regression: IDEA_INITIAL_DIRECTORY must enter the cascade ──
   //
   // JetBrains adapter sets only IDEA_INITIAL_DIRECTORY (no CLAUDE_PROJECT_DIR,
-  // no CONTEXT_MODE_PROJECT_DIR). Before the fix, getProjectDir() ignored that
+  // no QUIET_CONTEXT_PROJECT_DIR). Before the fix, getProjectDir() ignored that
   // var and fell through to process.cwd(), which is the IDE bin dir on
   // JetBrains — making `ctx_index({ path: "rel/foo.md" })` resolve to a path
   // under the IDE installation and ENOENT.
   //
   // Spawn the compiled server directly (build/server.js) instead of start.mjs
   // so we never enter the start.mjs path that auto-populates CLAUDE_PROJECT_DIR
-  // and CONTEXT_MODE_PROJECT_DIR from cwd. This lets us isolate the cascade
+  // and QUIET_CONTEXT_PROJECT_DIR from cwd. This lets us isolate the cascade
   // and prove that IDEA_INITIAL_DIRECTORY alone is enough to resolve relative
   // paths under the JetBrains project root.
   test("relative path resolves against IDEA_INITIAL_DIRECTORY (JetBrains)", async () => {
@@ -1264,14 +1264,14 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     delete cleanEnv.OPENCODE_PROJECT_DIR;
     delete cleanEnv.PI_PROJECT_DIR;
     delete cleanEnv.PI_WORKSPACE_DIR;
-    delete cleanEnv.CONTEXT_MODE_PROJECT_DIR;
+    delete cleanEnv.QUIET_CONTEXT_PROJECT_DIR;
 
     const proc = spawn("node", [buildEntry], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: fakeIdeBin,
       env: {
         ...cleanEnv,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         IDEA_INITIAL_DIRECTORY: ctxProjectDir,
       },
     });
@@ -1405,7 +1405,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         CLAUDE_PROJECT_DIR: projectDir,
         ...extraEnv,
       },
@@ -1652,7 +1652,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
     }
   }, 30_000);
 
-  test("ctx_index returns an actionable storage error when CONTEXT_MODE_DIR is unwritable", async () => {
+  test("ctx_index returns an actionable storage error when QUIET_CONTEXT_DIR is unwritable", async () => {
     if (process.platform === "win32") return;
 
     const projectDir = setupProject([], {
@@ -1661,7 +1661,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
     const storageRoot = mkdtempSync(join(tmpdir(), "ctx-storage-deny-"));
     chmodSync(storageRoot, 0o500);
     const proc = spawnServerInProject(projectDir, {
-      CONTEXT_MODE_DIR: storageRoot,
+      QUIET_CONTEXT_DIR: storageRoot,
     });
 
     try {
@@ -1680,7 +1680,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
         "context-mode content directory is not writable:",
       );
       expect(indexResp.result?.content?.[0]?.text).toContain(
-        "Set CONTEXT_MODE_DIR to a writable absolute path.",
+        "Set QUIET_CONTEXT_DIR to a writable absolute path.",
       );
     } finally {
       killProc(proc);
@@ -1751,7 +1751,7 @@ describe("ctx_insight: port schema rejects invalid values (#441)", () => {
   function spawnInsightServer(): ChildProcess {
     return spawn("node", [mcpEntry], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1" },
+      env: { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1" },
     });
   }
 
@@ -1875,14 +1875,14 @@ describe("ctx_insight: port schema rejects invalid values (#441)", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Regression for PR #365 follow-up. ctx_index was routed through the
-// `getProjectDir()` env cascade (CLAUDE_PROJECT_DIR → ... → CONTEXT_MODE_PROJECT_DIR
+// `getProjectDir()` env cascade (CLAUDE_PROJECT_DIR → ... → QUIET_CONTEXT_PROJECT_DIR
 // → cwd) but the PolyglotExecutor still captured CLAUDE_PROJECT_DIR ?? cwd
 // at construction time. ctx_execute_file therefore resolved the same
 // relative path differently from ctx_index whenever only
-// CONTEXT_MODE_PROJECT_DIR was set (e.g. Cursor / OpenClaw / Codex spawns).
+// QUIET_CONTEXT_PROJECT_DIR was set (e.g. Cursor / OpenClaw / Codex spawns).
 // Fix: executor now resolves projectRoot lazily via the server's getProjectDir.
 
-describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
+describe("ctx_execute_file: QUIET_CONTEXT_PROJECT_DIR env cascade", () => {
   const execProjectDir = mkdtempSync(join(tmpdir(), "ctx-exec-projroot-"));
   const execScriptDir = join(execProjectDir, "rel");
   const execScriptName = "script.js";
@@ -1891,7 +1891,7 @@ describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
   // Spawn build/server.js directly to bypass start.mjs's auto-set of
   // CLAUDE_PROJECT_DIR = process.cwd(). That auto-set would defeat the
   // test by injecting a CLAUDE_PROJECT_DIR before getProjectDir() can
-  // fall through to CONTEXT_MODE_PROJECT_DIR.
+  // fall through to QUIET_CONTEXT_PROJECT_DIR.
   const buildServerEntry = resolve(__dirname, "..", "..", "build", "server.js");
 
   beforeAll(() => {
@@ -1909,15 +1909,15 @@ describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
 
   function spawnServerCtxModeOnly(projectDirEnv: string): ChildProcess {
     // Strip every CLAUDE_*-style projectDir signal so the executor MUST
-    // fall back through the env cascade to CONTEXT_MODE_PROJECT_DIR.
-    const env = { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1" };
+    // fall back through the env cascade to QUIET_CONTEXT_PROJECT_DIR.
+    const env = { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1" };
     delete env.CLAUDE_PROJECT_DIR;
     delete env.GEMINI_PROJECT_DIR;
     delete env.VSCODE_CWD;
     delete env.OPENCODE_PROJECT_DIR;
     delete env.PI_PROJECT_DIR;
     delete env.IDEA_INITIAL_DIRECTORY;
-    env.CONTEXT_MODE_PROJECT_DIR = projectDirEnv;
+    env.QUIET_CONTEXT_PROJECT_DIR = projectDirEnv;
     return spawn("node", [buildServerEntry], {
       stdio: ["pipe", "pipe", "pipe"],
       env,
@@ -1962,7 +1962,7 @@ describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
     });
   }
 
-  test("relative path resolves against CONTEXT_MODE_PROJECT_DIR when CLAUDE_PROJECT_DIR is unset", async () => {
+  test("relative path resolves against QUIET_CONTEXT_PROJECT_DIR when CLAUDE_PROJECT_DIR is unset", async () => {
     const proc = spawnServerCtxModeOnly(execProjectDir);
     try {
       await awaitRpc(proc, 1, {
@@ -2554,7 +2554,7 @@ describe("Platform-aware session paths via adapter", () => {
       "PI_PROJECT_DIR",
       "IDEA_INITIAL_DIRECTORY",
       "CURSOR_CWD",
-      "CONTEXT_MODE_PROJECT_DIR",
+      "QUIET_CONTEXT_PROJECT_DIR",
     ]) {
       expect(utilSrc).toContain(v);
     }
@@ -4118,7 +4118,7 @@ interface DoctorJsonRpcResponse {
 function startMcpServer(extraEnv: Record<string, string> = {}): ChildProcess {
   return spawn("node", [mcpEntry], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1", ...extraEnv },
+    env: { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1", ...extraEnv },
   });
 }
 
@@ -4208,7 +4208,7 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
 
   test("ctx_doctor reports storage roots and ignored empty override", async () => {
     const storageRoot = mkdtempSync(join(tmpdir(), "ctx-doctor-storage-"));
-    const proc = startMcpServer({ CONTEXT_MODE_DIR: " \t ", HOME: storageRoot, USERPROFILE: storageRoot });
+    const proc = startMcpServer({ QUIET_CONTEXT_DIR: " \t ", HOME: storageRoot, USERPROFILE: storageRoot });
     const responses = await initAndCallDoctor(proc, 1);
     const call = responses.find((r) => r.id === 100);
 
@@ -4218,21 +4218,21 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
     expect(text).toContain("Storage sessions:");
     expect(text).toContain("Storage content:");
     expect(text).toContain("Storage stats:");
-    expect(text).toContain("(default; ignored empty CONTEXT_MODE_DIR)");
+    expect(text).toContain("(default; ignored empty QUIET_CONTEXT_DIR)");
   }, 30_000);
 
   test("ctx_doctor reports storage root override source", async () => {
     const storageRoot = mkdtempSync(join(tmpdir(), "ctx-doctor-storage-root-"));
-    const proc = startMcpServer({ CONTEXT_MODE_DIR: storageRoot });
+    const proc = startMcpServer({ QUIET_CONTEXT_DIR: storageRoot });
     const responses = await initAndCallDoctor(proc, 1);
     const call = responses.find((r) => r.id === 100);
 
     expect(call).toBeDefined();
     expect(call!.error).toBeUndefined();
     const text = call!.result?.content?.[0]?.text ?? "";
-    expect(text).toContain(`Storage sessions: ${join(storageRoot, "sessions")} (via CONTEXT_MODE_DIR)`);
-    expect(text).toContain(`Storage content: ${join(storageRoot, "content")} (via CONTEXT_MODE_DIR)`);
-    expect(text).toContain(`Storage stats: ${join(storageRoot, "sessions")} (via CONTEXT_MODE_DIR)`);
+    expect(text).toContain(`Storage sessions: ${join(storageRoot, "sessions")} (via QUIET_CONTEXT_DIR)`);
+    expect(text).toContain(`Storage content: ${join(storageRoot, "content")} (via QUIET_CONTEXT_DIR)`);
+    expect(text).toContain(`Storage stats: ${join(storageRoot, "sessions")} (via QUIET_CONTEXT_DIR)`);
   }, 30_000);
 
   test("three concurrent ctx_doctor calls all succeed without crashing the server", async () => {
@@ -5013,7 +5013,7 @@ describe("startup banner suppressed in stdio transport mode", () => {
     const stderr = await new Promise<string>((res) => {
       const proc = spawn(process.execPath, [bundlePath], {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1" },
+        env: { ...process.env, QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1" },
       });
       let data = "";
       proc.stderr.on("data", (chunk: Buffer) => { data += chunk.toString(); });
@@ -5070,10 +5070,10 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
       // Ensure env path is NOT taken — both env vars unset.
       const prevSid = process.env.CLAUDE_SESSION_ID;
       const prevProjDir = process.env.CLAUDE_PROJECT_DIR;
-      const prevCmProjDir = process.env.CONTEXT_MODE_PROJECT_DIR;
+      const prevCmProjDir = process.env.QUIET_CONTEXT_PROJECT_DIR;
       delete process.env.CLAUDE_SESSION_ID;
       delete process.env.CLAUDE_PROJECT_DIR;
-      delete process.env.CONTEXT_MODE_PROJECT_DIR;
+      delete process.env.QUIET_CONTEXT_PROJECT_DIR;
       try {
         // bypassCache: this test runs after others may have populated the cache.
         const sid = resolveSessionIdFromSessionDB({
@@ -5085,9 +5085,9 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
 
         // currentAttribution wraps it the same way for prod callers — when the
         // env var is unset it must surface the DB-resolved sid via the
-        // wrapper too. We re-set CONTEXT_MODE_PROJECT_DIR so the wrapper's
+        // wrapper too. We re-set QUIET_CONTEXT_PROJECT_DIR so the wrapper's
         // own (cache-bypassed by 2s window starting fresh) call also resolves.
-        process.env.CONTEXT_MODE_PROJECT_DIR = projectDir;
+        process.env.QUIET_CONTEXT_PROJECT_DIR = projectDir;
         // Wait long enough that the previous lookup's 2s cache won't shadow
         // the wrapper's own resolveSessionIdFromSessionDB call (env-driven path).
         // Easier: bypass via a direct call shape — the wrapper just composes.
@@ -5100,8 +5100,8 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
       } finally {
         if (prevSid !== undefined) process.env.CLAUDE_SESSION_ID = prevSid;
         if (prevProjDir !== undefined) process.env.CLAUDE_PROJECT_DIR = prevProjDir;
-        if (prevCmProjDir !== undefined) process.env.CONTEXT_MODE_PROJECT_DIR = prevCmProjDir;
-        else delete process.env.CONTEXT_MODE_PROJECT_DIR;
+        if (prevCmProjDir !== undefined) process.env.QUIET_CONTEXT_PROJECT_DIR = prevCmProjDir;
+        else delete process.env.QUIET_CONTEXT_PROJECT_DIR;
       }
     } finally {
       try { rmSync(sessionsDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -5987,7 +5987,7 @@ describe("ctx_index: directory path support (#687)", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         CLAUDE_PROJECT_DIR: projectDirEnv,
       },
     });

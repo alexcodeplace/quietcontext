@@ -78,7 +78,7 @@ MCP server        → detects markdown file on next getStore() call
 LLM               → searches source:"session-events" for details on demand
 ```
 
-Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `ctx_search()` MCP tool.
+Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `search()` MCP tool.
 
 ### Multi-writer contract (v1.0.130 — see [docs/adr/0001-sessiondb-multi-writer.md](docs/adr/0001-sessiondb-multi-writer.md))
 
@@ -139,7 +139,7 @@ The symlink in step 2 ensures `hooks.json` (which registers PostToolUse, PreComp
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute|mcp__(?!plugin_context-mode_)",
+        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__execute|mcp__plugin_context-mode_context-mode__exec-file|mcp__plugin_context-mode_context-mode__batch|mcp__(?!plugin_context-mode_)",
         "hooks": [
           {
             "type": "command",
@@ -311,7 +311,7 @@ If your change doesn't fit any existing file, discuss with the maintainer before
 
 ### Output quality matters
 
-When your change affects tool output (ctx_execute, ctx_search, ctx_fetch_and_index, etc.), always compare before and after:
+When your change affects tool output (execute, search, fetch-index, etc.), always compare before and after:
 
 1. Run the same prompt **before** your change (on `main`)
 2. Run it **again** with your change
@@ -356,7 +356,7 @@ context-mode does not dictate how the model writes its final answer. The four pi
 - Do **not** add brevity directives to MCP tool descriptions in `src/server.ts`.
 - Do **not** add `<communication_style>` or `<response_format>` blocks to `hooks/routing-block.mjs`.
 - Do **not** put "Terse like caveman" / "Only fluff die" / "Drop articles, filler" / "fewer than N lines" wording in any shipped adapter config under `configs/*/`.
-- Workflow-discipline rules — "write artifacts to FILES", "use descriptive `ctx_search` source labels", `<artifact_policy>` — are fine. They describe *what to do* (file vs. inline), not *how to write*.
+- Workflow-discipline rules — "write artifacts to FILES", "use descriptive `search` source labels", `<artifact_policy>` — are fine. They describe *what to do* (file vs. inline), not *how to write*.
 
 The regression test at `tests/core/server.test.ts > prose-style policy (#482)` pins the deletion: any caveman-style language landing in `src/server.ts`, `hooks/routing-block.mjs`, or `README.md` will fail CI.
 

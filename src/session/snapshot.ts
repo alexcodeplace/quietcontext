@@ -403,6 +403,22 @@ function buildIntentSection(intentEvents: StoredEvent[]): string {
 }
 
 /**
+ * Restore the most recent stated session goal verbatim. Placed at the top of
+ * the snapshot (right after how_to_search) so the resuming LLM reads the
+ * active objective before anything else and keeps working toward it.
+ */
+function buildGoalSection(goalEvents: StoredEvent[]): string {
+  if (goalEvents.length === 0) return "";
+  const lastGoal = goalEvents[goalEvents.length - 1];
+  return [
+    `  <session_goal>`,
+    `  The active objective for this session. Keep working toward it until it is met; do not ask the user to restate it.`,
+    `    ${escapeXML(lastGoal.data)}`,
+    `  </session_goal>`,
+  ].join("\n");
+}
+
+/**
  * Raw-prompt safety net (issue #535):
  * Always surface the most recent user prompts verbatim so the next LLM
  * sees them even if every universal-rule detector misses. Bound per-prompt
@@ -472,6 +488,7 @@ export function buildResumeSnapshot(
   const gitEvents: StoredEvent[] = [];
   const subagentEvents: StoredEvent[] = [];
   const intentEvents: StoredEvent[] = [];
+  const goalEvents: StoredEvent[] = [];
   const skillEvents: StoredEvent[] = [];
   const roleEvents: StoredEvent[] = [];
   const userPromptEvents: StoredEvent[] = [];
@@ -488,6 +505,7 @@ export function buildResumeSnapshot(
       case "git": gitEvents.push(ev); break;
       case "subagent": subagentEvents.push(ev); break;
       case "intent": intentEvents.push(ev); break;
+      case "goal": goalEvents.push(ev); break;
       case "skill": skillEvents.push(ev); break;
       case "role": roleEvents.push(ev); break;
       case "user-prompt": userPromptEvents.push(ev); break;
@@ -504,6 +522,10 @@ export function buildResumeSnapshot(
   Do NOT ask the user to re-explain prior work. Search first.
   Do NOT invent your own queries — use the ones provided.
   </how_to_search>`);
+
+  // Session goal first — the objective the LLM must keep working toward.
+  const goal = buildGoalSection(goalEvents);
+  if (goal) sections.push(goal);
 
   const files = buildFilesSection(fileEvents, searchTool);
   if (files) sections.push(files);

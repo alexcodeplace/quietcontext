@@ -136,7 +136,19 @@ export interface RuntimeStats {
   calls: Record<string, number>;
   sessionStart: number;
   cacheHits: number;
+  cacheMisses?: number;
   cacheBytesSaved: number;
+}
+
+/**
+ * Index observability snapshot — point-in-time view of the persistent
+ * content store. Optional input to `formatReport` so callers that don't
+ * have store access (or don't want the extra DB hit) can omit it.
+ */
+export interface IndexState {
+  totalChunks: number;
+  totalSources: number;
+  lastIndexedAt?: string; // ISO-8601 when available
 }
 
 // ─────────────────────────────────────────────────────────
@@ -160,6 +172,8 @@ export interface FullReport {
   };
   cache?: {
     hits: number;
+    misses: number;
+    hit_rate: number; // hits / (hits + misses); 0 when both are zero
     bytes_saved: number;
     ttl_hours_left: number;
     total_with_cache: number;
@@ -211,7 +225,8 @@ export const categoryLabels: Record<string, string> = {
   // Configuration & intent
   rule: "Project rules (CLAUDE.md)",
   prompt: "Your requests saved",
-  intent: "Session goal",
+  intent: "Session intent",
+  goal: "Session goal",
   role: "Behavior rules",
   constraint: "Constraints you set",
   // Tools & delegation
@@ -381,7 +396,8 @@ export class AnalyticsEngine {
       let median: number | null = null;
       let max: number | null = null;
       if (b.concurrencies.length > 0) {
-        const sorted = [...b.concurrencies].sort((a, c) => a - c);
+        b.concurrencies.sort((a, c) => a - c);
+        const sorted = b.concurrencies;
         const mid = Math.floor(sorted.length / 2);
         median = sorted.length % 2 === 0
           ? (sorted[mid - 1] + sorted[mid]) / 2
@@ -448,12 +464,21 @@ export class AnalyticsEngine {
 
     // ── Cache ──
     let cache: FullReport["cache"];
-    if (runtimeStats.cacheHits > 0 || runtimeStats.cacheBytesSaved > 0) {
+    const cacheMisses = runtimeStats.cacheMisses ?? 0;
+    if (runtimeStats.cacheHits > 0 || runtimeStats.cacheBytesSaved > 0 || cacheMisses > 0) {
       const totalWithCache = totalProcessed + runtimeStats.cacheBytesSaved;
       const totalSavingsRatio = totalWithCache / Math.max(totalBytesReturned, 1);
       const ttlHoursLeft = Math.max(0, 24 - Math.floor((Date.now() - runtimeStats.sessionStart) / (60 * 60 * 1000)));
+      // hit_rate is the nominal cache effectiveness — the metric ctx_stats
+      // historically inferred-only by diffing tokens_saved snapshots. When
+      // there is no activity we report 0 instead of NaN/undefined so the
+      // renderer stays JSON-safe.
+      const totalLookups = runtimeStats.cacheHits + cacheMisses;
+      const hitRate = totalLookups > 0 ? runtimeStats.cacheHits / totalLookups : 0;
       cache = {
         hits: runtimeStats.cacheHits,
+        misses: cacheMisses,
+        hit_rate: hitRate,
         bytes_saved: runtimeStats.cacheBytesSaved,
         ttl_hours_left: ttlHoursLeft,
         total_with_cache: totalWithCache,
@@ -593,7 +618,7 @@ export interface AdapterDirEntry {
  * so a single call surfaces "your work everywhere on this machine across
  * all AI tools" (the marketing line).
  *
- * Returns ALL 15 adapters even when the dir doesn't exist on disk — the
+ * Returns ALL 17 adapters even when the dir doesn't exist on disk — the
  * scanner functions filter to existing dirs. That keeps the enumeration
  * pure / testable without filesystem dependencies.
  */
@@ -604,10 +629,12 @@ export function enumerateAdapterDirs(opts?: { home?: string }): AdapterDirEntry[
     ["claude-code",      [".claude"]],
     ["gemini-cli",       [".gemini"]],
     ["antigravity",      [".gemini"]],
+    ["antigravity-cli",  [".gemini"]],
     ["openclaw",         [".openclaw"]],
     ["codex",            [".codex"]],
     ["cursor",           [".cursor"]],
     ["vscode-copilot",   [".vscode"]],
+    ["copilot-cli",      [".copilot"]],
     ["kiro",             [".kiro"]],
     ["pi",               [".pi"]],
     ["omp",              [".omp"]],
@@ -1247,6 +1274,18 @@ export function getRealBytesStats(opts: {
             ).get(opts.sessionId) as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
+          try {
+            // "With context-mode" = the bytes the model paid to ACCESS the
+            // kept-out content: ctx_search (query the index) + ctx_fetch_and_index
+            // (fetch + index a URL). Sandbox compute (ctx_execute/batch/file) is
+            // work-output the model would see regardless — NOT redirect savings —
+            // so it is excluded; folding it crushed the bar to a false ~43%.
+            const tc = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls
+               WHERE session_id = ? AND tool IN ('ctx_search', 'ctx_fetch_and_index')`,
+            ).get(opts.sessionId) as { bytes: number } | undefined;
+            if (tc?.bytes) bytesReturned += Number(tc.bytes);
+          } catch { /* old schema: no tool_calls table */ }
         } else if (opts.projectDir) {
           // Bug E+F: META-scoped aggregation. Take every session_id whose
           // session_meta.project_dir matches, then sum ALL of those
@@ -1280,6 +1319,17 @@ export function getRealBytesStats(opts: {
             ).get(opts.projectDir) as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
+          try {
+            const tc = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes
+               FROM tool_calls
+               WHERE session_id IN (
+                 SELECT session_id FROM session_meta WHERE project_dir = ?
+               )
+               AND tool IN ('ctx_search', 'ctx_fetch_and_index')`,
+            ).get(opts.projectDir) as { bytes: number } | undefined;
+            if (tc?.bytes) bytesReturned += Number(tc.bytes);
+          } catch { /* old schema: no tool_calls table */ }
         } else {
           const row = sdb.prepare(
             `SELECT
@@ -1301,6 +1351,13 @@ export function getRealBytesStats(opts: {
             ).get() as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
+          try {
+            const tc = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls
+               WHERE tool IN ('ctx_search', 'ctx_fetch_and_index')`,
+            ).get() as { bytes: number } | undefined;
+            if (tc?.bytes) bytesReturned += Number(tc.bytes);
+          } catch { /* old schema: no tool_calls table */ }
         }
       } finally {
         sdb.close();
@@ -1329,6 +1386,67 @@ export function getRealBytesStats(opts: {
   );
 
   return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens };
+}
+
+/**
+ * v1.0.169 — Section 1 "Where you are now" = the LIVE conversation window.
+ *
+ * A single live conversation fans out into sub-agents and ctx_execute
+ * sub-process sessions. Each runs in its OWN, disposable context window (its
+ * own session_id) — but all under the SAME worktree DB, because the worktree
+ * hash is sha256(cwd) and they share the cwd. Their retrieval (ctx_search /
+ * ctx_fetch_and_index returns) entered THOSE windows and was thrown away when
+ * each returned its short summary; it never touched the window the user is
+ * reading now. So the live-window savings bar must split the worktree by
+ * which retrieval actually landed in the user's window:
+ *
+ *   bytesReturned ("With context-mode")  = THIS session's retrieval only —
+ *       what genuinely entered the live window.
+ *   bytesAvoided  ("kept out")           = everything the whole worktree moved
+ *       (avoided + every session's retrieval) MINUS what landed in your window.
+ *
+ * Scoping by `worktreeHash` (not project-root + time) means the user's OTHER
+ * parallel worktrees never bleed in — a different worktree is a different
+ * cwd-hash, hence a different DB file the prefix filter excludes — while the
+ * sub-agent fan-out this conversation actually spawned is fully credited.
+ */
+export function getConversationWindowStats(opts: {
+  sessionId: string;
+  worktreeHash: string;
+  sessionsDir?: string;
+  contentDbPath?: string;
+}): RealBytesStats {
+  // Whole current worktree: every session that shares this cwd-hash DB.
+  const pool = getRealBytesStats({
+    worktreeHash: opts.worktreeHash,
+    sessionsDir: opts.sessionsDir,
+  });
+  // Just the live window: this session_id (folds its own ctx_search/ctx_fetch
+  // retrieval + content chunks).
+  const mine = getRealBytesStats({
+    sessionId: opts.sessionId,
+    worktreeHash: opts.worktreeHash,
+    sessionsDir: opts.sessionsDir,
+    contentDbPath: opts.contentDbPath,
+  });
+
+  const windowReturned = mine.bytesReturned;
+  const movedTotal = pool.bytesAvoided + pool.bytesReturned;
+  // What context-mode kept OUT of the live window = everything moved across the
+  // worktree minus the slice that actually entered this window. Clamp at 0 so a
+  // stale/edge DB can never produce a negative bar.
+  const keptOut = Math.max(0, movedTotal - windowReturned);
+
+  return {
+    eventDataBytes: pool.eventDataBytes,
+    bytesAvoided: keptOut,
+    bytesReturned: windowReturned,
+    snapshotBytes: pool.snapshotBytes,
+    contentBytes: mine.contentBytes,
+    totalSavedTokens: Math.floor(
+      (pool.eventDataBytes + keptOut + pool.snapshotBytes) / 4,
+    ),
+  };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1642,10 +1760,12 @@ export const adapterLabels: Record<string, string> = {
   "claude-code":       "Claude Code",
   "gemini-cli":        "Gemini CLI",
   "antigravity":       "Antigravity",
+  "antigravity-cli":   "Antigravity CLI",
   "openclaw":          "Openclaw",
   "codex":             "Codex CLI",
   "cursor":            "Cursor",
   "vscode-copilot":    "VS Code Copilot",
+  "copilot-cli":       "GitHub Copilot CLI",
   "kiro":              "Kiro",
   "pi":                "Pi",
   "omp":               "OMP",
@@ -1717,7 +1837,7 @@ function formatDuration(uptimeMin: string): string {
  * Locale + IANA-timezone detection for the narrative renderer.
  *
  * Cascade (each level overrides the next):
- *   1. CONTEXT_MODE_LOCALE / CONTEXT_MODE_TZ env overrides
+ *   1. QUIET_CONTEXT_LOCALE / QUIET_CONTEXT_TZ env overrides
  *      (used by tests + by users who want to pin output regardless of OS).
  *   2. macOS `defaults read -g AppleLocale` → `en_TR` style → `en-TR`.
  *   3. Linux `LANG` / `LC_TIME` env vars.
@@ -1760,7 +1880,7 @@ function isUsableBcp47Locale(raw: string): boolean {
 
 export function detectLocaleAndTz(): { locale: string; tz: string } {
   const env = (process.env ?? {}) as Record<string, string | undefined>;
-  let locale = env.CONTEXT_MODE_LOCALE ?? "";
+  let locale = env.QUIET_CONTEXT_LOCALE ?? "";
   if (locale && !isUsableBcp47Locale(locale)) locale = "";
   if (!locale) {
     if (process.platform === "darwin") {
@@ -1791,7 +1911,7 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
     }
   }
 
-  let tz = env.CONTEXT_MODE_TZ ?? "";
+  let tz = env.QUIET_CONTEXT_TZ ?? "";
   if (!tz) {
     try {
       tz = new Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -1836,11 +1956,11 @@ function shortPath(abs: string): string {
  * the section disappears cleanly on a fresh install.
  *
  * Math constants:
- *   Opus 4   = $15.00 per 1M input tokens (matches OPUS_INPUT_PRICE_PER_TOKEN)
- *   Sonnet 4 = $3.00  per 1M input tokens
- *   GPT-4o   = $2.50  per 1M input tokens
- *   Gemini 2 = $1.25  per 1M input tokens
- *   Haiku 4  = $0.80  per 1M input tokens
+ *   Opus 4.7/4.8 = $5.00 per 1M input tokens (fallback when QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN not set)
+ *   Sonnet 4.6   = $3.00 per 1M input tokens
+ *   GPT-4o       = $2.50 per 1M input tokens
+ *   Gemini 2     = $1.25 per 1M input tokens
+ *   Haiku 4.5    = $1.00 per 1M input tokens
  *   Cursor Pro       = $20  / month  → "X months of Cursor Pro"
  *   Claude Max       = $200 / month  → "X.X months of Claude Max"
  *   Weekend coding   ≈ $73.67        → "X weekends of nonstop API coding"
@@ -1853,36 +1973,55 @@ export function renderCostExample(
 ): string[] {
   if (!Number.isFinite(lifetimeTokens) || lifetimeTokens <= 0) return [];
 
-  const opusUsd = (lifetimeTokens * 15) / 1_000_000;
+  const lifetimeUsd = lifetimeTokens * pricePerToken();
   const usdStr  = (n: number, dp: number = 2): string => n.toFixed(dp);
 
   // Comparison units — kept locally so they're easy to tune without touching
   // the renderer logic. Cursor Pro & Claude Max are public list prices; the
   // weekend constant is an intentional approximation calibrated to make
   // $1399.73 → "19 weekends" line up with the demo target.
-  const cursorMonths     = Math.round(opusUsd / 20);
-  const claudeMaxMonths  = (opusUsd / 200).toFixed(1);
-  const weekendCount     = Math.round(opusUsd / 73.67);
-  const teamUsd          = Math.round(opusUsd * 10);
+  const cursorMonths     = Math.round(lifetimeUsd / 20);
+  const claudeMaxMonths  = (lifetimeUsd / 200).toFixed(1);
+  const weekendCount     = Math.round(lifetimeUsd / 73.67);
+  const teamUsd          = Math.round(lifetimeUsd * 10);
   const teamYearUsd      = lifetimeDays > 0
-    ? Math.round((opusUsd * 10) / lifetimeDays * 365)
+    ? Math.round((lifetimeUsd * 10) / lifetimeDays * 365)
     : 0;
 
   // Alternate-model scale row — same token count, different per-1M rates.
-  const sonnetUsd = ((lifetimeTokens * 3.0)  / 1_000_000).toFixed(2);
-  const gpt4oUsd  = ((lifetimeTokens * 2.5)  / 1_000_000).toFixed(2);
-  const geminiUsd = ((lifetimeTokens * 1.25) / 1_000_000).toFixed(2);
-  const haikuUsd  = ((lifetimeTokens * 0.8)  / 1_000_000).toFixed(2);
+  // (Kept for internal reference but unreachable per Mert directive.)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _sonnetUsd = ((lifetimeTokens * 3.0)  / 1_000_000).toFixed(2);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _gpt4oUsd  = ((lifetimeTokens * 2.5)  / 1_000_000).toFixed(2);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _geminiUsd = ((lifetimeTokens * 1.25) / 1_000_000).toFixed(2);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _haikuUsd  = ((lifetimeTokens * 1.0)  / 1_000_000).toFixed(2);
+
+  const usingDynamicPrice =
+    process.env.QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN !== undefined;
+  const modelId = process.env.QUIET_CONTEXT_PI_MODEL_ID;
 
   // Mert: "daha marketing ve business value e vermeli, math hesaplamalari ile
-  // kalabalik yapma" — collapse the old 4-block render (5 prose lines + 3
-  // comparison lines + 2 team lines + scaling table + disclaimer) into ONE
-  // headline number, ONE relatable comparison, ONE team-scale callout. Drop
-  // the alternate-model scaling row (engineer-curiosity, not value framing).
+  // kalabalik yapma" — collapse the old 4-block render into ONE headline
+  // number, ONE relatable comparison, ONE team-scale callout.
   const out: string[] = [];
-  out.push(
-    `  $${usdStr(opusUsd)} of Opus 4 tokens your team didn't burn.`,
-  );
+
+  if (usingDynamicPrice && modelId) {
+    out.push(
+      `  $${usdStr(lifetimeUsd)} of ${modelId} tokens your team didn't burn.`,
+    );
+  } else if (usingDynamicPrice) {
+    out.push(
+      `  $${usdStr(lifetimeUsd)} of tokens your team didn't burn.`,
+    );
+  } else {
+    out.push(
+      `  $${usdStr(lifetimeUsd)} of Opus 4.7 tokens your team didn't burn.`,
+    );
+  }
+
   out.push(
     `  context-mode kept ${kb(lifetimeBytes)} out of context — that's ${cursorMonths} months of Cursor Pro paid for itself.`,
   );
@@ -1892,10 +2031,13 @@ export function renderCostExample(
       `  Scale across a 10-dev team and that's ~$${teamYearUsd.toLocaleString("en-US")}/year saved.`,
     );
   }
-  out.push("");
-  out.push(
-    `  (Opus rates shown for context. On cheaper models the dollar number drops; the savings ratio holds.)`,
-  );
+
+  if (!usingDynamicPrice) {
+    out.push("");
+    out.push(
+      `  (Opus rates shown for context. On cheaper models the dollar number drops; the savings ratio holds.)`,
+    );
+  }
   return out;
 }
 
@@ -2074,7 +2216,7 @@ function renderNarrative5Section(args: {
     const convMult   = Math.max(1, Math.round(convTokensWithout / convTokensWith));
     out.push(`  Without context-mode  ${kb(convBytesWithout).padStart(8)}  ${withoutBar}   ${fmtNum(convTokensWithout).padStart(7)} tokens`);
     out.push(`  With context-mode     ${kb(convBytesWith).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
-    out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
+    out.push(`                          ${convPct.toFixed(1)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
     out.push("");
   }
 
@@ -2337,13 +2479,49 @@ function fmtNum(n: number): string {
 // Pricing (Bug #6) — Anthropic Opus input rate
 // ─────────────────────────────────────────────────────────
 
-/** Opus 4 input price: $15 per 1M tokens. */
-export const OPUS_INPUT_PRICE_PER_TOKEN = 15 / 1_000_000;
+// ── Pricing (Bug #6) — per-token USD rate ─────────────────
+// Reads QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN when set by a Pi host;
+// falls back to the Opus 4.7/4.8 input rate ($5/1M) for all other adapters.
+// Verified against platform.claude.com/docs/en/about-claude/pricing 2026-06.
+//
+// IMPORTANT: this is a FUNCTION, not a const. Pi sets the env var
+// AFTER the MCP server has been imported (the bridge spawns the server
+// child, then the child reads its own env on every render). A
+// module-load-time const would freeze to the fallback because
+// process.env.QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN is unset at
+// import time. Resolving on every call keeps the dynamic-pricing
+// contract honest — the env var works without an MCP restart.
+// (Reverted module-load const semantics, PR #741 follow-up.)
 
-/** Convert a token count to a USD string at the Opus input rate. */
+/**
+ * Per-token USD rate — resolves on every call.
+ * Dynamic when QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN is set, Opus 4.7/4.8 input
+ * ($5 per 1M tokens) otherwise.
+ */
+export function pricePerToken(): number {
+  const env = process.env.QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN;
+  if (env !== undefined && env !== "") {
+    const parsed = Number(env);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 5 / 1_000_000; // Opus 4.7/4.8 input fallback
+}
+
+/**
+ * Back-compat alias for the original Opus-rate const (PR #401 architect
+ * P1.1 — single source of truth). Kept as a literal so any third-party
+ * consumer importing the named constant still resolves to the same
+ * fallback rate. New code should call pricePerToken() to pick up the
+ * dynamic Pi env override.
+ *
+ * @deprecated Use pricePerToken() to honor QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN.
+ */
+export const OPUS_INPUT_PRICE_PER_TOKEN = 5 / 1_000_000;
+
+/** Convert a token count to a USD string at the current per-token rate. */
 export function tokensToUsd(tokens: number): string {
   const safe = Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
-  return `$${(safe * OPUS_INPUT_PRICE_PER_TOKEN).toFixed(2)}`;
+  return `$${(safe * pricePerToken()).toFixed(2)}`;
 }
 
 /**
@@ -2590,8 +2768,9 @@ function renderConversation(c: ConversationStats, conversationUsd: string, contr
  */
 function renderMultiAdapter(multiAdapter: MultiAdapterLifetimeStats | undefined): string[] {
   if (!multiAdapter) return [];
-  const real     = multiAdapter.perAdapter.filter((a) => a.isReal);
-  const skipped  = multiAdapter.perAdapter.filter((a) => !a.isReal);
+  const real: typeof multiAdapter.perAdapter = [];
+  const skipped: typeof multiAdapter.perAdapter = [];
+  for (const a of multiAdapter.perAdapter) (a.isReal ? real : skipped).push(a);
   if (real.length === 0 && skipped.length === 0) return [];
 
   const out: string[] = [];
@@ -2681,6 +2860,12 @@ export function formatReport(
      * single-adapter renderer output unchanged.
      */
     multiAdapter?: MultiAdapterLifetimeStats;
+    /**
+     * Point-in-time snapshot of the persistent content store. Optional —
+     * callers that don't have store access can omit it and the renderer
+     * skips the observability section gracefully.
+     */
+    indexState?: IndexState;
     /**
      * 5-section narrative renderer overrides. Defaults to ambient
      * `process.cwd()` + `Date.now()` + `detectLocaleAndTz()` for production

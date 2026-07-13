@@ -288,7 +288,7 @@ source it expects. If even one platform directory is missing, the
 agent's response MUST be:
 
 1. Detect the gap: `[ ! -d refs/platforms/<name> ]` or empty.
-2. Issue parallel clones — `ctx_batch_execute(commands, concurrency: 8)`
+2. Issue parallel clones — `batch(commands, concurrency: 8)`
    with one `git clone --depth 1 <url> refs/platforms/<name>`
    command per missing platform. Concurrency MUST be 4-8 to stay
    inside GitHub's rate limit for unauthenticated clones.

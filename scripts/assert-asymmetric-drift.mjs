@@ -26,7 +26,7 @@
 //
 // Contract:
 //   - Read `.mcp.json.example` and `.claude-plugin/plugin.json` from --root.
-//   - Extract mcpServers["context-mode"].args[0] from each.
+//   - Extract mcpServers[the plugin name].args[0] from each.
 //   - Assert both equal the literal `${CLAUDE_PLUGIN_ROOT}/start.mjs`.
 //   - Assert the two values are equal (the explicit drift check).
 //   - If a `.mcp.json` exists (contributor's local copy), check it too —
@@ -42,7 +42,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}/start.mjs";
-const PLUGIN_KEY = "context-mode";
+const DEFAULT_PLUGIN_KEY = "context-mode";
 const SKILLS_PATH = "./skills/";
 const REQUIRED_PLUGIN_RUNTIME_FILES = [
   "start.mjs",
@@ -61,7 +61,7 @@ function parseArgs(argv) {
   return out;
 }
 
-function readArgs0(filePath) {
+function readArgs0(filePath, pluginKey = DEFAULT_PLUGIN_KEY) {
   if (!existsSync(filePath)) return { ok: false, error: `missing: ${filePath}` };
   let parsed;
   try {
@@ -73,9 +73,9 @@ function readArgs0(filePath) {
   if (!servers || typeof servers !== "object") {
     return { ok: false, error: `no mcpServers in ${filePath}` };
   }
-  const ours = servers[PLUGIN_KEY];
+  const ours = servers[pluginKey];
   if (!ours || typeof ours !== "object" || !Array.isArray(ours.args) || ours.args.length === 0) {
-    return { ok: false, error: `no args[] for ${PLUGIN_KEY} in ${filePath}` };
+    return { ok: false, error: `no args[] for ${pluginKey} in ${filePath}` };
   }
   const a0 = ours.args[0];
   if (typeof a0 !== "string") {
@@ -107,9 +107,12 @@ function main() {
   /** @type {string[]} */
   const violations = [];
 
-  const example = readArgs0(exampleJsonPath);
-  const plg = readArgs0(pluginJsonPath);
   const pluginJson = readJson(pluginJsonPath);
+  const pluginKey = pluginJson.ok && typeof pluginJson.value?.name === "string"
+    ? pluginJson.value.name
+    : DEFAULT_PLUGIN_KEY;
+  const example = readArgs0(exampleJsonPath, pluginKey);
+  const plg = readArgs0(pluginJsonPath, pluginKey);
 
   if (!example.ok) violations.push(example.error);
   if (!plg.ok) violations.push(plg.error);
@@ -157,7 +160,7 @@ function main() {
   // Contributor's local .mcp.json (if present) — must match the template.
   // Absence is fine; the file is .gitignored after the #531 architectural untrack.
   if (existsSync(localMcpJsonPath)) {
-    const local = readArgs0(localMcpJsonPath);
+    const local = readArgs0(localMcpJsonPath, pluginKey);
     if (local.ok && local.value !== PLACEHOLDER) {
       violations.push(
         `local .mcp.json args[0] is "${local.value}" but must equal "${PLACEHOLDER}". ` +

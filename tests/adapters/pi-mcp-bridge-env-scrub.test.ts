@@ -58,7 +58,7 @@ describe("Pi MCPStdioClient — foreign workspace env scrub (issue #545)", () =>
       CLAUDE_PLUGIN_ROOT: "/some/plugin/root",
       CLAUDE_CODE_ENTRYPOINT: "cli",
       // Universal escape hatch — never scrubbed.
-      CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+      QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       // Non-platform env — preserved as-is (not in any registry).
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: "/Users/x",
@@ -94,7 +94,7 @@ describe("Pi MCPStdioClient — foreign workspace env scrub (issue #545)", () =>
     expect(spawned.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
 
     // Universal escape hatch — PRESERVED.
-    expect(spawned.CONTEXT_MODE_PROJECT_DIR).toBe("/Users/x/escape");
+    expect(spawned.QUIET_CONTEXT_PROJECT_DIR).toBe("/Users/x/escape");
 
     // Non-platform env — PRESERVED.
     expect(spawned.HOME).toBe("/Users/x");
@@ -154,7 +154,7 @@ describe("Pi MCPStdioClient — foreign identification env scrub (issue #561)", 
       PI_SESSION_FILE: "/Users/x/.pi/sessions/active.json",
       PI_COMPILED: "1",
       // Universal escape hatch — never scrubbed.
-      CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+      QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       // Non-platform env — preserved as-is.
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: "/Users/x",
@@ -189,7 +189,7 @@ describe("Pi MCPStdioClient — foreign identification env scrub (issue #561)", 
     expect(spawned.PI_COMPILED).toBe("1");
 
     // Universal escape hatch — PRESERVED.
-    expect(spawned.CONTEXT_MODE_PROJECT_DIR).toBe("/Users/x/escape");
+    expect(spawned.QUIET_CONTEXT_PROJECT_DIR).toBe("/Users/x/escape");
 
     // Non-platform env — PRESERVED.
     expect(spawned.HOME).toBe("/Users/x");

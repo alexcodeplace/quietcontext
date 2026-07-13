@@ -8,7 +8,7 @@
 | Metric | Value |
 |--------|-------|
 | Total scenarios | 21 |
-| Tools benchmarked | `ctx_execute_file` (summarize) + `ctx_index`/`ctx_search` (knowledge retrieval) |
+| Tools benchmarked | `exec-file` (summarize) + `index`/`search` (knowledge retrieval) |
 | Large output handling | Auto-externalize to FTS5 (>100 KB → pointer) |
 | Total raw data processed | 376 KB |
 | Total context consumed | 16.5 KB |
@@ -19,15 +19,15 @@
 
 | Data Type | Best Tool | Why |
 |-----------|-----------|-----|
-| Documentation, API refs | `ctx_index` + `ctx_search` | Need exact code examples — not summaries |
-| Skills prompts | `ctx_index` + `ctx_search` | Large prompts eat context; search on-demand |
-| MCP tool signatures | `ctx_index` + `ctx_search` | Need exact tool names and parameters |
-| Log files, test output | `ctx_execute_file` | Need aggregate stats, not raw lines |
-| CSV data, analytics | `ctx_execute_file` | Need computed metrics |
-| Build output | `ctx_execute_file` | Need error counts, not full logs |
-| Browser snapshots | `ctx_execute_file` | Need page structure summary |
+| Documentation, API refs | `index` + `search` | Need exact code examples — not summaries |
+| Skills prompts | `index` + `search` | Large prompts eat context; search on-demand |
+| MCP tool signatures | `index` + `search` | Need exact tool names and parameters |
+| Log files, test output | `exec-file` | Need aggregate stats, not raw lines |
+| CSV data, analytics | `exec-file` | Need computed metrics |
+| Build output | `exec-file` | Need error counts, not full logs |
+| Browser snapshots | `exec-file` | Need page structure summary |
 
-## Part 1: `ctx_execute_file` — Structured Data Processing
+## Part 1: `exec-file` — Structured Data Processing
 
 *Best for: logs, test output, CSV, build output — data where summaries are more useful than raw content.*
 
@@ -50,7 +50,7 @@
 
 **Subtotal: 315 KB raw → 5.5 KB context (98% savings)**
 
-## Part 2: `ctx_index` + `ctx_search` — Knowledge Retrieval (FTS5 BM25)
+## Part 2: `index` + `search` — Knowledge Retrieval (FTS5 BM25)
 
 *Best for: documentation, code examples, API references, Skills — content where you need EXACT text, not summaries.*
 
@@ -65,37 +65,37 @@
 
 **Subtotal: 60.3 KB raw → 11.0 KB context (82% savings)**
 
-**Key difference from `ctx_execute_file`:** Code examples are returned **exactly as written** — not summarized. A `useEffect` cleanup pattern comes back with the full code block intact.
+**Key difference from `exec-file`:** Code examples are returned **exactly as written** — not summarized. A `useEffect` cleanup pattern comes back with the full code block intact.
 
-### Why `ctx_index + ctx_search` savings are lower
+### Why `index + search` savings are lower
 
-`ctx_execute_file` achieves 95-100% savings because it compresses data into 1-2 line summaries. `ctx_index + ctx_search` achieves 50-93% savings because it returns **complete, exact chunks** — the actual code examples, not descriptions of them. This is by design:
+`exec-file` achieves 95-100% savings because it compresses data into 1-2 line summaries. `index + search` achieves 50-93% savings because it returns **complete, exact chunks** — the actual code examples, not descriptions of them. This is by design:
 
-- `ctx_execute_file` on React docs: `"5 code blocks, 3 sections about cleanup"` → **useless for coding**
-- `ctx_index + ctx_search` on React docs: returns the full `useEffect(() => { ... }, [deps])` block → **actually useful**
+- `exec-file` on React docs: `"5 code blocks, 3 sections about cleanup"` → **useless for coding**
+- `index + search` on React docs: returns the full `useEffect(() => { ... }, [deps])` block → **actually useful**
 
 ## Part 3: Large Output Externalization (FTS5 Pointer)
 
-*When output exceeds 100 KB, context-mode auto-indexes the full content into FTS5 and returns a pointer message instead of raw content. No data is discarded — the LLM queries it on demand via `ctx_search()`.*
+*When output exceeds 100 KB, context-mode auto-indexes the full content into FTS5 and returns a pointer message instead of raw content. No data is discarded — the LLM queries it on demand via `search()`.*
 
 | Before | After |
 |---|---|
 | Raw output floods context window | Output indexed into FTS5, pointer returned |
 | LLM sees truncated/partial content | Full content preserved, queryable on demand |
 | Large logs: **LOST** | Large logs: **FULLY INDEXED** |
-| `"... [output truncated]"` | `"Indexed N sections from: execute:shell\nUse ctx_search(...) to query."` |
+| `"... [output truncated]"` | `"Indexed N sections from: execute:shell\nUse search(...) to query."` |
 
 ### Example
 
 ```
-# ctx_execute output > 100 KB:
+# execute output > 100 KB:
 
 Indexed 42 sections (12 with code) from: execute:shell
-Use ctx_search(queries: ["..."]) to query this content.
+Use search(queries: ["..."]) to query this content.
 Use source: "execute:shell" to scope results.
 ```
 
-The LLM retrieves only the relevant sections via `ctx_search()` — no context budget wasted on raw output.
+The LLM retrieves only the relevant sections via `search()` — no context budget wasted on raw output.
 
 ## Context Window Impact
 

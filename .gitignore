@@ -35,3 +35,6 @@ context-mode-guidance-*/
 .cw/
 /.cocoindex_code/
 /.kilo/
+.throwaway-codex/
+.throwaway-codex-data/
+test-workspace/

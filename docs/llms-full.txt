@@ -752,7 +752,7 @@ Self-update from GitHub:
 - **Binary output:** Decoded as UTF-8 (may produce replacement characters).
 - **Timeout:** Returns partial stdout collected before kill + timeout message with elapsed time.
 - **Hard cap exceeded (>100 MB):** Process tree killed immediately, stderr appended with `"[output capped at 100MB -- process killed]"`.
-- **Large output externalization (>100 KB):** Full stdout auto-indexed into FTS5; pointer message returned: `"Indexed N sections from: execute:<lang>\nUse ctx_search(...) to query."`.
+- **Large output externalization (>100 KB):** Full stdout auto-indexed into FTS5; pointer message returned: `"Indexed N sections from: execute:<lang>\nUse search(...) to query."`.
 
 ### Search Constraints
 

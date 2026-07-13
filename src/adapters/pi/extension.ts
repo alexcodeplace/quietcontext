@@ -18,11 +18,11 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import type { ProjectAttribution } from "../../session/project-attribution.js";
-import { extractEvents, extractUserEvents } from "../../session/extract.js";
+import { extractEvents, extractUserEvents, parsePiUsage, buildAgentUsageEvent } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
-import { bootstrapMCPTools, type BridgeHandle } from "./mcp-bridge.js";
+import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -149,36 +149,21 @@ let _mcpBridge: BridgeHandle | null = null;
  * can `await` the wiring deterministically without relying on internal
  * timing or `setImmediate` polling.
  *
- * Reset to a fresh promise on every `piExtension(pi)` call so repeated
- * registrations in one test process don't see a stale resolution from
- * a prior load.
+ * Starts as an already-settled promise because the bridge is now bootstrapped
+ * lazily from `before_agent_start`, not during extension discovery.
  */
 export let _mcpBridgeReady: Promise<void> = Promise.resolve();
-
-// Cached routing-block string (built once per process from hooks/routing-block.mjs).
-let _routingBlock: string | null = null;
-async function getRoutingBlock(pluginRoot: string): Promise<string> {
-  if (_routingBlock !== null) return _routingBlock;
-  try {
-    const routingMod = await import(
-      pathToFileURL(join(pluginRoot, "hooks", "routing-block.mjs")).href
-    );
-    const namingMod = await import(
-      pathToFileURL(join(pluginRoot, "hooks", "core", "tool-naming.mjs")).href
-    );
-    const t = namingMod.createToolNamer("pi");
-    _routingBlock = String(routingMod.createRoutingBlock(t));
-  } catch {
-    _routingBlock = "";
-  }
-  return _routingBlock;
-}
 
 // Cached buildAutoInjection (500-token cap, prioritized).
 let _buildAutoInjection:
   | ((events: Array<{ category: string; data: string }>) => string)
   | null
   | undefined = undefined;
+
+// Pending context to inject via the 'context' hook (avoiding systemPrompt mutation
+// which breaks prefix prompt cache on DeepSeek/Anthropic/OpenAI).
+// See: https://github.com/mksglu/context-mode/issues/598
+let _pendingContext = "";
 async function getAutoInjection(
   pluginRoot: string,
 ): Promise<((events: Array<{ category: string; data: string }>) => string) | null> {
@@ -333,41 +318,61 @@ function handleCommandText(
   return { text };
 }
 
-// ── Pi short-circuit argv detection (#534) ───────────────
+// ── Pi MCP bridge lazy bootstrap (#534, #809) ───────────
 //
-// Pi's runtime loads every extension during module discovery, BEFORE its
-// `runCli()` decides whether the invocation is a real session or a
-// short-lived help / version print. Without this guard, even `pi --help`
-// causes us to spawn `server.bundle.mjs` as a long-lived stdio child —
-// which is then reparented to PID 1 the moment Pi's `--help` handler
-// returns. The MCP SDK's StdioServerTransport CPU-spins on the half-closed
-// pipe until the 30 s ppid poll catches up, accumulating multi-hour orphans
-// (see issue #534, plus the historical #311 / #388 fixes that only addressed
-// the *recovery* path — not the *prevention* path).
+// Pi loads extensions in several CLI paths that never dispatch an agent turn:
+// top-level help/version, package management (`install`, `list`, ...), config,
+// metadata commands, and project-trust probing. Bootstrapping the MCP bridge
+// during extension discovery is therefore the wrong signal: there may be no
+// real agent lifecycle and no `session_shutdown` cleanup. That caused both the
+// #534 short-lived help/version orphan class and the #809 package-command hang
+// (the bridge child's stdio handles kept Pi alive after `install`/`list`).
 //
-// Token set verified against the Pi 14.x source — specifically:
-//   refs/platforms/oh-my-pi/packages/coding-agent/src/cli.ts:runCli
-//
-//     if (first === "--help" || first === "-h" || first === "--version"
-//      || first === "-v" || first === "help") { /* short-circuit */ }
-//
-// We mirror it exactly — no inferred flags, no `-V` (Pi uses lowercase `-v`),
-// no `--no-help`. Anything else (including `pi stats --help`) routes through
-// the normal launch path and the bridge bootstraps as usual.
+// The robust signal is Pi's agent lifecycle itself. `before_agent_start` fires
+// only for invocations that are about to dispatch a model call, including
+// print-mode subagents (`pi --mode json -p --no-session`). We start and await
+// the bridge from that hook so ctx_* tools are present before Pi snapshots the
+// tool registry, while CLI-only commands never spawn a bridge at all.
 
-const PI_SHORT_CIRCUIT_TOKENS = new Set(["--help", "-h", "--version", "-v", "help"]);
+function startPiMCPBridge(
+  pi: any,
+  serverBundle: string,
+  shouldKeepHandle: () => boolean,
+  foreground: boolean,
+): Promise<void> {
+  if (existsSync(serverBundle)) {
+    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle, { foreground }).then(
+      (handle) => {
+        if (shouldKeepHandle()) {
+          _mcpBridge = handle;
+        } else {
+          // Bootstrap completed after this extension registration had already
+          // shut down or superseded the attempt. Do not publish a stale handle;
+          // immediately reclaim the child that bootstrap just spawned.
+          try {
+            handle.shutdown();
+          } catch {
+            // best effort — never throw from best-effort bridge cleanup
+          }
+        }
+      },
+      (err: unknown) => {
+        if (!shouldKeepHandle()) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        // #868: route to Pi's file logger, never process.stderr (raw-mode TUI).
+        makeBridgeDiag(pi)(
+          `[context-mode] WARNING: failed to bridge MCP tools to Pi (${msg}). ` +
+            `ctx_* tools will not be callable from this session.`,
+        );
+      },
+    );
+  } else {
+    // No bundle on disk → nothing to await. Tests can still rely on
+    // _mcpBridgeReady being a settled promise.
+    _mcpBridgeReady = Promise.resolve();
+  }
 
-/**
- * Returns true iff `argv` matches a Pi top-level short-circuit invocation
- * (help or version). Only argv[0] is inspected — Pi's runCli only checks
- * the first token, and subcommand-level `--help` (e.g. `pi stats --help`)
- * still spins up a real session, so we must NOT skip bootstrap there.
- *
- * Exported for unit tests.
- */
-export function isPiShortCircuitArgv(argv: readonly string[]): boolean {
-  if (argv.length === 0) return false;
-  return PI_SHORT_CIRCUIT_TOKENS.has(argv[0]);
+  return _mcpBridgeReady;
 }
 
 /**
@@ -424,6 +429,20 @@ export function resolvePiWorkspaceDir(opts: {
 export default function piExtension(pi: any): void {
   const buildDir = dirname(fileURLToPath(import.meta.url));
   const pluginRoot = resolve(buildDir, "..", "..", "..");
+  const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
+  let mcpBridgeStarted = false;
+  let mcpBridgeGeneration = 0;
+  const ensureMCPBridge = (foreground: boolean): Promise<void> => {
+    if (mcpBridgeStarted) return _mcpBridgeReady;
+    mcpBridgeStarted = true;
+    const generation = ++mcpBridgeGeneration;
+    return startPiMCPBridge(
+      pi,
+      serverBundle,
+      () => mcpBridgeStarted && mcpBridgeGeneration === generation,
+      foreground,
+    );
+  };
   // Issue #545 — Pi workspace resolver. PI_CONFIG_DIR is Pi's CONFIG dir
   // (~/.pi), NOT the user's workspace; using it as the project anchor
   // collapsed every Pi session into a single phantom workspace. The
@@ -585,20 +604,35 @@ export default function piExtension(pi: any): void {
 
   // ── 4. before_agent_start — Routing + active_memory + resume injection ─
 
-  pi.on("before_agent_start", async (event: any) => {
+  pi.on("before_agent_start", async (event: any, ctx: any) => {
     try {
-      // Block first agent start until the MCP bridge bootstrap has
-      // settled so the LLM call dispatched right after this handler
-      // sees the ctx_* tools in Pi's registry. Each subagent starts
-      // a fresh `pi --mode json -p --no-session` process whose only
-      // window to register tools is the gap between piExtension(pi)
-      // returning and the first before_agent_start firing — that gap
-      // is too small for the spawn → initialize → tools/list →
-      // pi.registerTool round-trip, so without this await the first
-      // (and often only) prompt of a subagent goes out with an empty
-      // ctx_* registry and the routing block becomes dead weight.
-      // Resolves on bootstrap failure too — the bridge is best-effort.
-      await _mcpBridgeReady;
+      _pendingContext = ""; // Reset — will be filled below if events exist
+      // Lazily start and await the MCP bridge only when Pi is about to
+      // dispatch a real agent turn. This is the non-brittle #534/#809 guard:
+      // help/version/package/config CLI paths may load the extension, but they
+      // never fire before_agent_start, so they never spawn server.bundle.mjs.
+      // Subagents (`pi --mode json -p --no-session`) do fire this hook; awaiting
+      // here ensures ctx_* tools are registered before Pi snapshots the tool
+      // registry for the model call. Resolves on bootstrap failure too — the
+      // bridge is best-effort.
+      //
+      // #868: the FOREGROUND interactive session's bridge child is spawned with
+      // the #854 idle reaper disabled (via ctx.hasUI), so a multi-minute human
+      // pause never drops its ctx_* tools. Subagents (hasUI:false) keep the
+      // reaper so abandoned children can't accumulate (#854).
+      //
+      // INVARIANT — deciding foreground on the FIRST before_agent_start is safe
+      // even though the bridge spawns single-flight (first-wins, no sticky
+      // latch): Pi wires the interactive uiContext inside `mode.init()`, which
+      // main.ts AWAITS before dispatching the first prompt — and
+      // before_agent_start is emitted only from the per-turn prompt path. So the
+      // foreground session's first hook ALWAYS observes hasUI:true; subagents are
+      // provably hasUI:false. There is no early-init window where the foreground
+      // transiently reads hasUI:false (that window is scoped to a separate,
+      // buffered credential event). Do NOT add a latch here — it would guard an
+      // unreachable state. (Verified against oh-my-pi: main.ts init→prompt order,
+      // interactive-mode.ts uiContext wiring, executor.ts subagent hasUI:false.)
+      await ensureMCPBridge(isForegroundSession(ctx));
 
       if (!_sessionId) return;
 
@@ -616,23 +650,37 @@ export default function piExtension(pi: any): void {
       const parts: string[] = [];
       if (existingPrompt) parts.push(existingPrompt);
 
-      // Pi-1: Inject routing block every turn.
-      // Unlike Claude Code where the SessionStart hook injects once into a persistent
-      // context, Pi rebuilds the system prompt fresh on every before_agent_start call.
-      // The routing block must be re-injected each turn or it disappears after turn 1.
-      const routingBlock = await getRoutingBlock(pluginRoot);
-      if (routingBlock) {
-        parts.push(routingBlock);
-      }
+      // Pi-1: Lightweight routing anchor — 7KB routing block is too heavy
+      // for Pi's context budget. Tool descriptions from pi.registerTool()
+      // already tell the model what each tool does. This anchor gives the
+      // deliberate choice (which tool for which scenario) without the full
+      // block/redirect/memory/tool-selection hierarchy.
+      parts.push(
+        "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
+        "Read/edit files → ctx_execute_file. Multi-command research → ctx_batch_execute. " +
+        "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
+        "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
+      );
 
       // Pi-3 + Pi-4: Always build active_memory (not just post-compact),
       // capped at 500 tokens via buildAutoInjection. Falls back to inline
       // budget loop if the helper is unavailable.
-      const activeEvents = db.getEvents(_sessionId, {
-        minPriority: 3,
-        limit: 50,
-      });
-      let behavioralDirective = "";
+      //
+      // Issue #856 — do NOT re-inject `role` as a standing behavioral_directive
+      // on every turn. A casual past phrase that classified as a role would
+      // otherwise be pinned and replayed each turn ("since you said 'that's
+      // fine for now', I'll leave it"), producing a do-nothing loop. Defense in
+      // depth: even if a stale `role` event exists (from an older build, or a
+      // genuine persona the user has since moved past), it must not become an
+      // inescapable per-turn standing order. Role events stay in the DB and
+      // remain queryable via ctx_search(source: "session-events"); intent,
+      // skills, decisions, and the resume snapshot are unaffected.
+      const activeEvents = db
+        .getEvents(_sessionId, {
+          minPriority: 3,
+          limit: 50,
+        })
+        .filter((e: any) => String(e.category ?? "") !== "role");
       if (activeEvents.length > 0) {
         const buildAuto = await getAutoInjection(pluginRoot);
         let memoryContext = "";
@@ -643,14 +691,6 @@ export default function piExtension(pi: any): void {
               data: String(e.data ?? ""),
             })),
           );
-          const bdMatch = memoryContext.match(/(<behavioral_directive>\n[^<]*\n<\/behavioral_directive>)/);
-          if (bdMatch) {
-            behavioralDirective = bdMatch[1];
-            memoryContext = memoryContext.replace(bdMatch[1], "");
-            if (memoryContext.match(/^<session_state[^>]*>\s*<\/session_state>\s*$/)) {
-              memoryContext = "";
-            }
-          }
         }
         // Fallback (or if helper produced empty output): inline 500-token cap.
         if (!memoryContext) {
@@ -675,15 +715,40 @@ export default function piExtension(pi: any): void {
         db.markResumeConsumed(_sessionId);
       }
 
-      if (behavioralDirective) parts.push(behavioralDirective);
-
-      // Return modified systemPrompt only if we added something beyond existing.
+      // Store extra context (routing anchor, active_memory, resume, behavioralDirective)
+      // for injection via the 'context' hook as a message, NOT as a systemPrompt
+      // modification. Mutating systemPrompt breaks prefix prompt caching on
+      // DeepSeek/Anthropic/OpenAI because the system message sits at messages[0]
+      // and any change invalidates the entire cache chain.
       const baseLen = existingPrompt ? 1 : 0;
       if (parts.length > baseLen) {
-        return { systemPrompt: parts.join("\n\n") };
+        const extraParts = parts.slice(baseLen);
+        _pendingContext = extraParts.join("\n\n");
+      } else {
+        _pendingContext = "";
       }
     } catch {
+      _pendingContext = ""; // Reset — ensure no stale data escapes
       // best effort — never break agent start
+    }
+  });
+
+  // ── 4a2. context — Inject active_memory + resume + behavioralDirective as message ──
+  // Uses the 'context' hook (like hindsight does) to append context at the END of
+  // messages rather than mutating systemPrompt at the beginning. This preserves
+  // prefix prompt cache for DeepSeek, Anthropic, and OpenAI.
+  pi.on("context", (event: any) => {
+    try {
+      if (!_pendingContext) return;
+      const ctx = _pendingContext;
+      _pendingContext = "";
+      event.messages.push({
+        role: "user",
+        content: ctx,
+      });
+      return { messages: event.messages };
+    } catch {
+      // best effort — never break context assembly
     }
   });
 
@@ -724,6 +789,36 @@ export default function piExtension(pi: any): void {
       );
     } catch {
       // best effort — never break provider response
+    }
+  });
+
+  // ── 4c. turn_end — per-turn token + native-USD cost capture ───
+  //
+  // Pi delivers per-turn usage on TurnEndEvent.message (an AssistantMessage):
+  // usage.{input,output,cacheRead,cacheWrite} + native usage.cost.total in USD,
+  // with model on .model. Usage is per-turn incremental, so each turn_end maps
+  // to exactly one structured `agent_usage` (category "cost") event — the same
+  // shape the Claude Code Stop path emits via buildAgentUsageEvent. We pass
+  // Pi's native cost as native_cost_usd so the builder trusts the source over
+  // the local price table (cost_confidence: HIGH — no price-table maintenance).
+  //
+  // Refs: adapter-matrix/pi.md @320261f — shared-events.ts:204-209 (TurnEndEvent),
+  // ai/src/types.ts:510/521 (model/usage), catalog/src/types.ts:100-145 (Usage).
+  // Best-effort: parse is null-safe and the handler never throws (a telemetry
+  // forwarder must never break the agent turn).
+  pi.on("turn_end", (event: any) => {
+    try {
+      if (!_sessionId) return;
+      const counts = parsePiUsage(event);
+      if (!counts) return; // non-assistant turn or all-zero usage
+      const ev = buildAgentUsageEvent(counts);
+      if (!ev) return;
+      // db.insertEvent is the extension-side analog of the .mjs hooks'
+      // attributeAndInsertEvents (insert + project attribution). The MCP
+      // server forwards persisted agent_usage events to the platform.
+      db.insertEvent(_sessionId, ev as SessionEvent, "Stop", _attribution);
+    } catch {
+      // best effort — never break the agent turn
     }
   });
 
@@ -771,12 +866,13 @@ export default function piExtension(pi: any): void {
     } catch {
       // best effort — never throw during shutdown
     }
-    // Race fix (#472 round-3): if shutdown fires while bridge bootstrap
-    // is still in flight, _mcpBridge is null at this point and the
-    // freshly-spawned MCP child gets orphaned once bootstrap eventually
-    // resolves. Await the bootstrap up to a 2s ceiling so we see the
-    // real handle, then call shutdown() on it. The ceiling prevents a
-    // hung bootstrap (e.g. broken bundle) from blocking session exit.
+    // Race fix (#472 round-3 + #809 lazy follow-up): if shutdown fires while
+    // bridge bootstrap is still in flight, _mcpBridge may be null at this
+    // point. Invalidate this bootstrap generation before waiting so any handle
+    // that resolves after the 2s ceiling self-shuts down instead of publishing
+    // a stale child handle after session shutdown.
+    mcpBridgeGeneration++;
+    mcpBridgeStarted = false;
     try {
       await Promise.race([
         _mcpBridgeReady,
@@ -794,6 +890,7 @@ export default function piExtension(pi: any): void {
       }
       _mcpBridge = null;
     }
+    _mcpBridgeReady = Promise.resolve();
   });
 
   // ── 8. Slash commands ──────────────────────────────────
@@ -849,50 +946,9 @@ export default function piExtension(pi: any): void {
 
   // ── 9. MCP tool bridge (#426) ───────────────────────────
   //
-  // Pi 0.73.x has no native MCP support. Without bridging here, the
-  // routing block tells the LLM to call ctx_execute / ctx_search / etc.
-  // but those tools never appear in Pi's tool list and the LLM cannot
-  // reach them — context-mode becomes a pure cost (~2.5K tokens of
-  // system-prompt overhead, 0 actual ctx_* calls).
-  //
-  // Spawn server.bundle.mjs as a long-lived MCP child and register
-  // each of its tools via pi.registerTool() so they enter the Pi
-  // tool list under their bare names — same names the routing block
-  // emits for the Pi platform (per hooks/core/tool-naming.mjs).
-  //
-  // Best-effort: a missing bundle or a spawn failure must NOT prevent
-  // the rest of the extension (session capture, hooks, slash commands)
-  // from initializing. We log to stderr and continue.
-  // Short-circuit guard (#534): skip the MCP bridge bootstrap for
-  // `pi --help` / `pi --version` / `pi help` and similar. Pi prints and
-  // exits within milliseconds, but the bridge child would otherwise live
-  // long enough to be reparented to PID 1, half-close stdin, and pin a CPU
-  // core via the MCP SDK's stdio loop. We use process.argv directly so the
-  // guard works for any caller that boots Pi with a short-circuit token,
-  // regardless of how the runtime wires its CLI parser.
-  const piArgv = process.argv.slice(2);
-  if (isPiShortCircuitArgv(piArgv)) {
-    _mcpBridgeReady = Promise.resolve();
-    return;
-  }
-
-  const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
-  if (existsSync(serverBundle)) {
-    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle).then(
-      (handle) => {
-        _mcpBridge = handle;
-      },
-      (err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(
-          `[context-mode] WARNING: failed to bridge MCP tools to Pi (${msg}). ` +
-            `ctx_* tools will not be callable from this session.\n`,
-        );
-      },
-    );
-  } else {
-    // No bundle on disk → nothing to await. Tests can still rely on
-    // _mcpBridgeReady being a settled promise.
-    _mcpBridgeReady = Promise.resolve();
-  }
+  // Intentionally no eager bootstrap here. `before_agent_start` is the first
+  // lifecycle signal that proves Pi is about to run a model call; starting the
+  // bridge there keeps ctx_* available for real agent turns while package/help
+  // commands that only load extensions never spawn a long-lived child (#809).
+  _mcpBridgeReady = Promise.resolve();
 }

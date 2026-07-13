@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "context-mode": {
+      "command": "context-mode",
+      "env": {
+        "QUIET_CONTEXT_PLATFORM": "antigravity-cli"
+      }
+    }
+  }
+}

@@ -80,14 +80,14 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
     // longer tracked in source — the canonical template moved to
     // .mcp.json.example. Contributors copy it to .mcp.json locally; end users
     // get MCP via .claude-plugin/plugin.json. This test pins the template.
-    const got = readArgs0(resolve(ROOT, ".mcp.json.example"), "context-mode");
+    const got = readArgs0(resolve(ROOT, ".mcp.json.example"), "quietcontext");
     expect(got, ".mcp.json.example missing or args[0] not a string").toBe(PLACEHOLDER);
   });
 
   test(".claude-plugin/plugin.json args[0] is the ${CLAUDE_PLUGIN_ROOT}/start.mjs placeholder", () => {
     const got = readArgs0(
       resolve(ROOT, ".claude-plugin", "plugin.json"),
-      "context-mode",
+      "quietcontext",
     );
     expect(got, "plugin.json missing or args[0] not a string").toBe(PLACEHOLDER);
   });
@@ -96,10 +96,10 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
     // Core architectural invariant. If the source-tracked template and the
     // shipped Claude Code manifest ever drift, fresh installs break silently.
     // This is the test-time mirror of scripts/assert-asymmetric-drift.mjs.
-    const exampleArgs = readArgs0(resolve(ROOT, ".mcp.json.example"), "context-mode");
+    const exampleArgs = readArgs0(resolve(ROOT, ".mcp.json.example"), "quietcontext");
     const pluginArgs = readArgs0(
       resolve(ROOT, ".claude-plugin", "plugin.json"),
-      "context-mode",
+      "quietcontext",
     );
     expect(exampleArgs).not.toBeNull();
     expect(pluginArgs).not.toBeNull();

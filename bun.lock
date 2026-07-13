@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "context-mode",
+      "name": "quietcontext",
       "dependencies": {
         "@clack/prompts": "^1.0.1",
         "@mixmark-io/domino": "^2.2.0",

@@ -736,7 +736,7 @@ describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
  * `readToolDenyPatterns`. This is a cross-adapter security parity gap.
  *
  * Behavior under test:
- *   - When CONTEXT_MODE_PLATFORM identifies a non-claude adapter, the security
+ *   - When QUIET_CONTEXT_PLATFORM identifies a non-claude adapter, the security
  *     reader MUST consult <home>/<adapter-segments>/settings.json.
  *   - Union semantics (defense in depth): even when an adapter is detected,
  *     ~/.claude/settings.json is ALSO read so a rule defined there still wins.
@@ -764,7 +764,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
     mkdirSync(parityTmpBase, { recursive: true });
     savedHome = process.env.HOME;
     savedUserprofile = process.env.USERPROFILE;
-    savedPlatform = process.env.CONTEXT_MODE_PLATFORM;
+    savedPlatform = process.env.QUIET_CONTEXT_PLATFORM;
     savedClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
   });
 
@@ -773,8 +773,8 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
     else process.env.HOME = savedHome;
     if (savedUserprofile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserprofile;
-    if (savedPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
-    else process.env.CONTEXT_MODE_PLATFORM = savedPlatform;
+    if (savedPlatform === undefined) delete process.env.QUIET_CONTEXT_PLATFORM;
+    else process.env.QUIET_CONTEXT_PLATFORM = savedPlatform;
     if (savedClaudeConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = savedClaudeConfig;
     rmSync(parityTmpBase, { recursive: true, force: true });
@@ -796,7 +796,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
       // Sandbox HOME so home-rooted resolution lands in our tmp tree.
       process.env.HOME = fakeHome;
       process.env.USERPROFILE = fakeHome;
-      process.env.CONTEXT_MODE_PLATFORM = adapter;
+      process.env.QUIET_CONTEXT_PLATFORM = adapter;
       delete process.env.CLAUDE_CONFIG_DIR;
 
       const policies = readBashPolicies();
@@ -821,7 +821,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
 
       process.env.HOME = fakeHome;
       process.env.USERPROFILE = fakeHome;
-      process.env.CONTEXT_MODE_PLATFORM = adapter;
+      process.env.QUIET_CONTEXT_PLATFORM = adapter;
       delete process.env.CLAUDE_CONFIG_DIR;
 
       const result = readToolDenyPatterns("Read");
@@ -850,7 +850,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
 
     process.env.HOME = fakeHome;
     process.env.USERPROFILE = fakeHome;
-    process.env.CONTEXT_MODE_PLATFORM = "cursor";
+    process.env.QUIET_CONTEXT_PLATFORM = "cursor";
     delete process.env.CLAUDE_CONFIG_DIR;
 
     const policies = readBashPolicies();

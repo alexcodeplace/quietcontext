@@ -373,7 +373,7 @@ section "5. Adapter Detection"
 printf '| Variable | Value |\n|----------|-------|\n'
 
 ADAPTER_VARS=(
-  CONTEXT_MODE_PLATFORM
+  QUIET_CONTEXT_PLATFORM
   CLAUDE_PROJECT_DIR CLAUDE_SESSION_ID
   GEMINI_PROJECT_DIR GEMINI_CLI
   OPENCLAW_HOME OPENCLAW_CLI
@@ -395,8 +395,8 @@ for var in "${ADAPTER_VARS[@]}"; do
 done
 
 # Detection logic (mirrors context-mode adapter selection)
-if [ -n "${CONTEXT_MODE_PLATFORM:-}" ]; then
-  DETECTED_ADAPTER="$CONTEXT_MODE_PLATFORM (explicit)"
+if [ -n "${QUIET_CONTEXT_PLATFORM:-}" ]; then
+  DETECTED_ADAPTER="$QUIET_CONTEXT_PLATFORM (explicit)"
 elif [ -n "${CURSOR_TRACE_ID:-}${CURSOR_CLI:-}" ]; then
   DETECTED_ADAPTER="cursor"
 elif [ -n "${VSCODE_PID:-}" ]; then
@@ -707,8 +707,8 @@ else
 fi
 
 # context-mode specific
-kv "CONTEXT_MODE_SESSION_SUFFIX" "${CONTEXT_MODE_SESSION_SUFFIX:-unset}"
-kv "CONTEXT_MODE_NODE" "${CONTEXT_MODE_NODE:-unset}"
+kv "QUIET_CONTEXT_SESSION_SUFFIX" "${QUIET_CONTEXT_SESSION_SUFFIX:-unset}"
+kv "QUIET_CONTEXT_NODE" "${QUIET_CONTEXT_NODE:-unset}"
 
 # PATH (abbreviated — show key directories)
 printf -- '- **PATH** (key dirs):\n'

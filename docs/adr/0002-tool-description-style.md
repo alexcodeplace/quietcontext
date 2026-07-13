@@ -60,7 +60,7 @@ EXAMPLE: <one canonical call with realistic params>
 ```
 
 The legacy alias `WHEN TO USE:` is accepted as a transitional form (see
-`ctx_index`) but new tools MUST use `WHEN:`.
+`index`) but new tools MUST use `WHEN:`.
 
 ### Canonical structure (locked rubric — PR #683 WS3)
 
@@ -178,8 +178,8 @@ Descriptions SHOULD be ≤ 1,000 characters. Hard cap 1,500.
 ## Consequences
 
 - PR #683 rewrites the six tools where the audit showed clear voice
-  drift: `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`,
-  `ctx_search`, `ctx_index`, `ctx_fetch_and_index`.
+  drift: `execute`, `exec-file`, `batch`,
+  `search`, `index`, `fetch-index`.
 - A new contract test in `tests/core/server.test.ts` (`tool description
   style contract (#683 ADR-0002)`) parses every `server.registerTool()`
   block and enforces the forbidden-token list + WHEN: requirement on
@@ -203,7 +203,7 @@ Descriptions SHOULD be ≤ 1,000 characters. Hard cap 1,500.
 - **Status quo (no style policy).** Rejected — PR #654 evidence shows
   organic drift directly causes user-visible bugs (Opus 4.6 capitulation).
 - **Single hortatory voice across all descriptions.** Rejected — Probe 4
-  evidence: heavy framing helps `ctx_purge` and hurts `ctx_execute`.
+  evidence: heavy framing helps `ctx_purge` and hurts `execute`.
   One-size-fits-all is empirically wrong.
 - **Per-tool author discretion.** Rejected — that's what we already had,
   and it produced the bug.

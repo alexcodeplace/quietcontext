@@ -194,7 +194,7 @@ describe("statusline.mjs — SessionDB-backed reads", () => {
     seedSessionDb({ dir, events });
 
     const { stdout } = runStatusline({
-      CONTEXT_MODE_DIR: root,
+      QUIET_CONTEXT_DIR: root,
       CLAUDE_SESSION_ID: "any-session-id",
     });
 
@@ -219,7 +219,7 @@ describe("statusline.mjs — SessionDB-backed reads", () => {
   test("empty sessionsDir falls back to substantiated headline", () => {
     // dir exists but has no .db files
     const { stdout } = runStatusline({
-      CONTEXT_MODE_DIR: root,
+      QUIET_CONTEXT_DIR: root,
       CLAUDE_SESSION_ID: "any-session-id",
     });
     assert.match(stdout, /context-mode/);

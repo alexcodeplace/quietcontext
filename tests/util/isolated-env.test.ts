@@ -14,7 +14,7 @@
  *     a temporary HOME the test uniquely owns.
  *   - `homedir()` and `tmpdir()` return that same dir (covers code that
  *     reads via `node:os` instead of env).
- *   - Internal `CONTEXT_MODE_*` keys + `CLAUDE_PLUGIN_ROOT` are removed so
+ *   - Internal `QUIET_CONTEXT_*` keys + `CLAUDE_PLUGIN_ROOT` are removed so
  *     stale developer state can't leak into the test process.
  *   - `restore()` puts every key back, even ones that were unset originally.
  */
@@ -39,7 +39,7 @@ const KEYS_THAT_MUST_POINT_AT_FAKE_HOME = [
   "TMPDIR",
   "TEMP",
   "TMP",
-  "CONTEXT_MODE_PROJECT_DIR",
+  "QUIET_CONTEXT_PROJECT_DIR",
 ] as const;
 
 const HOMEDRIVE_HOMEPATH = ["HOMEDRIVE", "HOMEPATH"] as const;
@@ -49,7 +49,7 @@ describe("withIsolatedEnv() — Slice 1: env round-trip", () => {
     // Pre-seed sentinels BEFORE snapshotting so we can later prove restore()
     // returned those exact values (not a no-op on already-unset keys).
     process.env.CLAUDE_PLUGIN_ROOT = "/should/be/cleared";
-    process.env.CONTEXT_MODE_PROJECT_DIR = "/should/be/redirected-then-restored";
+    process.env.QUIET_CONTEXT_PROJECT_DIR = "/should/be/redirected-then-restored";
 
     // Snapshot real values — we'll prove restore() puts them back exactly.
     const original: Record<string, string | undefined> = {};
@@ -114,7 +114,7 @@ describe("withIsolatedEnv() — Slice 1: env round-trip", () => {
 
     // Clean up the sentinels — they only existed for this round-trip assertion.
     delete process.env.CLAUDE_PLUGIN_ROOT;
-    delete process.env.CONTEXT_MODE_PROJECT_DIR;
+    delete process.env.QUIET_CONTEXT_PROJECT_DIR;
   });
 });
 

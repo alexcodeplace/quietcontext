@@ -13,7 +13,11 @@
  * MCP: full support via [mcp_servers] in $CODEX_HOME/config.toml.
  *
  * Known limitations:
- *   - PreToolUse: deny works, updatedInput not yet supported (openai/codex#18491)
+ *   - PreToolUse: deny works on all builds. permissionDecision:"allow" +
+ *     updatedInput (command rewrite) and additionalContext are honored on
+ *     codex-cli >= 0.141.0 (#845), detected at runtime by
+ *     hooks/core/codex-caps.mjs; older builds fail closed (redirect → deny).
+ *     `ask` remains unsupported.
  *   - PostToolUse: updatedMCPToolOutput parsed but logged as unsupported
  *   - PostToolUse does not fire on failing Bash calls (upstream bug)
  */

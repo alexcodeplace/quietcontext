@@ -5,6 +5,11 @@
  * All 13 event categories as specified in PRD Section 3.
  */
 
+import {
+  lookupPrice as catalogLookupPrice,
+  computeCostUsd as catalogComputeCostUsd,
+} from "./pricing.js";
+
 // ── Public interfaces ──────────────────────────────────────────────────────
 
 export interface SessionEvent {
@@ -25,6 +30,35 @@ export interface SessionEvent {
    * `Fetched and indexed N sections (XKB)` preamble.
    */
   bytes_avoided?: number;
+  /**
+   * Optional — bytes the model PAID to ACCESS kept-out content for this event:
+   * the tool_response byte length of a `ctx_search` / `ctx_fetch_and_index`
+   * call. This is the OTHER half of the with/without ratio (bytes_avoided is
+   * the kept-out half). Sandbox compute (ctx_execute/batch/file) is work-output
+   * and is excluded. Present only when the call is a retrieval call and its
+   * tool_response is non-empty.
+   */
+  bytes_retrieved?: number;
+  /**
+   * Optional structured cost/usage fields (Wave 2b). Emitted by
+   * extractAgentUsage alongside the colon-string `data` so the forward
+   * envelope can spread them to the platform as typed columns instead of an
+   * opaque blob. Present only when the source signal is present; cost_usd is
+   * omitted on a price miss or a zero-token turn.
+   */
+  model_id?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  cost_usd?: number;
+  /**
+   * "task_cumulative" on agent_usage events whose tokens are a Task sub-agent's
+   * usage SUMMED across its whole run (not one turn). The platform buckets these
+   * as lifetime spend and never prices them per-turn — see
+   * docs/handoff/cumulative-cost-bug.md.
+   */
+  usage_scope?: string;
 }
 
 export interface ToolCall {
@@ -340,15 +374,276 @@ function extractGit(input: HookInput): SessionEvent[] {
   if (input.tool_name !== "Bash") return [];
 
   const cmd = String(input.tool_input["command"] ?? "");
-  const match = GIT_PATTERNS.find(p => p.pattern.test(cmd));
+
+  // Bug 8 (v1.0.162) — parse the git invocation algorithmically so flags
+  // between `git` and the operation token are tolerated (`git -C /path
+  // status`, `git --no-pager log`, etc.). Falls back to the legacy regex
+  // pattern scan when the algorithmic parse cannot locate a `git` token —
+  // preserves backward compat for commands like `cd /repo && git status`
+  // where the algorithmic parse sees `cd` as the first token instead.
+  const parsed = parseGitInvocation(cmd);
+  let match: { pattern: RegExp; operation: string } | undefined;
+  if (parsed && parsed.operation) {
+    match = GIT_PATTERNS.find(p => p.operation === parsed.operation);
+  }
+  if (!match) {
+    match = GIT_PATTERNS.find(p => p.pattern.test(cmd));
+  }
   if (!match) return [];
 
-  return [{
+  // Bug 1 (v1.0.161) — for `git commit` operations, parse -m / -am / --message=
+  // from the Bash command via shell-like argv tokenization so downstream
+  // consumers receive the actual commit subject in `data`. Falls back to the
+  // operation name when no message argument is present (--amend / --no-edit /
+  // -F file / interactive editor flow). Tokenizer is hand-rolled char-by-char
+  // (no regex) to mirror real shell quoting/cluster-flag semantics.
+  //
+  // When a message is captured, the event surfaces as type='git_commit' so the
+  // rollup aggregator can distinguish ACTUAL commits from other git operations
+  // (status/diff/log were inflating has_commit on every event — see
+  // session-loaders.mjs rollup stamp + Bug 2).
+  // Bug 8 cwd hint — when `-C <dir>` is present in the git invocation, emit
+  // a leading cwd event so the attribution carry-forward (LAST_SEEN source)
+  // routes downstream events in the same batch to the scoped directory's
+  // project. Without the hint, `git -C /projB status` while cwd=/projA
+  // misattributes to /projA.
+  const out: SessionEvent[] = [];
+  if (parsed?.scopedDir) {
+    out.push({
+      type: "cwd",
+      category: "cwd",
+      data: safeString(parsed.scopedDir),
+      priority: 2,
+    });
+  }
+
+  if (match.operation === "commit") {
+    const msg = extractCommitMessageFromCommand(cmd);
+    if (msg) {
+      out.push({
+        type: "git_commit",
+        category: "git",
+        data: safeString(msg),
+        priority: 2,
+      });
+      return out;
+    }
+  }
+
+  out.push({
     type: "git",
     category: "git",
     data: safeString(match.operation),
     priority: 2,
-  }];
+  });
+  return out;
+}
+
+// Algorithmic git invocation parser — tokenizes the Bash command and walks
+// argv to extract the `-C <dir>` scope hint and the operation subcommand.
+// Tolerates env-prefix assignments and any number of flags between `git`
+// and the operation. Returns null when no `git` token is found (caller
+// falls back to the legacy regex pattern scan).
+interface ParsedGit {
+  scopedDir: string | null;
+  operation: string | null;
+}
+
+/**
+ * Gap #2 (16-oss-verify-gap-prd) — expand leading `~` / `~/` to homedir.
+ * Does NOT support `~user/path` (no current-user resolution at bridge
+ * layer; that requires a passwd lookup). Returns input unchanged when
+ * there is no tilde or the path starts with `~<otheruser>`.
+ */
+function expandHomeTilde(path: string): string {
+  if (typeof path !== "string" || path.length === 0) return path;
+  if (path === "~") return getHomedirSafe();
+  if (path.startsWith("~/")) return getHomedirSafe() + path.slice(1);
+  return path;
+}
+
+/**
+ * Lazily-resolved homedir — avoids a require/import at module init time.
+ * Falls back to "~" (no-op expansion) when the environment is sandboxed
+ * without HOME / USERPROFILE.
+ */
+function getHomedirSafe(): string {
+  try {
+    const home = process.env.HOME
+      || process.env.USERPROFILE
+      || (process.env.HOMEDRIVE && process.env.HOMEPATH
+          ? process.env.HOMEDRIVE + process.env.HOMEPATH
+          : "");
+    return home || "~";
+  } catch {
+    return "~";
+  }
+}
+
+function parseGitInvocation(cmd: string): ParsedGit | null {
+  const tokens = tokenizeCommand(cmd);
+  let i = 0;
+  // Skip env-style assignments at the head (FOO=bar git ...)
+  while (i < tokens.length && isEnvAssignment(tokens[i])) i++;
+  // Locate the `git` token (allow common runners like `sudo git ...`)
+  while (i < tokens.length && tokens[i] !== "git" && !tokens[i].endsWith("/git")) {
+    // Stop runner-skipping at the first non-assignment, non-runner token
+    if (!isCommonRunner(tokens[i])) break;
+    i++;
+  }
+  if (i >= tokens.length) return null;
+  if (tokens[i] !== "git" && !tokens[i].endsWith("/git")) return null;
+  i++; // consume `git`
+
+  let scopedDir: string | null = null;
+  let operation: string | null = null;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === "-C" || t === "--directory") {
+      scopedDir = tokens[i + 1] ?? null;
+      i += 2;
+      continue;
+    }
+    // Gap #2 — `--directory=/path` equals-form (tokenizer keeps it as one)
+    if (t.startsWith("--directory=")) {
+      scopedDir = t.slice("--directory=".length);
+      i++;
+      continue;
+    }
+    if (t.length > 0 && t[0] === "-") {
+      // Generic flag — skip the flag itself. We do NOT consume the next
+      // token as its value generically because git's per-flag arg shape
+      // varies; the dedicated extractCommitMessageFromCommand handles -m
+      // separately.
+      i++;
+      continue;
+    }
+    // First bare (non-flag) token after `git` = operation
+    operation = t;
+    break;
+  }
+  if (scopedDir) scopedDir = expandHomeTilde(scopedDir);
+  return { scopedDir, operation };
+}
+
+function isEnvAssignment(token: string): boolean {
+  if (token.length === 0) return false;
+  // FOO=bar shape: starts with an uppercase letter, contains an `=`
+  let sawEq = false;
+  for (let j = 0; j < token.length; j++) {
+    const c = token.charCodeAt(j);
+    if (j === 0) {
+      // First char must be A-Z or underscore
+      if (!((c >= 65 && c <= 90) || c === 95)) return false;
+    } else if (c === 61 /* = */) {
+      sawEq = true;
+      break;
+    } else if (!((c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95)) {
+      // Body chars must be A-Z, 0-9, or _
+      return false;
+    }
+  }
+  return sawEq;
+}
+
+function isCommonRunner(token: string): boolean {
+  // Runners that wrap real commands. We skip them when locating `git`
+  // so `sudo git status` works the same as `git status`.
+  switch (token) {
+    case "sudo":
+    case "doas":
+    case "env":
+    case "exec":
+    case "time":
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Shell-like argv tokenizer — handles single/double quotes, backslash escapes,
+// and merges adjacent quoted/unquoted segments per POSIX shell behavior
+// (`echo a"b c"d` → ["ab cd"]). Pure char loop; no regex.
+function tokenizeCommand(cmd: string): string[] {
+  const tokens: string[] = [];
+  const n = cmd.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && (cmd[i] === " " || cmd[i] === "\t")) i++;
+    if (i >= n) break;
+    let buf = "";
+    while (i < n && cmd[i] !== " " && cmd[i] !== "\t") {
+      const ch = cmd[i];
+      if (ch === '"' || ch === "'") {
+        const quote = ch;
+        i++;
+        while (i < n && cmd[i] !== quote) {
+          if (cmd[i] === "\\" && i + 1 < n) {
+            buf += cmd[i + 1];
+            i += 2;
+          } else {
+            buf += cmd[i];
+            i++;
+          }
+        }
+        if (i < n) i++; // consume closing quote
+      } else if (ch === "\\" && i + 1 < n) {
+        buf += cmd[i + 1];
+        i += 2;
+      } else {
+        buf += ch;
+        i++;
+      }
+    }
+    tokens.push(buf);
+  }
+  return tokens;
+}
+
+// Linear scan over argv looking for a commit-message-bearing flag:
+//   --message=<value>   long form, attached value
+//   --message <value>   long form, separate token
+//   -m / -am / -cm ...  short cluster ending in 'm', value in next token
+// Returns null when no message arg is present — caller falls back to
+// operation name. Pure char checks; no regex.
+function extractCommitMessageFromCommand(cmd: string): string | null {
+  const argv = tokenizeCommand(cmd);
+  const longPrefix = "--message=";
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    // Long form: --message=VALUE
+    if (arg.length > longPrefix.length && arg.startsWith(longPrefix)) {
+      const v = arg.slice(longPrefix.length);
+      return v.length > 0 ? v : null;
+    }
+    // Long form: --message VALUE
+    if (arg === "--message") {
+      const v = argv[i + 1];
+      return v && v.length > 0 ? v : null;
+    }
+    // Short cluster ending in 'm' (e.g. -m, -am, -cm). Cluster must be
+    // single-dash followed by only lowercase letters, last letter 'm'.
+    if (
+      arg.length >= 2 &&
+      arg[0] === "-" &&
+      arg[1] !== "-" &&
+      arg[arg.length - 1] === "m" &&
+      isLowerAlphaRun(arg, 1)
+    ) {
+      const v = argv[i + 1];
+      return v && v.length > 0 ? v : null;
+    }
+  }
+  return null;
+}
+
+function isLowerAlphaRun(s: string, start: number): boolean {
+  if (start >= s.length) return false;
+  for (let i = start; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 97 || c > 122) return false; // not a-z
+  }
+  return true;
 }
 
 /**
@@ -383,6 +678,39 @@ function extractTask(input: HookInput): SessionEvent[] {
  * Note: Shift+Tab and /plan command do NOT fire PostToolUse hooks
  * (Claude Code bug #15660). Only programmatic EnterPlanMode is tracked.
  */
+/**
+ * FNV-1a 32-bit hash → 8-char lowercase hex. Stable across runs/platforms.
+ * Used for plan_hash so identical plans dedupe at the platform side.
+ */
+function fnv1a32Hex(s: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Read the plan text from the ExitPlanMode envelope. SDK carries it on
+ * the OUTPUT (ExitPlanModeOutput @ :2222), but the PRD body cites input.
+ * Try both so we are spec-flexible.
+ */
+function extractExitPlanText(input: HookInput): string | null {
+  const inputPlan = input.tool_input["plan"];
+  if (typeof inputPlan === "string" && inputPlan.length > 0) return inputPlan;
+  const resp = input.tool_response;
+  if (typeof resp === "string" && resp.length > 0) {
+    try {
+      const parsed = JSON.parse(resp);
+      if (parsed && typeof parsed === "object" && typeof (parsed as Record<string, unknown>).plan === "string") {
+        return (parsed as Record<string, unknown>).plan as string;
+      }
+    } catch { /* fall through */ }
+  }
+  return null;
+}
+
 function extractPlan(input: HookInput): SessionEvent[] {
   if (input.tool_name === "EnterPlanMode") {
     return [{
@@ -398,12 +726,23 @@ function extractPlan(input: HookInput): SessionEvent[] {
 
     // Plan exit event with allowedPrompts detail
     const prompts = input.tool_input["allowedPrompts"];
-    const detail = Array.isArray(prompts) && prompts.length > 0
+    let detail = Array.isArray(prompts) && prompts.length > 0
       ? `exited plan mode (allowed: ${safeStringAny(prompts.map((p: unknown) => {
           if (typeof p === "object" && p !== null && "prompt" in p) return String((p as Record<string, unknown>).prompt);
           return String(p);
         }).join(", "))})`
       : "exited plan mode";
+
+    // §11 / PRD #6 — append plan_bytes + plan_hash so the platform can
+    // dedupe identical plans across sessions and JOIN plan_mode_authorized
+    // writes against a stable plan id. Plan source: tool_input.plan first
+    // (per PRD), fall back to tool_response.plan (SDK actually carries it
+    // there per ExitPlanModeOutput @ sdk-tools.d.ts:2222).
+    const plan = extractExitPlanText(input);
+    if (typeof plan === "string" && plan.length > 0) {
+      detail += ` plan_bytes:${plan.length} plan_hash:${fnv1a32Hex(plan)}`;
+    }
+
     events.push({
       type: "plan_exit",
       category: "plan",
@@ -711,12 +1050,43 @@ function extractMcpToolCall(input: HookInput): SessionEvent[] {
     ? `{"tool_name":${JSON.stringify(tool_name)},"params_raw":${JSON.stringify(cappedStr)},"truncated":true}`
     : `{"tool_name":${JSON.stringify(tool_name)},"params":${cappedStr}}`;
 
-  return [{
+  const event: SessionEvent = {
     type: "mcp_tool_call",
     category: "mcp_tool_call",
     data: safeString(payload),
     priority: 4,
-  }];
+  };
+
+  // Retrieval cost (the OTHER half of the with/without ratio): when this MCP
+  // call is a `ctx_search` or `ctx_fetch_and_index` retrieval, the tool_response
+  // IS the kept-out content the model paid to access — record its byte length.
+  // Sandbox compute (ctx_execute/batch/file) is work-output, NOT retrieval, so
+  // it is intentionally excluded. Match by suffix char-algorithmically (host
+  // prefixes the name like `mcp__plugin_…__ctx_search`); NO regex.
+  if (isRetrievalToolName(tool_name)) {
+    const response = safeString(input.tool_response);
+    if (response.length > 0) {
+      event.bytes_retrieved = Buffer.byteLength(response, "utf8");
+    }
+  }
+
+  return [event];
+}
+
+/** Tool-name suffixes that denote a RETRIEVAL call (kept-out content accessed). */
+const RETRIEVAL_TOOL_SUFFIXES = ["ctx_search", "ctx_fetch_and_index"];
+
+/**
+ * True when `toolName` ends with one of the retrieval suffixes. Char-level
+ * suffix comparison via String.prototype.endsWith — no regex. MCP host names
+ * arrive prefixed (e.g. `mcp__plugin_context-mode_context-mode__ctx_search`),
+ * so an exact-name check would miss them; suffix match is host-agnostic.
+ */
+function isRetrievalToolName(toolName: string): boolean {
+  for (const suffix of RETRIEVAL_TOOL_SUFFIXES) {
+    if (toolName.endsWith(suffix)) return true;
+  }
+  return false;
 }
 
 /**
@@ -868,18 +1238,959 @@ function extractExternalRef(input: HookInput): SessionEvent[] {
 
 /**
  * Category 8: env (worktree)
- * EnterWorktree tool — tracks worktree creation.
+ * EnterWorktree + ExitWorktree tools — tracks worktree lifecycle.
  */
 function extractWorktree(input: HookInput): SessionEvent[] {
-  if (input.tool_name !== "EnterWorktree") return [];
+  if (input.tool_name === "EnterWorktree") {
+    const name = String(input.tool_input["name"] ?? "unnamed");
+    return [{
+      type: "worktree",
+      category: "env",
+      data: safeString(`entered worktree: ${name}`),
+      priority: 2,
+    }];
+  }
 
-  const name = String(input.tool_input["name"] ?? "unnamed");
+  if (input.tool_name === "ExitWorktree") {
+    const discard = Boolean(input.tool_input["discard_changes"]);
+    return [{
+      type: "worktree_exit",
+      category: "env",
+      data: safeString(`exited worktree (discard_changes:${discard})`),
+      priority: 2,
+    }];
+  }
+
+  return [];
+}
+
+/**
+ * Algorithmic URL host extraction — no regex.
+ * Skips scheme, returns everything up to the first path/query/fragment marker.
+ * Port is preserved as part of the host signature.
+ */
+function extractHostFromUrl(url: string): string | null {
+  if (typeof url !== "string" || url.length === 0) return null;
+  const protoEnd = url.indexOf("://");
+  if (protoEnd < 0) return null;
+  const start = protoEnd + 3;
+  if (start >= url.length) return null;
+  let end = url.length;
+  for (let i = start; i < url.length; i++) {
+    const c = url.charCodeAt(i);
+    if (c === 47 || c === 63 || c === 35) { end = i; break; }
+  }
+  const host = url.slice(start, end);
+  return host.length > 0 ? host : null;
+}
+
+/**
+ * WebFetch response metadata — captures bytes/code/durationMs and host
+ * (privacy: never the full URL or query string). Redirect-loop detection
+ * is temporal, not single-field — SDK has no redirect_url.
+ */
+function extractWebFetchMetadata(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "WebFetch") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const obj = parsed as Record<string, unknown>;
+  const parts: string[] = [];
+
+  if (typeof obj.code === "number") parts.push(`code:${obj.code}`);
+  if (typeof obj.bytes === "number") parts.push(`bytes:${obj.bytes}`);
+  if (typeof obj.durationMs === "number") parts.push(`durMs:${obj.durationMs}`);
+  if (typeof obj.url === "string") {
+    const host = extractHostFromUrl(obj.url);
+    if (host) parts.push(`host:${host}`);
+  }
+
+  if (parts.length === 0) return [];
+
   return [{
-    type: "worktree",
-    category: "env",
-    data: safeString(`entered worktree: ${name}`),
-    priority: 2,
+    type: "webfetch_metadata",
+    category: "data",
+    data: safeString(parts.join(" ")),
+    priority: 3,
   }];
+}
+
+/**
+ * Bash outcome signals — captures the three fields that DO exist on
+ * BashOutput (SDK :2160-2200): interrupted (boolean), stderr (length-only
+ * for privacy), returnCodeInterpretation (semantic non-zero exit hint).
+ * NO exit_code field exists in the SDK.
+ */
+function extractBashOutcome(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "Bash") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const obj = parsed as Record<string, unknown>;
+  const hasSignal =
+    typeof obj.interrupted === "boolean" ||
+    typeof obj.stderr === "string" ||
+    typeof obj.returnCodeInterpretation === "string";
+  if (!hasSignal) return [];
+
+  const parts: string[] = [];
+  if (typeof obj.interrupted === "boolean") {
+    parts.push(`interrupted:${obj.interrupted}`);
+  }
+  if (typeof obj.returnCodeInterpretation === "string") {
+    parts.push(`rcInterp:${obj.returnCodeInterpretation.slice(0, 80)}`);
+  }
+  if (typeof obj.stderr === "string") {
+    parts.push(`stderrBytes:${obj.stderr.length}`);
+  }
+
+  return [{
+    type: "bash_outcome",
+    category: "data",
+    data: safeString(parts.join(" ")),
+    priority: 3,
+  }];
+}
+
+/**
+ * FileReadOutput size metadata — branches on the text/image variant.
+ * Captures sizes/line counts only; never file content. Image dimensions
+ * are formatted as "WxH" when both width/height are numeric.
+ */
+function extractFileReadMetadata(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "Read") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const obj = parsed as Record<string, unknown>;
+  const variant = obj.type;
+  if (variant !== "text" && variant !== "image") return [];
+
+  const parts: string[] = [`type:${variant}`];
+
+  if (variant === "text") {
+    if (typeof obj.numLines === "number") parts.push(`lines:${obj.numLines}`);
+    if (typeof obj.totalLines === "number") parts.push(`totalLines:${obj.totalLines}`);
+    if (typeof obj.startLine === "number") parts.push(`start:${obj.startLine}`);
+  } else {
+    if (typeof obj.originalSize === "number") parts.push(`origSize:${obj.originalSize}`);
+    const dims = obj.dimensions;
+    if (dims && typeof dims === "object") {
+      const d = dims as Record<string, unknown>;
+      if (typeof d.width === "number" && typeof d.height === "number") {
+        parts.push(`dims:${d.width}x${d.height}`);
+      }
+    }
+  }
+
+  return [{
+    type: "file_read_metadata",
+    category: "data",
+    data: safeString(parts.join(" ")),
+    priority: 3,
+  }];
+}
+
+/**
+ * Per-model USD pricing now lives in the curated multi-vendor catalog
+ * (src/pricing/catalog.ts), which prices each model from ITS OWN row across
+ * Anthropic / OpenAI / Google / Chinese / other vendors. This kills the old
+ * bug where the hardcoded Anthropic-only table here billed every non-Claude
+ * model at Claude-Sonnet's `default` rate. Unknown ids now resolve to a null
+ * cost (one console.warn) instead of a silently wrong Claude rate.
+ *
+ * resolveModelId picks the first non-empty model id from the hook candidates;
+ * date-suffixed ids (e.g. claude-haiku-4-5-20251001) are reduced to a catalog
+ * hit by progressively dropping trailing `-segment` suffixes (NO regex).
+ */
+function resolveModelId(input: HookInput, parsedResp: Record<string, unknown>): string {
+  const candidates: unknown[] = [
+    input.tool_input?.model,
+    (input as unknown as Record<string, unknown>).model,
+    parsedResp.model,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) return c;
+  }
+  return "";
+}
+
+/**
+ * Drop one trailing `-<segment>` from a model id, char-algorithmically (no
+ * regex): walks back to the last '-' and returns the head, or null when there
+ * is no usable separator. Lets a date-suffixed id fall back to its base id
+ * (claude-haiku-4-5-20251001 → claude-haiku-4-5 → … ) one segment at a time.
+ */
+function dropTrailingSegment(id: string): string | null {
+  for (let i = id.length - 1; i > 0; i--) {
+    if (id.charCodeAt(i) === 45 /* '-' */) return id.slice(0, i);
+  }
+  return null;
+}
+
+/**
+ * Resolve a model id to one the catalog can price: try the raw id, then
+ * progressively trim trailing `-segment` suffixes so a date-suffixed id still
+ * prices off its base model. Probes with lookupPrice (no warn) and returns the
+ * first id that hits, or "" on a full miss — so cost compute warns at most once.
+ */
+function resolveCatalogId(modelId: string): string {
+  let candidate: string | null = modelId;
+  while (candidate && candidate.length > 0) {
+    if (catalogLookupPrice(candidate) !== null) return candidate;
+    candidate = dropTrailingSegment(candidate);
+  }
+  return "";
+}
+
+/**
+ * Cost for a turn via the catalog. Returns null on a price miss (catalog emits
+ * one console.warn of the unmatched id) or when all token buckets are zero.
+ */
+function computeTurnCostUsd(
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheCreationTokens: number,
+  cacheReadTokens: number,
+): number | null {
+  const resolved = resolveCatalogId(modelId);
+  // Feed the resolved id when found; otherwise pass the raw id so the catalog's
+  // single miss-warning carries the id the operator actually saw.
+  return catalogComputeCostUsd(resolved || modelId, {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_creation_tokens: cacheCreationTokens,
+    cache_read_tokens: cacheReadTokens,
+  });
+}
+
+/**
+ * Format a cost to a compact `cost_usd` string, char-algorithmically (no
+ * regex). Renders 6 decimals, drops trailing zeros, and keeps a single `.0`
+ * when the fraction trims to empty (e.g. 0 → "0.0"), matching the prior
+ * `.toFixed(6).replace(...)` output exactly.
+ */
+function formatCostUsd(cost: number): string {
+  let s = cost.toFixed(6);
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 48 /* '0' */) end--;
+  s = s.slice(0, end);
+  if (s.length > 0 && s.charCodeAt(s.length - 1) === 46 /* '.' */) s += "0";
+  return s;
+}
+
+/**
+ * AgentOutput.usage capture — fires on the Task sub-agent dispatcher.
+ * Captures the 7 cost/perf fields from sdk-tools.d.ts:64-75. Derives
+ * cost_usd from per-model pricing (Gap #1 fix). The platform persists
+ * these as typed columns post-release; the bridge emits them as
+ * structured tokens in event.data for forward-compatible ingestion.
+ */
+function extractAgentUsage(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "Task") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const out = parsed as Record<string, unknown>;
+  const usage = (out.usage && typeof out.usage === "object")
+    ? out.usage as Record<string, unknown>
+    : {};
+
+  const hasSignal =
+    typeof out.totalTokens === "number" ||
+    typeof out.totalDurationMs === "number" ||
+    typeof usage.input_tokens === "number" ||
+    typeof usage.output_tokens === "number" ||
+    typeof usage.service_tier === "string";
+  if (!hasSignal) return [];
+
+  const parts: string[] = [];
+  if (typeof out.totalTokens === "number") parts.push(`totalTokens:${out.totalTokens}`);
+  if (typeof out.totalDurationMs === "number") parts.push(`totalDurMs:${out.totalDurationMs}`);
+  if (typeof usage.input_tokens === "number") parts.push(`tokens_in:${usage.input_tokens}`);
+  if (typeof usage.output_tokens === "number") parts.push(`tokens_out:${usage.output_tokens}`);
+  if (typeof usage.cache_creation_input_tokens === "number") {
+    parts.push(`cache_create:${usage.cache_creation_input_tokens}`);
+  }
+  if (typeof usage.cache_read_input_tokens === "number") {
+    parts.push(`cache_read:${usage.cache_read_input_tokens}`);
+  }
+  if (typeof usage.service_tier === "string") {
+    parts.push(`tier:${usage.service_tier.slice(0, 32)}`);
+  }
+
+  // CUMULATIVE-USAGE GUARD (docs/handoff/cumulative-cost-bug.md): a Task
+  // tool_response carries the sub-agent's usage SUMMED across its entire run —
+  // every internal turn re-reads the cache, so cache_read reaches the billions.
+  // Pricing that cumulative figure as a single turn produced four-figure
+  // per-event costs ($3,532 with cache_read 4.7B) that poisoned every FinOps
+  // aggregate. We therefore do NOT derive cost_usd here. The raw token counts
+  // stay, tagged usage_scope="task_cumulative", so the platform buckets them as
+  // lifetime spend; real per-turn cost comes only from per-turn signals
+  // (extractTranscriptUsage + each adapter's own session).
+  const modelId = resolveModelId(input, out);
+
+  // Wave 2b — emit structured top-level fields alongside the colon-string so
+  // the forward envelope (which spreads `...event`) hands the platform typed
+  // columns. Each field is set only when its source signal is present, so the
+  // forward payload stays minimal; cost_usd is omitted on a price miss or a
+  // zero-token turn. The colon-string `data` stays for human/debug + back-compat.
+  const event: SessionEvent = {
+    type: "agent_usage",
+    category: "cost",
+    data: safeString(parts.join(" ")),
+    priority: 2,
+  };
+  if (modelId.length > 0) event.model_id = modelId;
+  if (typeof usage.input_tokens === "number") event.input_tokens = usage.input_tokens;
+  if (typeof usage.output_tokens === "number") event.output_tokens = usage.output_tokens;
+  if (typeof usage.cache_read_input_tokens === "number") {
+    event.cache_read_tokens = usage.cache_read_input_tokens;
+  }
+  if (typeof usage.cache_creation_input_tokens === "number") {
+    event.cache_creation_tokens = usage.cache_creation_input_tokens;
+  }
+  event.usage_scope = "task_cumulative";
+
+  return [event];
+}
+
+/** Input shape `buildAgentUsageEvent` consumes — re-exported for parser typing. */
+export interface AgentUsageCounts {
+  model_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  native_cost_usd?: number | null;
+}
+
+// ── Kimi Code (kimi-code) usage parsers ────────────────────────────────────
+// Implementation lives in src/adapters/kimi/usage.ts (per adapter ownership);
+// re-exported here so the hook-reachable session-extract bundle can import the
+// cursor-gated wire.jsonl reader without a separate per-adapter bundle. The
+// import is type-only-free (runtime callees buildAgentUsageEvent are hoisted),
+// so the extract.ts <-> usage.ts cycle is load-order safe.
+export { parseKimiUsage, extractKimiUsageSince } from "../adapters/kimi/usage.js";
+
+// ── Qwen Code (qwen-code) usage parsers ────────────────────────────────────
+// Implementation lives in src/adapters/qwen-code/usage.ts (per adapter
+// ownership); re-exported here so the hook-reachable session-extract bundle can
+// import the cursor-gated chats/<sessionId>.jsonl reader via the shared
+// loadExtract() loader, exactly like the kimi re-export above. Same load-order
+// safety: runtime callee buildAgentUsageEvent is hoisted within this module.
+export { parseQwenUsage, extractQwenUsageSince } from "../adapters/qwen-code/usage.js";
+
+/**
+ * Pi (oh-my-pi) per-turn usage parser.
+ *
+ * Maps a Pi `turn_end` payload (`{ message: AssistantMessage }`) to the
+ * `buildAgentUsageEvent` input shape, or null when there is nothing to record.
+ *
+ * Field provenance (adapter-matrix/pi.md @320261f + cited refs):
+ *   - usage:        AssistantMessage.usage          (ai/src/types.ts:521 -> catalog/src/types.ts:100-145)
+ *   - model_id:     AssistantMessage.model          (ai/src/types.ts:510; kept "provider/model" — builder normalizes)
+ *   - input:        Usage.input                     -> input_tokens
+ *   - output:       Usage.output                    -> output_tokens
+ *   - cacheWrite:   Usage.cacheWrite                -> cache_creation_tokens
+ *   - cacheRead:    Usage.cacheRead                 -> cache_read_tokens
+ *   - native USD:   Usage.cost.total                -> native_cost_usd (HIGH confidence; no price-table needed)
+ *
+ * The event is per-turn incremental (per-response usage; anthropic.ts:1893-1901;
+ * "for the turn" catalog/types.ts:103), so each turn_end maps to exactly one
+ * agent_usage event with no cross-turn accumulation.
+ *
+ * Algorithmic + null-safe, NO regex. Accepts either the full TurnEndEvent
+ * (`{ message }`) or a bare AssistantMessage (`{ usage, model }`) so callers
+ * can pass `event` or `event.message` interchangeably. Returns null when the
+ * payload is not an assistant message, carries no usage object, or every token
+ * bucket is zero/absent (an all-zero turn emits no event — matches
+ * buildAgentUsageEvent's own zero->null contract).
+ */
+export function parsePiUsage(payload: unknown): AgentUsageCounts | null {
+  if (!payload || typeof payload !== "object") return null;
+  const root = payload as Record<string, unknown>;
+
+  // Unwrap TurnEndEvent.message when present; otherwise treat the payload as
+  // the AssistantMessage itself.
+  const maybeMessage = root.message;
+  const message: Record<string, unknown> =
+    maybeMessage && typeof maybeMessage === "object"
+      ? (maybeMessage as Record<string, unknown>)
+      : root;
+
+  // Only assistant turns carry LLM usage. Custom/non-LLM turns are skipped.
+  // Tolerate a missing role (some payloads omit it) but reject an explicit
+  // non-assistant role.
+  if (typeof message.role === "string" && message.role !== "assistant") {
+    return null;
+  }
+
+  const usageRaw = message.usage;
+  if (!usageRaw || typeof usageRaw !== "object") return null;
+  const usage = usageRaw as Record<string, unknown>;
+
+  const num = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+
+  const input_tokens = num(usage.input);
+  const output_tokens = num(usage.output);
+  const cache_creation_tokens = num(usage.cacheWrite);
+  const cache_read_tokens = num(usage.cacheRead);
+
+  // Zero-everything turn → null (mirrors buildAgentUsageEvent's contract; keeps
+  // the DB free of no-op cost events).
+  if (
+    input_tokens <= 0 &&
+    output_tokens <= 0 &&
+    cache_creation_tokens <= 0 &&
+    cache_read_tokens <= 0
+  ) {
+    return null;
+  }
+
+  // Pi-native USD cost lives on usage.cost.total. Preserve it only when finite;
+  // omit (null) on absence so the builder falls back to the pricing catalog.
+  let native_cost_usd: number | null = null;
+  const costRaw = usage.cost;
+  if (costRaw && typeof costRaw === "object") {
+    const total = (costRaw as Record<string, unknown>).total;
+    if (typeof total === "number" && Number.isFinite(total)) {
+      native_cost_usd = total;
+    }
+  }
+
+  const model_id = typeof message.model === "string" ? message.model : "";
+
+  return {
+    model_id,
+    input_tokens,
+    output_tokens,
+    cache_creation_tokens,
+    cache_read_tokens,
+    native_cost_usd,
+  };
+}
+
+/**
+ * openclaw `model.usage` diagnostic-event capture — parseOpenclawUsage.
+ *
+ * openclaw exposes a first-class `model.usage` diagnostic event
+ * (`DiagnosticUsageEvent`, refs/platforms/openclaw/src/infra/diagnostic-events.ts:18-47),
+ * emitted once per turn and consumed via `onDiagnosticEvent(listener)`
+ * (diagnostic-events.ts:1156) — the same bus the first-party diagnostics-otel /
+ * diagnostics-prometheus extensions read.
+ *
+ * Field mapping (openclaw → AgentUsageCounts):
+ *   evt.usage.input     → input_tokens
+ *   evt.usage.output    → output_tokens
+ *   evt.usage.cacheWrite→ cache_creation_tokens   (cache-creation)
+ *   evt.usage.cacheRead → cache_read_tokens       (cache-read)
+ *   evt.costUsd         → native_cost_usd  (pre-computed via estimateUsageCost,
+ *                                           agent-runner.ts:1995 — preferred over catalog)
+ *   evt.model           → model_id
+ *
+ * CRITICAL: read `evt.usage` (the PER-TURN TOTAL — "Last Turn Total"
+ * agent-runner.ts:943), NEVER `evt.lastCallUsage` (the last-model-call DELTA,
+ * diagnostic-events.ts:34-40). Summing both would double-count.
+ *
+ * Returns AgentUsageCounts (the buildAgentUsageEvent input shape) or null when
+ * the event is not a usage event / carries no usage / sums to zero. Pure,
+ * null-safe, algorithmic — NO regex.
+ */
+export function parseOpenclawUsage(payload: unknown): AgentUsageCounts | null {
+  if (!payload || typeof payload !== "object") return null;
+  const evt = payload as Record<string, unknown>;
+
+  // Only the `model.usage` diagnostic carries token usage. Tolerate an absent
+  // type (defensive against a thinner payload variant) but reject any explicit
+  // non-usage diagnostic (model.failover, log.record, …).
+  if (typeof evt.type === "string" && evt.type !== "model.usage") {
+    return null;
+  }
+
+  // PER-TURN TOTAL lives on `usage`. `lastCallUsage` is the last-call delta and
+  // must NOT be consumed — reading it instead would understate (or, when summed
+  // with usage, double-count) the turn.
+  const usageRaw = evt.usage;
+  if (!usageRaw || typeof usageRaw !== "object") return null;
+  const usage = usageRaw as Record<string, unknown>;
+
+  const num = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+
+  const input_tokens = num(usage.input);
+  const output_tokens = num(usage.output);
+  const cache_creation_tokens = num(usage.cacheWrite);
+  const cache_read_tokens = num(usage.cacheRead);
+
+  // Zero-everything turn → null (mirrors buildAgentUsageEvent's contract; keeps
+  // the DB free of no-op cost events).
+  if (
+    input_tokens <= 0 &&
+    output_tokens <= 0 &&
+    cache_creation_tokens <= 0 &&
+    cache_read_tokens <= 0
+  ) {
+    return null;
+  }
+
+  // openclaw ships a pre-computed USD cost at the TOP LEVEL (`evt.costUsd`, not
+  // nested under usage). Preserve it only when finite; omit (null) on absence so
+  // the builder falls back to the pricing catalog.
+  const costRaw = evt.costUsd;
+  const native_cost_usd: number | null =
+    typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+
+  const model_id = typeof evt.model === "string" ? evt.model : "";
+
+  return {
+    model_id,
+    input_tokens,
+    output_tokens,
+    cache_creation_tokens,
+    cache_read_tokens,
+    native_cost_usd,
+  };
+}
+
+/**
+ * opencode per-turn usage parser.
+ *
+ * Ground truth: context-mode-platform/docs/prds/2026-06-paid-observability/
+ * adapter-matrix/opencode.md. opencode tracks usage per *assistant message*; the
+ * usage-bearing payload reaches a plugin via the `message.updated` bus event,
+ * whose `event.properties.info` is the full Message. The assistant token shape
+ * (refs platforms/opencode .../session/message.ts) is:
+ *   info.tokens = { input, output, reasoning, cache: { read, write } }
+ *   info.cost   = USD cost for this message
+ *   info.modelID / info.providerID  (older refs may expose a single info.model)
+ *
+ * Field mapping (refs message.ts):
+ *   tokens.input        -> input_tokens
+ *   tokens.output       -> output_tokens
+ *   tokens.cache.read   -> cache_read_tokens
+ *   tokens.cache.write  -> cache_creation_tokens
+ *   modelID/providerID  -> model_id (`${providerID}/${modelID}` when both present)
+ *   cost                -> native_cost_usd
+ *
+ * LAST-STEP-SNAPSHOT CAVEAT (refs processor.ts:717-718): message-level
+ * `.tokens` is OVERWRITTEN every step-finish, so it holds the LAST step's usage
+ * — not the turn total. `.cost`, however, ACCUMULATES (`cost += usage.cost`) and
+ * is the correct cumulative turn cost. We therefore pass `info.cost` through as
+ * native_cost_usd so the billed $ is exact even though the token snapshot is
+ * imprecise; the token columns remain best-effort (last-step) telemetry. A true
+ * turn-total token sum would require summing per-step Step.Ended parts, which the
+ * `message.updated` payload does not carry — out of scope for this snapshot-based
+ * capture.
+ *
+ * Accepts either the bus event (`{ properties: { info } }`), the wrapped
+ * `{ event: { properties: { info } } }`, or the bare Message (`info`) so the
+ * caller can hand us whatever the SDK surfaces. NO regex — pure algorithmic,
+ * null-safe traversal. Returns null when the payload is not an assistant
+ * message, carries no tokens object, or every token bucket is zero/absent
+ * (mirrors buildAgentUsageEvent's zero->null contract).
+ */
+export function parseOpencodeUsage(payload: unknown): AgentUsageCounts | null {
+  if (!payload || typeof payload !== "object") return null;
+  const root = payload as Record<string, unknown>;
+
+  // Unwrap, most-specific first: { event: { properties: { info } } } →
+  // { properties: { info } } → bare message. Each hop is guarded so a missing
+  // layer simply falls through to treating the current object as the message.
+  const eventLayer =
+    root.event && typeof root.event === "object"
+      ? (root.event as Record<string, unknown>)
+      : root;
+  const propsLayer =
+    eventLayer.properties && typeof eventLayer.properties === "object"
+      ? (eventLayer.properties as Record<string, unknown>)
+      : eventLayer;
+  const message: Record<string, unknown> =
+    propsLayer.info && typeof propsLayer.info === "object"
+      ? (propsLayer.info as Record<string, unknown>)
+      : root;
+
+  // Only assistant messages carry token usage. Tolerate a missing role but
+  // reject an explicit non-assistant one.
+  if (typeof message.role === "string" && message.role !== "assistant") {
+    return null;
+  }
+
+  const tokensRaw = message.tokens;
+  if (!tokensRaw || typeof tokensRaw !== "object") return null;
+  const tokens = tokensRaw as Record<string, unknown>;
+
+  const num = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+
+  const cacheRaw = tokens.cache;
+  const cache =
+    cacheRaw && typeof cacheRaw === "object"
+      ? (cacheRaw as Record<string, unknown>)
+      : {};
+
+  const input_tokens = num(tokens.input);
+  const output_tokens = num(tokens.output);
+  const cache_read_tokens = num(cache.read);
+  const cache_creation_tokens = num(cache.write);
+
+  // Zero-everything turn → null (keeps the DB free of no-op cost events).
+  if (
+    input_tokens <= 0 &&
+    output_tokens <= 0 &&
+    cache_creation_tokens <= 0 &&
+    cache_read_tokens <= 0
+  ) {
+    return null;
+  }
+
+  // Native cumulative USD cost (preferred — exact, immune to the last-step
+  // token-snapshot imprecision). Omit (null) on absence so the builder falls
+  // back to the pricing catalog over the last-step token columns.
+  const costRaw = message.cost;
+  const native_cost_usd =
+    typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+
+  // Billed model id. Prefer the `${providerID}/${modelID}` pair (how opencode
+  // itself addresses the model); fall back to a bare modelID, then a single
+  // `model` string (older refs shape). Empty when none present.
+  const modelID = typeof message.modelID === "string" ? message.modelID : "";
+  const providerID =
+    typeof message.providerID === "string" ? message.providerID : "";
+  let model_id = "";
+  if (modelID.length > 0) {
+    model_id = providerID.length > 0 ? `${providerID}/${modelID}` : modelID;
+  } else if (typeof message.model === "string") {
+    model_id = message.model;
+  }
+
+  return {
+    model_id,
+    input_tokens,
+    output_tokens,
+    cache_creation_tokens,
+    cache_read_tokens,
+    native_cost_usd,
+  };
+}
+
+/**
+ * Build a structured `agent_usage` event from summed per-model token counts.
+ * Emits the colon-string `data` (human/debug + back-compat) AND the structured
+ * top-level fields the forward envelope spreads to the platform. cost_usd via
+ * the pricing catalog — omitted on a price miss. Returns null when every token
+ * bucket is zero/absent (so an all-zero model emits no event).
+ */
+export function buildAgentUsageEvent(counts: {
+  model_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  /**
+   * Provider-supplied USD cost for this turn. When a finite number, it is
+   * preferred over the catalog computation (openclaw / pi / omp / opencode
+   * ship a native cost — trust the source over our price table). Omit/null to
+   * derive cost_usd from the pricing catalog.
+   */
+  native_cost_usd?: number | null;
+}): SessionEvent | null {
+  const { model_id, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, native_cost_usd } = counts;
+  if (input_tokens <= 0 && output_tokens <= 0 && cache_creation_tokens <= 0 && cache_read_tokens <= 0) {
+    return null;
+  }
+
+  const parts: string[] = [`tokens_in:${input_tokens}`, `tokens_out:${output_tokens}`];
+  if (cache_creation_tokens > 0) parts.push(`cache_create:${cache_creation_tokens}`);
+  if (cache_read_tokens > 0) parts.push(`cache_read:${cache_read_tokens}`);
+
+  const cost = (typeof native_cost_usd === "number" && Number.isFinite(native_cost_usd))
+    ? native_cost_usd
+    : computeTurnCostUsd(model_id, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens);
+  if (cost !== null) parts.push(`cost_usd:${formatCostUsd(cost)}`);
+
+  const event: SessionEvent = {
+    type: "agent_usage",
+    category: "cost",
+    data: safeString(parts.join(" ")),
+    priority: 2,
+  };
+  if (model_id.length > 0) event.model_id = model_id;
+  event.input_tokens = input_tokens;
+  event.output_tokens = output_tokens;
+  if (cache_read_tokens > 0) event.cache_read_tokens = cache_read_tokens;
+  if (cache_creation_tokens > 0) event.cache_creation_tokens = cache_creation_tokens;
+  if (cost !== null) event.cost_usd = cost;
+  return event;
+}
+
+/**
+ * gemini-cli AfterModel usage capture — parse ONE AfterModel hook payload into
+ * a builder `agent_usage` event (or null). Pure, null-safe, struct-only — NO regex.
+ *
+ * Refs (docs/prds/2026-06-paid-observability/adapter-matrix/gemini-cli.md):
+ *   - AfterModel fires per model call inside the gemini-cli stream loop
+ *     (geminiChat.ts:1213); the hook input carries `llm_request` + `llm_response`
+ *     (hooks/types.ts:692-695).
+ *   - `llm_response.usageMetadata` exposes promptTokenCount / candidatesTokenCount
+ *     / totalTokenCount (hookTranslator.ts:60-64).
+ *   - model_id = `response.modelVersion || req.model` (loggingContentGenerator.ts:405,553).
+ *
+ * Mapping → builder shape:
+ *   promptTokenCount        → input_tokens
+ *   candidatesTokenCount    → output_tokens
+ *   thoughtsTokenCount      → ADDED into output_tokens (Gemini bills reasoning as output)
+ *   cachedContentTokenCount → cache_read_tokens (when present)
+ *   model_id                → response.modelVersion || llm_request.model
+ *
+ * CAVEAT — the DECOUPLED AfterModel payload (hookTranslator.ts:60-64) forwards
+ * only prompt/candidates/total and DROPS cachedContentTokenCount +
+ * thoughtsTokenCount. We map those two defensively WHEN PRESENT (richer payload
+ * variant / future fix / OTel-fed input) but never depend on them — the common
+ * case is input+output only. For full cached/thoughts fidelity the OTel
+ * `api_response` exporter or the chat-recording JSON is the source of record.
+ *
+ * MULTI-CALL TURNS — one user turn that triggers tool calls spans MULTIPLE
+ * model calls, each AfterModel cumulative within itself. This fn emits ONE
+ * priced event PER AfterModel call (each call is one billed round-trip).
+ * Per-userPromptId summation into a single per-turn total is DEFERRED — emitting
+ * per-call never double-counts, since each call's usageMetadata is the
+ * authoritative total for that call.
+ */
+export function parseGeminiUsage(afterModelPayload: unknown): SessionEvent | null {
+  if (!afterModelPayload || typeof afterModelPayload !== "object") return null;
+  const payload = afterModelPayload as Record<string, unknown>;
+
+  const resp = payload.llm_response;
+  if (!resp || typeof resp !== "object") return null;
+  const response = resp as Record<string, unknown>;
+
+  const um = response.usageMetadata;
+  if (!um || typeof um !== "object") return null;
+  const usage = um as Record<string, unknown>;
+
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+  const input = num(usage.promptTokenCount);
+  const candidates = num(usage.candidatesTokenCount);
+  const thoughts = num(usage.thoughtsTokenCount);
+  const cached = num(usage.cachedContentTokenCount);
+  // Gemini bills reasoning (thoughts) as output tokens — fold into output.
+  const output = candidates + thoughts;
+
+  // model_id = response.modelVersion (server-confirmed) || llm_request.model.
+  const req = payload.llm_request;
+  const reqModel =
+    req && typeof req === "object" && typeof (req as Record<string, unknown>).model === "string"
+      ? ((req as Record<string, unknown>).model as string)
+      : "";
+  const modelVersion = typeof response.modelVersion === "string" ? response.modelVersion : "";
+  const modelId = modelVersion.length > 0 ? modelVersion : reqModel;
+
+  // gemini exposes no native cost — cost_usd is derived from the pricing catalog
+  // inside buildAgentUsageEvent (native_cost_usd omitted). All-zero ⇒ null.
+  return buildAgentUsageEvent({
+    model_id: modelId,
+    input_tokens: input,
+    output_tokens: output,
+    cache_creation_tokens: 0,
+    cache_read_tokens: cached,
+  });
+}
+
+/**
+ * claude-code MAIN-turn usage capture — the dominant-spend path the Task
+ * subagent capture (extractAgentUsage) misses. Parses the session transcript
+ * JSONL char-algorithmically (NO regex): each `type:"assistant"` line carries
+ * `message.usage` + `message.model`, and usage is a per-turn DELTA, so summing
+ * the assistant turns per model = the exact billed total. `isSidechain:true`
+ * lines are Task-subagent sidechains written to a SEPARATE transcript (refs:
+ * sessionStorage.ts:1042) — excluding them keeps the main-turn sum from
+ * double-counting the separate Task-subagent capture. Emits one structured
+ * `agent_usage` event per distinct model.
+ */
+export function extractTranscriptUsage(transcript: string): SessionEvent[] {
+  if (typeof transcript !== "string" || transcript.length === 0) return [];
+  const sums = new Map<string, { input: number; output: number; cacheCreate: number; cacheRead: number }>();
+  let start = 0;
+  for (let i = 0; i <= transcript.length; i++) {
+    if (i !== transcript.length && transcript.charCodeAt(i) !== 10 /* \n */) continue;
+    const line = transcript.slice(start, i).trim();
+    start = i + 1;
+    if (line.length === 0) continue;
+    let obj: Record<string, unknown>;
+    try {
+      const p = JSON.parse(line);
+      if (!p || typeof p !== "object") continue;
+      obj = p as Record<string, unknown>;
+    } catch { continue; }
+    if (obj.type !== "assistant" || obj.isSidechain === true) continue;
+    const msg = obj.message;
+    if (!msg || typeof msg !== "object") continue;
+    const m = msg as Record<string, unknown>;
+    const model = typeof m.model === "string" ? m.model : "";
+    if (model.length === 0) continue;
+    const u = m.usage;
+    if (!u || typeof u !== "object") continue;
+    const usage = u as Record<string, unknown>;
+    const cur = sums.get(model) ?? { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 };
+    if (typeof usage.input_tokens === "number") cur.input += usage.input_tokens;
+    if (typeof usage.output_tokens === "number") cur.output += usage.output_tokens;
+    if (typeof usage.cache_creation_input_tokens === "number") cur.cacheCreate += usage.cache_creation_input_tokens;
+    if (typeof usage.cache_read_input_tokens === "number") cur.cacheRead += usage.cache_read_input_tokens;
+    sums.set(model, cur);
+  }
+  const events: SessionEvent[] = [];
+  for (const [model, s] of sums) {
+    const ev = buildAgentUsageEvent({
+      model_id: model,
+      input_tokens: s.input,
+      output_tokens: s.output,
+      cache_creation_tokens: s.cacheCreate,
+      cache_read_tokens: s.cacheRead,
+    });
+    if (ev) events.push(ev);
+  }
+  return events;
+}
+
+/**
+ * Cursor-aware variant of extractTranscriptUsage for the Stop hook.
+ *
+ * The transcript grows every turn and the forward loop forwards ALL passed
+ * events unconditionally, so re-running extractTranscriptUsage on the whole
+ * transcript each Stop would double-count every prior turn. This walks only
+ * the turns NEW since the last Stop, keyed by a per-session high-water cursor
+ * (the `uuid` of the last assistant turn seen).
+ *
+ *   - sinceUuid null/empty  → process ALL non-sidechain assistant turns.
+ *   - sinceUuid found       → process only turns AFTER it (exclusive).
+ *   - sinceUuid set but NOT found (transcript compaction dropped it) → process
+ *     ONLY THE LAST non-sidechain assistant turn. Bounded by design: we never
+ *     re-emit the whole history when the cursor falls off the front.
+ *
+ * `cursor` returns the uuid of the LAST non-sidechain assistant turn in the
+ * transcript (whether or not it carried usage), so the next Stop resumes
+ * exactly past it. When the transcript has no such turn, the input cursor is
+ * returned unchanged. Same char-algorithmic JSONL parse (NO regex), same
+ * sidechain exclusion, same buildAgentUsageEvent emission path.
+ */
+export function extractTranscriptUsageSince(
+  transcript: string,
+  sinceUuid: string | null,
+): { events: SessionEvent[]; cursor: string | null } {
+  const inputCursor = typeof sinceUuid === "string" && sinceUuid.length > 0 ? sinceUuid : null;
+  if (typeof transcript !== "string" || transcript.length === 0) {
+    return { events: [], cursor: inputCursor };
+  }
+
+  // Pass 1: materialize the ordered non-sidechain assistant turns (uuid + the
+  // usage signal we need). One linear walk, JSON.parse per line, no regex.
+  type Turn = {
+    uuid: string | null;
+    model: string;
+    input: number;
+    output: number;
+    cacheCreate: number;
+    cacheRead: number;
+  };
+  const turns: Turn[] = [];
+  let start = 0;
+  for (let i = 0; i <= transcript.length; i++) {
+    if (i !== transcript.length && transcript.charCodeAt(i) !== 10 /* \n */) continue;
+    const line = transcript.slice(start, i).trim();
+    start = i + 1;
+    if (line.length === 0) continue;
+    let obj: Record<string, unknown>;
+    try {
+      const p = JSON.parse(line);
+      if (!p || typeof p !== "object") continue;
+      obj = p as Record<string, unknown>;
+    } catch { continue; }
+    if (obj.type !== "assistant" || obj.isSidechain === true) continue;
+    const msg = obj.message;
+    if (!msg || typeof msg !== "object") continue;
+    const m = msg as Record<string, unknown>;
+    const model = typeof m.model === "string" ? m.model : "";
+    if (model.length === 0) continue;
+    const uuid = typeof obj.uuid === "string" && obj.uuid.length > 0 ? obj.uuid : null;
+    const u = m.usage;
+    const usage = u && typeof u === "object" ? (u as Record<string, unknown>) : {};
+    turns.push({
+      uuid,
+      model,
+      input: typeof usage.input_tokens === "number" ? usage.input_tokens : 0,
+      output: typeof usage.output_tokens === "number" ? usage.output_tokens : 0,
+      cacheCreate: typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : 0,
+      cacheRead: typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : 0,
+    });
+  }
+
+  // No assistant turns at all → nothing to emit, cursor unchanged.
+  if (turns.length === 0) return { events: [], cursor: inputCursor };
+
+  // Cursor always advances to the last assistant turn's uuid (or stays as the
+  // input cursor if that last turn has no uuid).
+  const lastUuid = turns[turns.length - 1].uuid;
+  const cursor = lastUuid !== null ? lastUuid : inputCursor;
+
+  // Select the slice to process.
+  let slice: Turn[];
+  if (inputCursor === null) {
+    slice = turns; // all turns
+  } else {
+    let foundAt = -1;
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i].uuid === inputCursor) { foundAt = i; break; }
+    }
+    if (foundAt >= 0) {
+      slice = turns.slice(foundAt + 1); // strictly after the cursor
+    } else {
+      // Compaction: cursor fell off the front. Bounded fallback — last turn only.
+      slice = turns.slice(turns.length - 1);
+    }
+  }
+
+  // Sum the selected turns per model and emit via the shared event builder.
+  const sums = new Map<string, { input: number; output: number; cacheCreate: number; cacheRead: number }>();
+  for (const t of slice) {
+    const cur = sums.get(t.model) ?? { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 };
+    cur.input += t.input;
+    cur.output += t.output;
+    cur.cacheCreate += t.cacheCreate;
+    cur.cacheRead += t.cacheRead;
+    sums.set(t.model, cur);
+  }
+  const events: SessionEvent[] = [];
+  for (const [model, s] of sums) {
+    const ev = buildAgentUsageEvent({
+      model_id: model,
+      input_tokens: s.input,
+      output_tokens: s.output,
+      cache_creation_tokens: s.cacheCreate,
+      cache_read_tokens: s.cacheRead,
+    });
+    if (ev) events.push(ev);
+  }
+  return { events, cursor };
 }
 
 // ── User-message extractors ────────────────────────────────────────────────
@@ -961,6 +2272,72 @@ const ROLE_MAX_CHARS = 120;
 const TWO_LEXICAL_TOKENS_PATTERN = /\p{L}+\s+\p{L}+/u;
 const CONTINUOUS_LETTER_RUN_PATTERN = /\p{L}{6,}/u;
 
+// Issue #856 — persona / standing-directive cue gate.
+//
+// The structural test below ("two lexical tokens OR a 6-codepoint letter run,
+// 8..120 chars, no '?', no clause separator") is intentionally coarse and
+// matches ANY short declarative sentence. That let casual conversational
+// acknowledgements ("that's fine for now", "go with the second option") freeze
+// as a priority-3 `role`, which the Pi adapter then re-injected as a standing
+// behavioral_directive every turn → do-nothing loop.
+//
+// A genuine role/behavioral prompt always LEADS with a persona declaration
+// ("You are X", "Tu es X", "あなたは…", "你是…") or a standing-directive verb
+// ("always respond…", "act as…"). Casual phrases never do, so we require that
+// cue as a NECESSARY condition. This preserves legitimate role persistence
+// (issue #535 multilingual corpus) while killing the casual-phrase loop.
+//
+// ALGORITHMIC ONLY — pure lowercase + prefix membership, no regex (project
+// hard rule). Multilingual openers are matched by `startsWith` on the
+// normalized first clause; leading conversational filler tokens are stripped
+// by array operations before the check.
+const ROLE_FILLER_TOKENS = new Set([
+  "ok", "okay", "sure", "yeah", "yep", "yup", "alright", "fine",
+  "well", "so", "hmm", "right", "please",
+]);
+
+// Second-person persona openers across the supported-language corpus
+// (issue #535 multilingual role test set) plus common English persona framings.
+const ROLE_PERSONA_PREFIXES = [
+  "you are", "you're", "your role", "you will be", "you act", "you will act",
+  "act as", "act like", "behave as", "behave like", "imagine you", "pretend you",
+  "assume the role", "take the role", "play the role", "respond as",
+  "tu es", "tu est", "vous etes", "vous êtes", // French
+  "sen ", "siz ", // Turkish (Sen kıdemli…)
+  "eres ", "tú eres", "usted es", // Spanish (Eres…)
+  "ты ", "вы ", // Russian (Ты опытный…)
+  "あなたは", "君は", "お前は", "あなたが", // Japanese (あなたは…)
+  "你是", "您是", // Chinese (你是…)
+  "तुम ", "आप ", "तू ", // Hindi (तुम…)
+  "أنت ", "انت ", "أنتَ ", // Arabic (أنت…)
+];
+
+// Standing-directive verb openers — imperative behavioral rules that should
+// persist ("always respond in TypeScript", "never use emojis").
+const ROLE_DIRECTIVE_PREFIXES = [
+  "always ", "never ", "respond ", "reply ", "answer ", "speak ",
+  "write ", "prefer ", "format ", "output ", "communicate ", "use only ",
+];
+
+function hasRoleCue(firstClause: string): boolean {
+  const lower = firstClause.toLowerCase().trim();
+  if (!lower) return false;
+  // Strip leading conversational filler tokens via array ops (no regex).
+  const tokens = lower.split(" ").filter((t) => t.length > 0);
+  while (tokens.length > 0 && ROLE_FILLER_TOKENS.has(tokens[0])) {
+    tokens.shift();
+  }
+  const normalized = tokens.join(" ");
+  if (!normalized) return false;
+  for (const prefix of ROLE_PERSONA_PREFIXES) {
+    if (normalized.startsWith(prefix)) return true;
+  }
+  for (const prefix of ROLE_DIRECTIVE_PREFIXES) {
+    if (normalized.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 function looksLikeRole(trimmed: string): boolean {
   // Role prompts are persona-prefix shaped: the FIRST SENTENCE declares the
   // role (e.g. "You are a senior backend engineer. <long context...>").
@@ -975,6 +2352,9 @@ function looksLikeRole(trimmed: string): boolean {
   if (!ALPHABETIC_PATTERN.test(firstClause)) return false;
   const codepointLength = [...firstClause].length;
   if (codepointLength < ROLE_MIN_CHARS || codepointLength > ROLE_MAX_CHARS) return false;
+  // Issue #856 — require a persona / standing-directive cue so casual
+  // conversational acknowledgements do not freeze as a role directive.
+  if (!hasRoleCue(firstClause)) return false;
   return (
     TWO_LEXICAL_TOKENS_PATTERN.test(firstClause) ||
     CONTINUOUS_LETTER_RUN_PATTERN.test(firstClause)
@@ -1048,6 +2428,35 @@ function extractIntent(message: string): SessionEvent[] {
     type: "intent",
     category: "intent",
     data: safeString(mode),
+    priority: 4,
+  }];
+}
+
+/**
+ * Category: session goal (objective).
+ *
+ * Captures the user's stated objective so it survives compaction and resume —
+ * unlike `intent`, which stores only the coarse mode (investigate/implement)
+ * and discards the goal text. Triggered by the `/goal <text>` command or an
+ * explicit `goal:` / `objective:` marker, so the FULL goal text is preserved
+ * (priority 4 = critical in the DB eviction contract) and restored at the top
+ * of the resume snapshot.
+ * Without this, a `/goal` directive is lost across compaction/resume.
+ */
+const GOAL_DIRECTIVE_PATTERN =
+  /^(?:\/goal\s+|(?:goal|objective)\s*:\s*)(.+)$/is;
+
+function extractGoal(message: string): SessionEvent[] {
+  const trimmed = message.trim();
+  if (!trimmed) return [];
+  const match = trimmed.match(GOAL_DIRECTIVE_PATTERN);
+  if (!match) return [];
+  const goalText = match[1].trim();
+  if (!goalText) return [];
+  return [{
+    type: "goal",
+    category: "goal",
+    data: safeString(goalText),
     priority: 4,
   }];
 }
@@ -1276,6 +2685,14 @@ const TOOL_NAME_NORMALIZE: Record<string, string> = {
   "container.exec": "Bash",
   local_shell: "Bash",
   grep_files: "Grep",
+  // Antigravity CLI (`agy`) native names. Keep in sync with the two other agy
+  // maps: hooks/antigravity-cli/payload.mjs (normalizeAgyToolName) and
+  // hooks/core/routing.mjs (TOOL_ALIASES).
+  run_command: "Bash",
+  view_file: "Read",
+  read_url_content: "WebFetch",
+  list_dir: "LS",
+  search_web: "WebSearch",
 };
 
 function normalizeHookInput(input: HookInput): HookInput {
@@ -1314,6 +2731,10 @@ export function extractEvents(rawInput: HookInput): SessionEvent[] {
     events.push(...extractDecision(input));
     events.push(...extractConstraint(input));
     events.push(...extractWorktree(input));
+    events.push(...extractWebFetchMetadata(input));
+    events.push(...extractBashOutcome(input));
+    events.push(...extractFileReadMetadata(input));
+    events.push(...extractAgentUsage(input));
     events.push(...extractAgentFinding(input));
     events.push(...extractExternalRef(input));
 
@@ -1338,9 +2759,11 @@ export function extractUserEvents(message: string): SessionEvent[] {
   try {
     const events: SessionEvent[] = [];
 
+    events.push(...extractUserPlan(message));
     events.push(...extractUserDecision(message));
     events.push(...extractRole(message));
     events.push(...extractIntent(message));
+    events.push(...extractGoal(message));
     events.push(...extractBlocker(message));
     events.push(...extractData(message));
 
@@ -1348,4 +2771,190 @@ export function extractUserEvents(message: string): SessionEvent[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Issue #4 (new PRD) — SessionStart settings + MCP servers snapshot.
+ *
+ * Emits ONE session_settings_snapshot event when ≥1 setting is available
+ * on the SessionStart input. The data field carries key:value tokens
+ * (mcp_count, mcp_servers, model, permission_mode) so the platform can
+ * compute MCP integration counts and primary-model adoption per org.
+ * mcp_servers list is truncated to first 8 names.
+ */
+export function extractSessionSettings(input: unknown): SessionEvent[] {
+  if (!input || typeof input !== "object") return [];
+
+  const obj = input as Record<string, unknown>;
+  const parts: string[] = [];
+
+  const mcpServers = obj.mcp_servers;
+  let mcpKeys: string[] | null = null;
+  if (mcpServers && typeof mcpServers === "object" && !Array.isArray(mcpServers)) {
+    mcpKeys = Object.keys(mcpServers as Record<string, unknown>);
+    parts.push(`mcp_count:${mcpKeys.length}`);
+    if (mcpKeys.length > 0) {
+      parts.push(`mcp_servers:${mcpKeys.slice(0, 8).join(",")}`);
+    }
+  }
+
+  if (typeof obj.model === "string") {
+    parts.push(`model:${obj.model.slice(0, 64)}`);
+  }
+
+  if (typeof obj.permission_mode === "string") {
+    parts.push(`permission_mode:${obj.permission_mode.slice(0, 32)}`);
+  }
+
+  if (parts.length === 0) return [];
+
+  return [{
+    type: "session_settings_snapshot",
+    category: "env",
+    data: safeString(parts.join(" ")),
+    priority: 2,
+  }];
+}
+
+/**
+ * §11 Layer 1 + Layer 3 — multilingual prompt features.
+ *
+ * Reference: context-mode-platform/docs/prds/2026-06-insight-data-flow/
+ *   11-multilingual-prompt-algorithm.md
+ *
+ * Script-agnostic via Unicode property regex (`\p{L}`, `\p{Lu}`,
+ * `\p{Script=X}`). No per-language tables, no franc/fasttext deps.
+ * Layer 1 returns 10 numeric/string features; Layer 3 appends a
+ * `prompt_word_tokens: string[]` array for the platform's streaming
+ * word-frequency UPSERT.
+ *
+ * Privacy: features carry no prose. Layer 3 tokens are deduped
+ * letter-only words ≥3 chars; platform aggregates by (org_id, week,
+ * word) so no individual token surfaces in UI.
+ */
+export interface PromptFeatures {
+  prompt_length: number;
+  prompt_word_count: number;
+  prompt_uppercase_ratio: number;
+  prompt_file_ref_count: number;
+  prompt_path_ref_count: number;
+  prompt_script_primary: string | null;
+  prompt_script_count: number;
+  prompt_question_glyph_count: number;
+  prompt_code_block_count: number;
+  prompt_url_count: number;
+  prompt_word_tokens: string[];
+}
+
+const PROMPT_SCRIPT_NAMES = [
+  "Latin", "Cyrillic", "Arabic", "Han", "Hangul",
+  "Hiragana", "Katakana", "Devanagari", "Hebrew", "Thai", "Greek",
+] as const;
+
+const EMPTY_PROMPT_FEATURES: PromptFeatures = {
+  prompt_length: 0,
+  prompt_word_count: 0,
+  prompt_uppercase_ratio: 0,
+  prompt_file_ref_count: 0,
+  prompt_path_ref_count: 0,
+  prompt_script_primary: null,
+  prompt_script_count: 0,
+  prompt_question_glyph_count: 0,
+  prompt_code_block_count: 0,
+  prompt_url_count: 0,
+  prompt_word_tokens: [],
+};
+
+/**
+ * Verbatim mirror of §11 Layer 1 reference implementation + Layer 3
+ * token extraction. Uses Unicode property regex per the spec — the
+ * "no regex" project default does NOT apply here because the spec
+ * explicitly mandates `\p{Script=X}` for script-agnostic classification.
+ */
+export function extractUserPromptFeatures(prompt: unknown): PromptFeatures {
+  if (typeof prompt !== "string" || prompt.length === 0) {
+    return { ...EMPTY_PROMPT_FEATURES, prompt_word_tokens: [] };
+  }
+
+  const letters = prompt.match(/\p{L}+/gu) ?? [];
+  const upperCount = (prompt.match(/\p{Lu}/gu) ?? []).length;
+  const totalLetters = letters.join("").length;
+  const fences = (prompt.match(/```/g) ?? []).length;
+
+  const scripts: Record<string, number> = {};
+  for (const name of PROMPT_SCRIPT_NAMES) {
+    const re = new RegExp(`\\p{Script=${name}}`, "gu");
+    const n = (prompt.match(re) ?? []).length;
+    if (n > 0) scripts[name] = n;
+  }
+  const primary =
+    Object.entries(scripts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const word of letters) {
+    if (word.length < 3) continue;
+    const lower = word.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    tokens.push(lower);
+  }
+
+  return {
+    prompt_length: prompt.length,
+    prompt_word_count: letters.length,
+    prompt_uppercase_ratio: totalLetters === 0 ? 0 : upperCount / totalLetters,
+    prompt_file_ref_count: (prompt.match(/(\w+\/)+\w+\.\w+/g) ?? []).length,
+    prompt_path_ref_count: (prompt.match(/\.{0,2}\/[\w\/.-]+/g) ?? []).length,
+    prompt_script_primary: primary,
+    prompt_script_count: Object.keys(scripts).length,
+    prompt_question_glyph_count: (prompt.match(/[?？؟]/gu) ?? []).length,
+    prompt_code_block_count: Math.floor(fences / 2),
+    prompt_url_count: (prompt.match(/https?:\/\/[^\s]+/gu) ?? []).length,
+    prompt_word_tokens: tokens,
+  };
+}
+
+/**
+ * UserPromptSubmit-driven `/plan` slash detector.
+ *
+ * Compensates for Claude Code Bug #15660: programmatic EnterPlanMode tool
+ * calls fire PostToolUse, but the `/plan` slash command and Shift+Tab do
+ * NOT. Shift+Tab is unrecoverable from the OSS bridge without an upstream
+ * SDK change; this detector handles the slash case.
+ *
+ * Algorithmic (no regex): tolerate leading whitespace, require lowercase
+ * "/plan", reject longer slashes like "/plans" via the next-char check.
+ */
+function extractUserPlan(message: string): SessionEvent[] {
+  if (typeof message !== "string" || message.length === 0) return [];
+
+  let i = 0;
+  while (i < message.length) {
+    const c = message.charCodeAt(i);
+    if (c !== 32 && c !== 9) break;
+    i++;
+  }
+
+  if (i + 5 > message.length) return [];
+  if (message.slice(i, i + 5) !== "/plan") return [];
+
+  if (i + 5 < message.length) {
+    const next = message.charCodeAt(i + 5);
+    const isWordBoundary =
+      next === 32 || next === 9 || next === 10 || next === 13;
+    if (!isWordBoundary) return [];
+  }
+
+  const arg = message.slice(i + 5).trim();
+  const detail = arg.length > 0
+    ? `plan via /plan slash: ${arg.slice(0, 120)}`
+    : "plan via /plan slash";
+
+  return [{
+    type: "plan_enter",
+    category: "plan",
+    data: safeString(detail),
+    priority: 2,
+  }];
 }

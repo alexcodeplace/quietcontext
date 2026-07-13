@@ -223,7 +223,7 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
   },
   {
     name: "ctx_insight",
-    description: "Open the context-mode Insight analytics dashboard in the browser.",
+    description: "Open the hosted context-mode Insight dashboard (context-mode.com/insight) in the browser.",
     parameters: {
       type: "object",
       properties: {},

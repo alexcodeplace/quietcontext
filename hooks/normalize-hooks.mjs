@@ -219,29 +219,55 @@ export function normalizePluginJson(content, nodePath, pluginRoot) {
 }
 
 /**
- * Apply normalization to hooks.json and plugin.json on startup.
+ * Apply normalization to hooks/hooks.json ONLY (not plugin.json).
+ *
+ * Why a narrow variant exists (#711 + #414 / #528):
+ *   - plugin.json is read by Claude Code's plugin manager and carried forward
+ *     into NEW versioned cache dirs on auto-update. Baking absolute paths into
+ *     it during /ctx-upgrade poisons the next version (#711).
+ *   - hooks/hooks.json lives in the per-version dir and is read by the SAME
+ *     Node process that needs to spawn a child. On Windows + Git Bash, Claude
+ *     Code fires SessionStart/PreToolUse BEFORE MCP boot — the unresolved
+ *     `${CLAUDE_PLUGIN_ROOT}` placeholder yields MODULE_NOT_FOUND for the
+ *     first hook fire after /ctx-upgrade (#414).
+ *
+ * So /ctx-upgrade calls THIS narrow function (hooks.json only) to close the
+ * Windows first-hook-fire window without re-introducing #711.
  *
  * Options:
- *   - pluginRoot: absolute path to plugin install dir (e.g. __dirname of start.mjs)
- *   - nodePath:   process.execPath
- *   - platform:   process.platform ("win32" and "linux" trigger a write)
+ *   - pluginRoot:     absolute path to plugin install dir
+ *   - nodePath:       process.execPath (the Node binary running this script)
+ *   - jsRuntimePath:  optional — resolved Bun ≥1.0 path (#738). When set, the
+ *                     rewrite uses this instead of nodePath so hook invocations
+ *                     gain Bun's ~40-60ms cold-start advantage. Falls back to
+ *                     nodePath when omitted (back-compat).
+ *   - platform:       process.platform. Triggers a write on:
+ *                       • "win32" / "linux" — the original #378 path
+ *                         (#369/#372 MSYS / nvm fixes), AND
+ *                       • any platform when jsRuntimePath !== nodePath
+ *                         (#738 — bun swap is a perf optimisation that should
+ *                         not be gated by the historical Windows-only check;
+ *                         issue was filed from macOS).
  *
  * Best-effort — never throws.
  */
-export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
-  // Normalize on Windows (MSYS path mangling, #369/#372/#378) and Linux
-  // (bare `node` not in PATH when invoked via /bin/sh, e.g. nvm users).
-  // macOS ships a system node so bare `node` resolves reliably there.
-  if (platform !== "win32" && platform !== "linux") return;
-  if (!pluginRoot || !nodePath) return;
+export function normalizeHooksJsonOnly({ pluginRoot, nodePath, jsRuntimePath, platform }) {
+  const effectiveRuntime = jsRuntimePath || nodePath;
+  // #378 path: always normalize on Windows/Linux to heal placeholder + bare-node.
+  // #738 path: also fire on macOS when we have a real bun swap to perform — the
+  // legacy gate skipped darwin because system node was reliable there, but bun
+  // resolution is the new perf-win that the gate now needs to allow through.
+  const isPlatformGated = platform !== "win32" && platform !== "linux";
+  const hasBunSwap = jsRuntimePath && jsRuntimePath !== nodePath;
+  if (isPlatformGated && !hasBunSwap) return;
+  if (!pluginRoot || !effectiveRuntime) return;
 
-  // hooks/hooks.json
   try {
     const hooksPath = resolve(pluginRoot, "hooks", "hooks.json");
     if (existsSync(hooksPath)) {
       const original = readFileSync(hooksPath, "utf-8");
       if (needsHookNormalization(original, pluginRoot)) {
-        const next = normalizeHooksJson(original, nodePath, pluginRoot);
+        const next = normalizeHooksJson(original, effectiveRuntime, pluginRoot);
         if (next !== original) {
           writeFileSync(hooksPath, next, "utf-8");
         }
@@ -250,6 +276,34 @@ export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
   } catch {
     /* best effort */
   }
+}
+
+/**
+ * Apply normalization to hooks.json and plugin.json on startup.
+ *
+ * Options:
+ *   - pluginRoot:     absolute path to plugin install dir (e.g. __dirname of start.mjs)
+ *   - nodePath:       process.execPath
+ *   - jsRuntimePath:  optional Bun ≥1.0 path (#738) — used for hooks.json only,
+ *                     never for plugin.json (the MCP server itself must stay on
+ *                     Node — better-sqlite3 ABI, #543)
+ *   - platform:       process.platform ("win32" and "linux" trigger plugin.json
+ *                     rewrite for #378; hooks.json also rewrites on darwin when
+ *                     `jsRuntimePath` !== `nodePath` for #738)
+ *
+ * Best-effort — never throws.
+ */
+export function normalizeHooksOnStartup({ pluginRoot, nodePath, jsRuntimePath, platform }) {
+  // Delegate the hooks.json branch to the narrow helper so /ctx-upgrade and
+  // boot share one implementation. plugin.json normalization stays here —
+  // start.mjs and postinstall still need it; /ctx-upgrade must NOT (#711).
+  normalizeHooksJsonOnly({ pluginRoot, nodePath, jsRuntimePath, platform });
+
+  // plugin.json rewrite: ALWAYS uses nodePath (MCP server must stay on Node,
+  // #543). Bun resolution is irrelevant here — `jsRuntimePath` is consumed
+  // exclusively by the hooks.json branch above.
+  if (platform !== "win32" && platform !== "linux") return;
+  if (!pluginRoot || !nodePath) return;
 
   // .claude-plugin/plugin.json
   try {

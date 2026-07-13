@@ -17,16 +17,17 @@ await runHook(async () => {
     parseStdin,
     getSessionId,
     getSessionDBPath,
+    getInputProjectDir,
     resolveConfigDir,
   } = await import("./session-helpers.mjs");
-  const { createSessionLoaders } = await import("./session-loaders.mjs");
+  const { createSessionLoaders, attributeAndInsertEvents } = await import("./session-loaders.mjs");
   const { appendFileSync } = await import("node:fs");
   const { join, dirname } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
 
   // Resolve absolute path for imports
   const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-  const { loadSessionDB, loadSnapshot } = createSessionLoaders(HOOK_DIR);
+  const { loadSessionDB, loadSnapshot, loadProjectAttribution } = createSessionLoaders(HOOK_DIR);
   const DEBUG_LOG = join(resolveConfigDir(), "context-mode", "precompact-debug.log");
 
   try {
@@ -52,31 +53,37 @@ await runHook(async () => {
       db.upsertResume(sessionId, snapshot, events.length);
       db.incrementCompactCount(sessionId);
 
-      // Write compaction category event for analytics
-      const fileEvents = events.filter(e => e.category === "file");
-      db.insertEvent(sessionId, {
-        type: "compaction_summary",
-        category: "compaction",
-        data: `Session compacted. ${events.length} events, ${fileEvents.length} files touched.`,
-        priority: 1,
-      }, "PreCompact");
-
-      // D2 PRD Phase 6.1: emit snapshot-built event with bytes_avoided=snapshot.length
-      // Snapshot bytes are bytes the model would have re-read on resume but didn't.
+      // v1.0.160: route compaction lifecycle events through wire so
+      // dashboard's compact widget gets per-compaction rows (the engine
+      // joins on category='compaction' to compute snapshot insights).
       try {
-        db.insertEvent(
+        const fileEvents = events.filter(e => e.category === "file");
+        const projectDirCompact = getInputProjectDir(input);
+        const { resolveProjectAttributions } = await loadProjectAttribution();
+        attributeAndInsertEvents(
+          db,
           sessionId,
-          {
-            type: "snapshot-built",
-            category: "compaction",
-            data: `Snapshot built. ${snapshot.length} bytes for ${events.length} events.`,
-            priority: 1,
-          },
+          [
+            {
+              type: "compaction_summary",
+              category: "compaction",
+              data: `Session compacted. ${events.length} events, ${fileEvents.length} files touched.`,
+              priority: 1,
+            },
+            {
+              type: "snapshot-built",
+              category: "compaction",
+              data: `Snapshot built. ${snapshot.length} bytes for ${events.length} events.`,
+              priority: 1,
+              bytes_avoided: snapshot.length,
+            },
+          ],
+          input,
+          projectDirCompact,
           "PreCompact",
-          undefined,
-          { bytesAvoided: snapshot.length, bytesReturned: 0 },
+          resolveProjectAttributions,
         );
-      } catch { /* best-effort */ }
+      } catch { /* best-effort — never block PreCompact */ }
     }
 
     db.close();

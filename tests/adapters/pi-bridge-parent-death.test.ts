@@ -14,14 +14,14 @@ import "../setup-home";
  * exits in ~50 ms and no human is around to notice the 30 s gap.
  *
  * Fix: when the lifecycle guard runs *as an MCP bridge child* (signalled via
- * `CONTEXT_MODE_BRIDGE_DEPTH=1` in env — already set by mcp-bridge.ts:179),
+ * `QUIET_CONTEXT_BRIDGE_DEPTH=1` in env — already set by mcp-bridge.ts:179),
  * tighten the poll to 1 s. This is invisible to normal Claude Code MCP
  * sessions (their depth is 0) and shrinks the orphan window for `pi --help`
  * from 30 s to ~1 s.
  *
  * These tests pin:
  *   1. `lifecycleGuardIntervalForEnv(env)` returns 1000 when
- *      `CONTEXT_MODE_BRIDGE_DEPTH` is set to a positive number.
+ *      `QUIET_CONTEXT_BRIDGE_DEPTH` is set to a positive number.
  *   2. Returns the default (30000) otherwise.
  *   3. `startLifecycleGuard` honours the resolved interval — under the
  *      fast-poll regime, an `isParentAlive=false` flip is detected in ≤2 s.
@@ -38,22 +38,22 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   // Restore env keys we mutate.
-  delete process.env.CONTEXT_MODE_BRIDGE_DEPTH;
-  if (realEnv.CONTEXT_MODE_BRIDGE_DEPTH !== undefined) {
-    process.env.CONTEXT_MODE_BRIDGE_DEPTH = realEnv.CONTEXT_MODE_BRIDGE_DEPTH;
+  delete process.env.QUIET_CONTEXT_BRIDGE_DEPTH;
+  if (realEnv.QUIET_CONTEXT_BRIDGE_DEPTH !== undefined) {
+    process.env.QUIET_CONTEXT_BRIDGE_DEPTH = realEnv.QUIET_CONTEXT_BRIDGE_DEPTH;
   }
 });
 
 describe("lifecycleGuardIntervalForEnv — bridge-child fast poll (#534)", () => {
-  it("returns 1000 ms when CONTEXT_MODE_BRIDGE_DEPTH=1 (running as MCP child)", async () => {
+  it("returns 1000 ms when QUIET_CONTEXT_BRIDGE_DEPTH=1 (running as MCP child)", async () => {
     const { lifecycleGuardIntervalForEnv } = await import("../../src/lifecycle.js");
-    expect(lifecycleGuardIntervalForEnv({ CONTEXT_MODE_BRIDGE_DEPTH: "1" })).toBe(1000);
+    expect(lifecycleGuardIntervalForEnv({ QUIET_CONTEXT_BRIDGE_DEPTH: "1" })).toBe(1000);
   });
 
   it("returns 1000 ms for any positive depth (transitive bridges)", async () => {
     const { lifecycleGuardIntervalForEnv } = await import("../../src/lifecycle.js");
-    expect(lifecycleGuardIntervalForEnv({ CONTEXT_MODE_BRIDGE_DEPTH: "2" })).toBe(1000);
-    expect(lifecycleGuardIntervalForEnv({ CONTEXT_MODE_BRIDGE_DEPTH: "5" })).toBe(1000);
+    expect(lifecycleGuardIntervalForEnv({ QUIET_CONTEXT_BRIDGE_DEPTH: "2" })).toBe(1000);
+    expect(lifecycleGuardIntervalForEnv({ QUIET_CONTEXT_BRIDGE_DEPTH: "5" })).toBe(1000);
   });
 
   it("returns the default 30000 ms when env flag is absent (regression guard)", async () => {
@@ -63,12 +63,12 @@ describe("lifecycleGuardIntervalForEnv — bridge-child fast poll (#534)", () =>
 
   it("returns the default 30000 ms when depth is 0 (top-level MCP server)", async () => {
     const { lifecycleGuardIntervalForEnv } = await import("../../src/lifecycle.js");
-    expect(lifecycleGuardIntervalForEnv({ CONTEXT_MODE_BRIDGE_DEPTH: "0" })).toBe(30_000);
+    expect(lifecycleGuardIntervalForEnv({ QUIET_CONTEXT_BRIDGE_DEPTH: "0" })).toBe(30_000);
   });
 
   it("returns the default when depth is malformed (defensive)", async () => {
     const { lifecycleGuardIntervalForEnv } = await import("../../src/lifecycle.js");
-    expect(lifecycleGuardIntervalForEnv({ CONTEXT_MODE_BRIDGE_DEPTH: "garbage" })).toBe(
+    expect(lifecycleGuardIntervalForEnv({ QUIET_CONTEXT_BRIDGE_DEPTH: "garbage" })).toBe(
       30_000,
     );
   });

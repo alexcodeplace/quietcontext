@@ -65,7 +65,7 @@ describe("precompact.mjs — snapshot-built event (D2 PRD Phase 6.1)", () => {
       CLAUDE_CONFIG_DIR: join(fakeHome, ".claude"),
       CLAUDE_PROJECT_DIR: fakeProject,
       CLAUDE_SESSION_ID: sessionId,
-      CONTEXT_MODE_SESSION_SUFFIX: "",
+      QUIET_CONTEXT_SESSION_SUFFIX: "",
     };
   });
 

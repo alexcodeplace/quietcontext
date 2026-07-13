@@ -53,7 +53,7 @@ export class AntigravityAdapter extends BaseAdapter implements HookAdapter {
     super([".gemini"]);
   }
 
-  readonly name = "Antigravity";
+  readonly name: string = "Antigravity";
   readonly paradigm: HookParadigm = "mcp-only";
 
   readonly capabilities: PlatformCapabilities = {

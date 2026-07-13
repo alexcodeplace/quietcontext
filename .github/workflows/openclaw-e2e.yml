@@ -99,7 +99,7 @@ jobs:
         run: bash scripts/test-openclaw-e2e.sh
         env:
           OPENCLAW_HOME: ${{ github.workspace }}
-          CONTEXT_MODE_SESSION_SUFFIX: ""
+          QUIET_CONTEXT_SESSION_SUFFIX: ""
 
       - name: Upload session DBs on failure
         if: failure()

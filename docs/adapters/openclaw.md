@@ -59,7 +59,7 @@ openclaw mcp set context-mode \
 openclaw gateway restart
 ```
 
-After the restart, the agent's tool inventory should include `context-mode__ctx_execute`, `context-mode__ctx_search`, `context-mode__ctx_fetch_and_index`, and the rest of the `ctx_*` surface (OpenClaw prefixes MCP-sourced tools with the server name).
+After the restart, the agent's tool inventory should include `context-mode__execute`, `context-mode__search`, `context-mode__fetch-index`, and the rest of the `ctx_*` surface (OpenClaw prefixes MCP-sourced tools with the server name).
 
 ## Hook Registration
 

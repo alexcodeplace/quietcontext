@@ -368,12 +368,12 @@ describe("initSecurity loud-failure (#466)", () => {
       timeout: 10000,
       env: {
         ...process.env,
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "",
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "",
         // #558 v1.0.127: initSecurity is now bundle-first. To exercise the
         // "both missing → loud fail" contract, point the bundle test seam at
         // a non-existent path so neither the bundle nor build/security.js
         // can be loaded.
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
       },
     });
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -385,7 +385,7 @@ describe("initSecurity loud-failure (#466)", () => {
     );
   });
 
-  test("CONTEXT_MODE_SUPPRESS_SECURITY_WARNING silences the warning", async () => {
+  test("QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING silences the warning", async () => {
     const ROUTING_PATH = join(__dirname, "..", "..", "hooks", "core", "routing.mjs");
     const missingBuildDir = join(tmpdir(), `ctx-no-build-${Date.now()}-silent`);
     const code = `
@@ -397,10 +397,10 @@ describe("initSecurity loud-failure (#466)", () => {
       timeout: 10000,
       env: {
         ...process.env,
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
         // #558 v1.0.127: bundle-first — hide the bundle so the warn-or-suppress
         // codepath actually runs (otherwise bundle loads and warning never fires).
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
       },
     });
     assert.equal(r.status, 0);
@@ -712,7 +712,7 @@ describe("resolveConfigDir (#289)", () => {
     `;
     const r = spawnSync("node", ["--input-type=module", "-e", code], {
       encoding: "utf-8",
-      env: { ...process.env, ...env, CONTEXT_MODE_SESSION_SUFFIX: "" },
+      env: { ...process.env, ...env, QUIET_CONTEXT_SESSION_SUFFIX: "" },
       timeout: 10000,
     });
     return JSON.parse(r.stdout);
@@ -772,13 +772,13 @@ describe("resolveConfigDir (#289)", () => {
       const code = `
         process.env.CLAUDE_CONFIG_DIR = ${JSON.stringify(customDir)};
         process.env.CLAUDE_PROJECT_DIR = "/test/project";
-        process.env.CONTEXT_MODE_SESSION_SUFFIX = "";
+        process.env.QUIET_CONTEXT_SESSION_SUFFIX = "";
         const { getSessionDBPath } = await import(${JSON.stringify(pathToFileURL(HELPERS_PATH).href)});
         process.stdout.write(getSessionDBPath());
       `;
       const r = spawnSync("node", ["--input-type=module", "-e", code], {
         encoding: "utf-8",
-        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, CLAUDE_PROJECT_DIR: "/test/project", CONTEXT_MODE_SESSION_SUFFIX: "" },
+        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, CLAUDE_PROJECT_DIR: "/test/project", QUIET_CONTEXT_SESSION_SUFFIX: "" },
         timeout: 10000,
       });
       expect(r.stdout).toContain(customDir);
@@ -795,7 +795,7 @@ describe("resolveConfigDir (#289)", () => {
     try {
       const code = `
         process.env.CLAUDE_CONFIG_DIR = ${JSON.stringify(customDir)};
-        process.env.CONTEXT_MODE_SESSION_SUFFIX = "";
+        process.env.QUIET_CONTEXT_SESSION_SUFFIX = "";
         const {
           getSessionDBPath,
           getSessionEventsPath,
@@ -815,7 +815,7 @@ describe("resolveConfigDir (#289)", () => {
       `;
       const r = spawnSync("node", ["--input-type=module", "-e", code], {
         encoding: "utf-8",
-        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, CONTEXT_MODE_SESSION_SUFFIX: "" },
+        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, QUIET_CONTEXT_SESSION_SUFFIX: "" },
         timeout: 10000,
       });
       expect(r.status).toBe(0);
@@ -901,7 +901,7 @@ describe("Category 27 — Latency cross-hook bridge", () => {
       USERPROFILE: fakeHome,
       CLAUDE_PROJECT_DIR: fakeProject,
       CLAUDE_SESSION_ID: "latency-test-session",
-      CONTEXT_MODE_SESSION_SUFFIX: "",
+      QUIET_CONTEXT_SESSION_SUFFIX: "",
     };
   });
 
@@ -1060,7 +1060,7 @@ describe("empty stdin resilience (#322)", () => {
           GEMINI_PROJECT_DIR: fakeProject,
           VSCODE_CWD: fakeProject,
           CURSOR_CWD: fakeProject,
-          CONTEXT_MODE_SESSION_SUFFIX: "",
+          QUIET_CONTEXT_SESSION_SUFFIX: "",
         },
       });
       return { exitCode: r.status ?? -1 };

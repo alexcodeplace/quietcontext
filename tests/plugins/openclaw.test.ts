@@ -818,11 +818,11 @@ describe("OpenClawPlugin", () => {
         mkdtempSync(join(tmpdir(), "OpenClaw-Mixed-")),
       );
       const prevCwd = process.cwd();
-      const priorOverride = process.env.CONTEXT_MODE_DATA_DIR;
+      const priorOverride = process.env.QUIET_CONTEXT_DATA_DIR;
       // Route the OpenClaw sessions dir into a fresh scratch root so
       // we never collide with the developer's real ~/.openclaw DB.
       const dataRoot = mkdtempSync(join(tmpdir(), "openclaw-645-root-"));
-      process.env.CONTEXT_MODE_DATA_DIR = dataRoot;
+      process.env.QUIET_CONTEXT_DATA_DIR = dataRoot;
       try {
         // OpenClaw plugin resolves projectDir via process.cwd() at
         // register() time (src/adapters/openclaw/plugin.ts:250).
@@ -878,9 +878,9 @@ describe("OpenClawPlugin", () => {
         try { rmSync(mixedCaseProject, { recursive: true, force: true }); } catch { /* best effort */ }
         try { rmSync(dataRoot, { recursive: true, force: true }); } catch { /* best effort */ }
         if (priorOverride === undefined) {
-          delete process.env.CONTEXT_MODE_DATA_DIR;
+          delete process.env.QUIET_CONTEXT_DATA_DIR;
         } else {
-          process.env.CONTEXT_MODE_DATA_DIR = priorOverride;
+          process.env.QUIET_CONTEXT_DATA_DIR = priorOverride;
         }
         vi.resetModules();
       }

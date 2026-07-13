@@ -1190,7 +1190,7 @@ describe("Pi MCP bridge (#426)", () => {
     const url = require("node:url") as typeof import("node:url");
     const here = path.dirname(url.fileURLToPath(import.meta.url));
     const mcpEntry = path.resolve(here, "..", "start.mjs");
-    const mcpEnv = { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1" };
+    const mcpEnv = { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1" };
 
     let bridge: { tools: string[]; shutdown: () => void } | null = null;
 

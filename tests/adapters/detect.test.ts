@@ -65,7 +65,7 @@ describe("detectPlatform", () => {
     delete process.env.IDEA_INITIAL_DIRECTORY;
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
-    delete process.env.CONTEXT_MODE_PLATFORM;
+    delete process.env.QUIET_CONTEXT_PLATFORM;
     // Issue #539 slice 2: tests in this file pre-date the installed_plugins.json
     // fallback and assume env-var-only detection. Seed the plugin cache to a
     // "miss" so the fallback never triggers — explicit slice-2 coverage lives
@@ -390,39 +390,39 @@ describe("detectPlatform", () => {
     expect(signal.platform).toBe("claude-code");
   });
 
-  // ── CONTEXT_MODE_PLATFORM override ──────────────────────
+  // ── QUIET_CONTEXT_PLATFORM override ──────────────────────
 
-  it("returns antigravity when CONTEXT_MODE_PLATFORM=antigravity", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity";
+  it("returns antigravity when QUIET_CONTEXT_PLATFORM=antigravity", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "antigravity";
     const signal = detectPlatform();
     expect(signal.platform).toBe("antigravity");
     expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
+    expect(signal.reason).toContain("QUIET_CONTEXT_PLATFORM");
   });
 
-  it("returns kiro when CONTEXT_MODE_PLATFORM=kiro", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "kiro";
+  it("returns kiro when QUIET_CONTEXT_PLATFORM=kiro", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "kiro";
     const signal = detectPlatform();
     expect(signal.platform).toBe("kiro");
     expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
+    expect(signal.reason).toContain("QUIET_CONTEXT_PLATFORM");
   });
 
-  it("CONTEXT_MODE_PLATFORM takes priority over env vars", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity";
+  it("QUIET_CONTEXT_PLATFORM takes priority over env vars", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "antigravity";
     process.env.CLAUDE_PROJECT_DIR = "/some/project";
     const signal = detectPlatform();
     expect(signal.platform).toBe("antigravity");
   });
 
-  it("clientInfo takes priority over CONTEXT_MODE_PLATFORM", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "codex";
+  it("clientInfo takes priority over QUIET_CONTEXT_PLATFORM", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "codex";
     const signal = detectPlatform({ name: "antigravity-client", version: "1.0" });
     expect(signal.platform).toBe("antigravity");
   });
 
-  it("invalid CONTEXT_MODE_PLATFORM is ignored", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "not-a-platform";
+  it("invalid QUIET_CONTEXT_PLATFORM is ignored", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "not-a-platform";
     process.env.CLAUDE_PROJECT_DIR = "/some/project";
     const signal = detectPlatform();
     expect(signal.platform).toBe("claude-code");
@@ -463,7 +463,7 @@ describe("detectPlatform", () => {
   it("returns a valid platform as default when no env vars are set", () => {
     // No env vars set — result depends on which config dirs exist on this machine.
     const signal = detectPlatform();
-    expect(["claude-code", "gemini-cli", "codex", "cursor", "opencode", "kilo", "openclaw", "vscode-copilot", "antigravity", "kiro", "pi", "omp", "zed", "qwen-code", "jetbrains-copilot"]).toContain(signal.platform);
+    expect(["claude-code", "gemini-cli", "codex", "cursor", "opencode", "kilo", "openclaw", "vscode-copilot", "antigravity", "antigravity-cli", "kiro", "pi", "omp", "zed", "qwen-code", "jetbrains-copilot"]).toContain(signal.platform);
   });
 });
 

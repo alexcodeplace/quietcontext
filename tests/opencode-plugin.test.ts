@@ -363,7 +363,7 @@ describe("ContextModePlugin", () => {
           const after = {
             unhandled: process.listenerCount("unhandledRejection"),
             uncaught: process.listenerCount("uncaughtException"),
-            embedded: process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS ?? null,
+            embedded: process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS ?? null,
           };
           console.log(JSON.stringify({ before, after }));
           })().catch((err) => { console.error(err); process.exit(1); });

@@ -71,7 +71,7 @@ Spawn the **pair** (Architect + Staff Engineer) for each affected platform:
 | Hook, PreToolUse, PostToolUse, SessionStart, PreCompact | **Hooks Architect** | Hook lifecycle, matcher patterns, stdin/stdout protocol |
 | Session, compaction, resume, snapshot, continuity | **Session Architect** | SessionDB schema, event extraction, resume flow, PreCompact |
 | Executor, sandbox, polyglot, truncation, timeout | **Executor Architect** | Language runtimes, smart truncation, FTS5 indexing pipeline |
-| Fetch, turndown, HTML, markdown conversion, web | **Web/Fetch Architect** | ctx_fetch_and_index, HTML→markdown, chunking, URL handling |
+| Fetch, turndown, HTML, markdown conversion, web | **Web/Fetch Architect** | fetch-index, HTML→markdown, chunking, URL handling |
 | Performance, benchmark, tokens, context savings | **Performance Engineer** | Token counting, context savings ratio, benchmark comparisons |
 | Version, release, publish, npm, manifest | **Release Engineer** | version-sync, manifest files, npm publish, GitHub releases |
 
@@ -145,7 +145,7 @@ Report back with ONE of:
 - FINDINGS: {investigation results}
 
 ## Tools Available
-- Use context-mode MCP tools (ctx_execute, ctx_batch_execute) for large output
+- Use context-mode MCP tools (execute, batch) for large output
 - Use Grep/Glob for targeted searches
 - Use Read only for files you need to Edit
 - Run tests with: npx vitest run {test file}

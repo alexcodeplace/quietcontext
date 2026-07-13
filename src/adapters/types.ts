@@ -3,9 +3,10 @@
  *
  * Defines the contract that each platform adapter must implement.
  * Three paradigms exist across supported platforms:
- *   A) JSON stdin/stdout — Claude Code, Gemini CLI, VS Code Copilot, Copilot CLI, Cursor
- *   B) TS Plugin Functions — OpenCode
- *   C) MCP-only (no hooks) — Codex CLI
+ *   A) JSON stdin/stdout — Claude Code, Gemini/Qwen family CLIs, Copilot/Codex/Kimi,
+ *      Cursor, Kiro, Antigravity CLI (`agy`)
+ *   B) TS Plugin Functions — OpenCode, KiloCode, OpenClaw
+ *   C) MCP-only (no hooks) — Antigravity IDE, Zed, Pi/OMP MCP-only paths
  *
  * The MCP server layer is 100% portable and needs no adapter.
  * Only the hook layer requires platform-specific adapters.
@@ -14,6 +15,8 @@
 // ─────────────────────────────────────────────────────────
 // Hook paradigm
 // ─────────────────────────────────────────────────────────
+
+import { resolveHookRuntime } from "../runtime.js";
 
 export type HookParadigm = "json-stdio" | "ts-plugin" | "mcp-only";
 
@@ -372,10 +375,59 @@ export interface HealthCheck {
  *
  * Safe on macOS/Linux — quoting and forward slashes are no-ops there.
  */
-export function buildNodeCommand(scriptPath: string): string {
-  const nodePath = process.execPath.replace(/\\/g, "/");
+export function buildNodeCommand(
+  scriptPath: string,
+  opts?: { platform?: string; jsRuntime?: string },
+): string {
+  let nodePath = process.execPath.replace(/\\/g, "/");
+  if (isInProcessPluginPlatform(opts?.platform)) {
+    const base = nodePath.split("/").pop()!.replace(/\.exe$/i, "");
+    if (!JS_RUNTIMES.has(base)) {
+      nodePath = opts?.jsRuntime?.replace(/\\/g, "/") ?? "node";
+    }
+  }
   const safePath = scriptPath.replace(/\\/g, "/");
   return `"${nodePath}" "${safePath}"`;
+}
+
+/**
+ * Build a cross-platform hook spawn command using the resolved JS runtime
+ * (issue #738). Identical wire-format to {@link buildNodeCommand} — two
+ * double-quoted, forward-slashed tokens separated by whitespace — so it
+ * round-trips through {@link parseNodeCommand} unchanged.
+ *
+ * The only difference is the runtime path: when a Bun ≥1.0 install is
+ * detected at process start, that path is used in place of `process.execPath`.
+ * Hooks run end-to-end in pure JS (no native modules) so swapping the
+ * runtime is a no-op for output but cuts ~40-60ms of Node cold-start per
+ * tool call.
+ *
+ * Why a SEPARATE helper instead of repurposing {@link buildNodeCommand}:
+ *   `buildNodeCommand` is also called by openclaw plugin (doctor / upgrade
+ *   command suggestions in `src/adapters/openclaw/plugin.ts`). Those CLI
+ *   targets MUST stay on Node because they load better-sqlite3, which has
+ *   no Bun-compatible prebuild yet (#543). Keeping the two helpers separate
+ *   makes the audit trivial: anything emitting a hook spawn command uses
+ *   `buildHookRuntimeCommand`; anything emitting a user-visible CLI command
+ *   stays on `buildNodeCommand`.
+ *
+ * `opts.platform` is forwarded to {@link isInProcessPluginPlatform} so the
+ * existing opencode/kilo in-process JS-runtime substitution still works
+ * (those platforms inject their own runtime via `opts.jsRuntime`).
+ */
+export function buildHookRuntimeCommand(
+  scriptPath: string,
+  opts?: { platform?: string; jsRuntime?: string },
+): string {
+  // In-process plugin platforms (opencode/kilo) inject their own runtime —
+  // delegate to buildNodeCommand which already handles that special case.
+  if (isInProcessPluginPlatform(opts?.platform)) {
+    return buildNodeCommand(scriptPath, opts);
+  }
+  const runtime = resolveHookRuntime();
+  const runtimePath = runtime.path.replace(/\\/g, "/");
+  const safePath = scriptPath.replace(/\\/g, "/");
+  return `"${runtimePath}" "${safePath}"`;
 }
 
 /**
@@ -408,6 +460,16 @@ export function parseNodeCommand(
   return { nodePath: m[1], scriptPath: m[2] };
 }
 
+/** Known JS runtime binary names (base filename without extension). */
+export const JS_RUNTIMES: ReadonlySet<string> = new Set(["node", "bun", "deno"]);
+
+/** Platforms where context-mode runs as an in-process TS plugin (not MCP stdio). */
+export const IN_PROCESS_PLUGIN_PLATFORMS: ReadonlySet<string> = new Set(["opencode", "kilo"]);
+
+export function isInProcessPluginPlatform(p: string | undefined): boolean {
+  return !!p && IN_PROCESS_PLUGIN_PLATFORMS.has(p);
+}
+
 /** Supported platform identifiers. */
 export type PlatformId =
   | "claude-code"
@@ -418,11 +480,14 @@ export type PlatformId =
   | "codex"
   | "vscode-copilot"
   | "jetbrains-copilot"
+  | "copilot-cli"
   | "cursor"
   | "antigravity"
+  | "antigravity-cli"
   | "kiro"
   | "pi"
   | "omp"
+  | "kimi"
   | "zed"
   | "qwen-code"
   | "unknown";

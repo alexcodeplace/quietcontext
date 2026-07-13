@@ -56,7 +56,7 @@ describe("ctx_upgrade MCP handler threads clientInfo (issue #542)", () => {
   test("handler emits --platform <id> in the returned shell command", () => {
     // --platform flag is cross-shell safe (POSIX bash, zsh, Windows Git
     // Bash, PowerShell, cmd.exe all forward CLI args identically). Env-var
-    // prefixes like CONTEXT_MODE_PLATFORM=pi cmd would break on cmd.exe.
+    // prefixes like QUIET_CONTEXT_PLATFORM=pi cmd would break on cmd.exe.
     expect(ctxUpgradeHandler).toMatch(/--platform/);
   });
 });
@@ -64,7 +64,7 @@ describe("ctx_upgrade MCP handler threads clientInfo (issue #542)", () => {
 describe("cli.ts upgrade() honors --platform flag (issue #542)", () => {
   test("argv parse extracts --platform <id> before invoking upgrade()", () => {
     // The entry-point switch (cli.ts:141) must forward the flag — either
-    // as a function argument or by setting CONTEXT_MODE_PLATFORM env var
+    // as a function argument or by setting QUIET_CONTEXT_PLATFORM env var
     // before detectPlatform() runs.
     expect(cliSrc).toMatch(/--platform/);
   });
@@ -72,20 +72,20 @@ describe("cli.ts upgrade() honors --platform flag (issue #542)", () => {
   test("upgrade() prefers explicit --platform over detectPlatform()", () => {
     // When --platform is supplied, detectPlatform()'s heuristic chain
     // must NOT override it. We assert the source threads the flag into
-    // either getAdapter() directly or CONTEXT_MODE_PLATFORM (which
+    // either getAdapter() directly or QUIET_CONTEXT_PLATFORM (which
     // detectPlatform() already honors as the explicit-override tier).
     const upgradeIdx = cliSrc.indexOf("async function upgrade");
     const upgradeBody = cliSrc.slice(upgradeIdx, upgradeIdx + 14000);
     expect(upgradeBody).toMatch(/--platform|platformOverride|opts\.platform/);
   });
 
-  test("upgrade() passes CONTEXT_MODE_PLATFORM into the nested doctor check", () => {
+  test("upgrade() passes QUIET_CONTEXT_PLATFORM into the nested doctor check", () => {
     // The final verification step must not rediscover Claude Code via ~/.claude
     // after upgrade() has already resolved OpenCode. Thread the chosen platform
     // into the spawned doctor process so the child stays on the same path.
     const upgradeIdx = cliSrc.indexOf("async function upgrade");
     const upgradeBody = cliSrc.slice(upgradeIdx);
     expect(upgradeBody).toContain('execFileSync("node", [cliPath, "doctor"], {');
-    expect(upgradeBody).toContain('CONTEXT_MODE_PLATFORM: detection.platform');
+    expect(upgradeBody).toContain('QUIET_CONTEXT_PLATFORM: detection.platform');
   });
 });
