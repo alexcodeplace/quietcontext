@@ -771,16 +771,28 @@ export function ensureSessionEventsSchema(
   },
 ): void {
   let db: { pragma: (q: string) => Array<{ name: string }>; exec: (sql: string) => void; close: () => void } | null = null;
+  let primaryFailure: unknown;
+  let closeFailure: unknown;
   try {
     db = new DatabaseCtor(dbPath);
     applyMissingSessionEventsColumns(db);
-  } catch {
-    // best-effort — missing table, file lock, corrupt DB, or DatabaseCtor
-    // load failure. The aggregator's existing skip-on-error handles the
-    // downstream readonly query.
+  } catch (error) {
+    primaryFailure = error;
   } finally {
-    try { db?.close(); } catch { /* ignore */ }
+    try {
+      db?.close();
+    } catch (error) {
+      closeFailure = error;
+    }
   }
+  if (!closeFailure) return;
+  if (primaryFailure) {
+    throw new AggregateError(
+      [primaryFailure, closeFailure],
+      primaryFailure instanceof Error ? primaryFailure.message : "Session-events migration and cleanup failed",
+    );
+  }
+  throw closeFailure;
 }
 
 // ─────────────────────────────────────────────────────────

@@ -23,6 +23,11 @@ jobs:
         with:
           node-version: "22.5"
 
+      - uses: oven-sh/setup-bun@v2
+        if: runner.os == 'Linux'
+        with:
+          bun-version: "1.3.14"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

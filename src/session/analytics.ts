@@ -27,6 +27,110 @@ function semverNewer(a: string, b: string): boolean {
   return false;
 }
 
+type AnalyticsDatabase = { close: () => void };
+
+interface UnresolvedAnalyticsDatabase {
+  db: AnalyticsDatabase;
+  scan: string;
+  onClosed?: () => void;
+  states: Map<string, unknown>;
+}
+
+const unresolvedAnalyticsDatabases = new Map<string, UnresolvedAnalyticsDatabase>();
+
+function closeAnalyticsDatabase(
+  db: AnalyticsDatabase,
+  dbPath: string,
+  scan: string,
+  onClosed?: () => void,
+): boolean {
+  try {
+    db.close();
+    unresolvedAnalyticsDatabases.delete(dbPath);
+    onClosed?.();
+    return true;
+  } catch (error) {
+    console.warn(`[analytics] failed to close ${scan} database ${dbPath}: ${error instanceof Error ? error.message : String(error)}`);
+    unresolvedAnalyticsDatabases.set(dbPath, { db, scan, onClosed, states: unresolvedAnalyticsDatabases.get(dbPath)?.states ?? new Map() });
+    return false;
+  }
+}
+
+function getUnresolvedAnalyticsState<T>(dbPath: string, key: string): T | undefined {
+  return unresolvedAnalyticsDatabases.get(dbPath)?.states.get(key) as T | undefined;
+}
+
+function setUnresolvedAnalyticsState(dbPath: string | undefined, key: string, value: unknown): void {
+  if (dbPath) unresolvedAnalyticsDatabases.get(dbPath)?.states.set(key, value);
+}
+
+function closeUnresolvedAnalyticsDatabase(dbPath: string): boolean {
+  const unresolved = unresolvedAnalyticsDatabases.get(dbPath);
+  return !unresolved || closeAnalyticsDatabase(
+    unresolved.db,
+    dbPath,
+    unresolved.scan,
+    unresolved.onClosed,
+  );
+}
+
+interface LifecycleResult<T> {
+  value: T;
+  closed: boolean;
+}
+
+const contentReadCache = new Map<string, number>();
+
+function clearContentReadCache(contentDbPath: string): void {
+  for (const key of contentReadCache.keys()) {
+    if (key.startsWith(`${contentDbPath}\u0000`)) contentReadCache.delete(key);
+  }
+}
+
+function readContentBytes(
+  cacheKey: string,
+  contentDbPath: string,
+  opts: { loadDatabase?: () => unknown } | undefined,
+  sql: string,
+  params: unknown[] = [],
+): LifecycleResult<number> {
+  if (!closeUnresolvedAnalyticsDatabase(contentDbPath)) {
+    return { value: contentReadCache.get(cacheKey) ?? 0, closed: false };
+  }
+  if (!existsSync(contentDbPath)) return { value: 0, closed: true };
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts?.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch {
+    return { value: 0, closed: true };
+  }
+  if (!DatabaseCtor) return { value: 0, closed: true };
+
+  let db: any = null;
+  let value = 0;
+  try {
+    db = new DatabaseCtor(contentDbPath, { readonly: true });
+    const row = db.prepare(sql).get(...params) as { bytes: number } | undefined;
+    value = Number(row?.bytes ?? 0);
+  } catch {
+    if (!db) return { value, closed: true };
+  }
+
+  const closed = closeAnalyticsDatabase(
+    db!,
+    contentDbPath,
+    "content",
+    () => clearContentReadCache(contentDbPath),
+  );
+  if (!closed) {
+    contentReadCache.set(cacheKey, value);
+  }
+  return { value, closed };
+}
+
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -729,6 +833,7 @@ export function getLifetimeStats(opts?: {
   let firstEventMs = Number.POSITIVE_INFINITY;
   const distinctProjectsSet = new Set<string>();
   const categoryCounts: Record<string, number> = {};
+  let unresolvedDbPath: string | undefined;
 
   // ── SessionDB aggregation ──
   if (existsSync(sessionsDir)) {
@@ -749,13 +854,19 @@ export function getLifetimeStats(opts?: {
       if (DatabaseCtor) {
         for (const file of dbFiles) {
           const dbPath = join(sessionsDir, file);
+          if (!closeUnresolvedAnalyticsDatabase(dbPath)) {
+            const preserved = getUnresolvedAnalyticsState<LifetimeStats>(dbPath, "lifetime");
+            if (preserved) return preserved;
+            break;
+          }
+          let sdb: any;
+          let closed = true;
           try {
-            const sdb = new DatabaseCtor(dbPath, { readonly: true });
-            try {
-              const ev = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_events").get() as { cnt: number } | undefined;
-              const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
-              totalEvents += ev?.cnt ?? 0;
-              totalSessions += ss?.cnt ?? 0;
+            sdb = new DatabaseCtor(dbPath, { readonly: true });
+            const ev = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_events").get() as { cnt: number } | undefined;
+            const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
+            totalEvents += ev?.cnt ?? 0;
+            totalSessions += ss?.cnt ?? 0;
               // Per-category aggregation across every sidecar so the
               // Persistent memory bars stay populated even when the
               // current project's local DB is fresh / empty.
@@ -797,11 +908,16 @@ export function getLifetimeStats(opts?: {
                 ).all() as Array<{ p: string }>;
                 for (const row of projRows) if (row.p) distinctProjectsSet.add(row.p);
               } catch { /* old schema */ }
-            } finally {
-              sdb.close();
-            }
           } catch {
             // missing tables / corrupt file — skip
+          } finally {
+            if (sdb) {
+              closed = closeAnalyticsDatabase(sdb, dbPath, "lifetime");
+            }
+          }
+          if (!closed) {
+            unresolvedDbPath = dbPath;
+            break;
           }
         }
       }
@@ -840,7 +956,7 @@ export function getLifetimeStats(opts?: {
     }
   }
 
-  return {
+  const result = {
     totalEvents,
     totalSessions,
     autoMemoryCount,
@@ -851,6 +967,8 @@ export function getLifetimeStats(opts?: {
     firstEventMs: Number.isFinite(firstEventMs) ? firstEventMs : 0,
     distinctProjects: distinctProjectsSet.size,
   };
+  setUnresolvedAnalyticsState(unresolvedDbPath, "lifetime", result);
+  return result;
 }
 
 /**
@@ -913,6 +1031,8 @@ export function getConversationStats(opts: {
   let firstMs = Number.POSITIVE_INFINITY;
   let lastMs = 0;
   let lastRescueMs = 0;
+  let unresolvedDbPath: string | undefined;
+  const stateKey = `conversation\u0000${sessionId}\u0000${opts.worktreeHash ?? ""}`;
   // Per-day captures aggregated across every DB. Key is the UTC midnight ms
   // of the day; value tracks both the event count and any rescueBytes (latter
   // overlays the ◆ /compact glyph in the section-1 horizontal timeline).
@@ -921,7 +1041,11 @@ export function getConversationStats(opts: {
 
   for (const file of dbFiles) {
     const dbPath = join(sessionsDir, file);
+    if (!closeUnresolvedAnalyticsDatabase(dbPath)) {
+      return getUnresolvedAnalyticsState<ConversationStats>(dbPath, stateKey) ?? empty;
+    }
     let touched = false;
+    let closed = true;
     try {
       const sdb = new DatabaseCtor(dbPath, { readonly: true });
       try {
@@ -980,10 +1104,14 @@ export function getConversationStats(opts: {
           }
         } catch { /* old schema */ }
       } finally {
-        sdb.close();
+        closed = closeAnalyticsDatabase(sdb, dbPath, "conversation");
       }
     } catch { /* missing tables / corrupt */ }
     if (touched) dbCount++;
+    if (!closed) {
+      unresolvedDbPath = dbPath;
+      break;
+    }
   }
 
   const daysAlive = firstMs < lastMs ? (lastMs - firstMs) / 86_400_000 : 0;
@@ -1003,7 +1131,7 @@ export function getConversationStats(opts: {
       ...(v.rescueBytes > 0 ? { rescueBytes: v.rescueBytes } : {}),
     }));
 
-  return {
+  const result = {
     sessionId,
     events,
     dbCount,
@@ -1016,6 +1144,8 @@ export function getConversationStats(opts: {
     lastRescueMs: lastRescueMs > 0 ? lastRescueMs : undefined,
     byDay,
   };
+  setUnresolvedAnalyticsState(unresolvedDbPath, stateKey, result);
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1079,30 +1209,26 @@ export function getContentBytesForSession(
   opts?: { loadDatabase?: () => unknown },
 ): number {
   if (!sessionId || !contentDbPath) return 0;
-  if (!existsSync(contentDbPath)) return 0;
 
-  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
-  try {
-    DatabaseCtor = opts?.loadDatabase
-      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
-      : loadDatabaseImpl();
-  } catch { return 0; }
-  if (!DatabaseCtor) return 0;
+  return getContentBytesForSessionResult(sessionId, contentDbPath, opts).value;
+}
 
-  try {
-    const db = new DatabaseCtor(contentDbPath, { readonly: true });
-    try {
-      const row = db.prepare(
-        `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
-         FROM chunks WHERE session_id = ?`,
-      ).get(sessionId) as { bytes: number } | undefined;
-      return Number(row?.bytes ?? 0);
-    } finally {
-      db.close();
-    }
-  } catch {
-    return 0;
+function getContentBytesForSessionResult(
+  sessionId: string,
+  contentDbPath: string,
+  opts?: { loadDatabase?: () => unknown },
+): LifecycleResult<number> {
+  if (!sessionId || !contentDbPath) {
+    return { value: 0, closed: true };
   }
+  return readContentBytes(
+    `${contentDbPath}\u0000${sessionId}`,
+    contentDbPath,
+    opts,
+    `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
+     FROM chunks WHERE session_id = ?`,
+    [sessionId],
+  );
 }
 
 /**
@@ -1125,30 +1251,22 @@ export function getContentBytesAllSessions(
   opts?: { loadDatabase?: () => unknown },
 ): number {
   if (!contentDbPath) return 0;
-  if (!existsSync(contentDbPath)) return 0;
 
-  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
-  try {
-    DatabaseCtor = opts?.loadDatabase
-      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
-      : loadDatabaseImpl();
-  } catch { return 0; }
-  if (!DatabaseCtor) return 0;
+  return getContentBytesAllSessionsResult(contentDbPath, opts).value;
+}
 
-  try {
-    const db = new DatabaseCtor(contentDbPath, { readonly: true });
-    try {
-      const row = db.prepare(
-        `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
-         FROM chunks`,
-      ).get() as { bytes: number } | undefined;
-      return Number(row?.bytes ?? 0);
-    } finally {
-      db.close();
-    }
-  } catch {
-    return 0;
-  }
+function getContentBytesAllSessionsResult(
+  contentDbPath: string,
+  opts?: { loadDatabase?: () => unknown },
+): LifecycleResult<number> {
+  if (!contentDbPath) return { value: 0, closed: true };
+  return readContentBytes(
+    `${contentDbPath}\u0000all`,
+    contentDbPath,
+    opts,
+    `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
+     FROM chunks`,
+  );
 }
 
 /**
@@ -1165,7 +1283,7 @@ export function getContentBytesAllSessions(
  * contract as `getConversationStats` / `getLifetimeStats` so the
  * stats-render path can never crash on a bad sidecar.
  */
-export function getRealBytesStats(opts: {
+function getRealBytesStatsResult(opts: {
   sessionId?: string;
   sessionsDir?: string;
   worktreeHash?: string;
@@ -1196,7 +1314,7 @@ export function getRealBytesStats(opts: {
    */
   contentDbPath?: string;
   loadDatabase?: () => unknown;
-}): RealBytesStats {
+}): LifecycleResult<RealBytesStats> {
   const empty: RealBytesStats = {
     eventDataBytes: 0,
     bytesAvoided: 0,
@@ -1208,7 +1326,7 @@ export function getRealBytesStats(opts: {
 
   const sessionsDir = opts.sessionsDir
     ?? join(homedir(), ".claude", "context-mode", "sessions");
-  if (!existsSync(sessionsDir)) return empty;
+  if (!existsSync(sessionsDir)) return { value: empty, closed: true };
 
   let dbFiles: string[] = [];
   try {
@@ -1217,26 +1335,33 @@ export function getRealBytesStats(opts: {
       if (opts.worktreeHash && !f.startsWith(opts.worktreeHash)) return false;
       return true;
     });
-  } catch { return empty; }
-  if (dbFiles.length === 0) return empty;
+  } catch { return { value: empty, closed: true }; }
+  if (dbFiles.length === 0) return { value: empty, closed: true };
 
   let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
   try {
     DatabaseCtor = opts.loadDatabase
       ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
       : loadDatabaseImpl();
-  } catch { return empty; }
-  if (!DatabaseCtor) return empty;
+  } catch { return { value: empty, closed: true }; }
+  if (!DatabaseCtor) return { value: empty, closed: true };
 
   let eventDataBytes = 0;
   let bytesAvoided = 0;
   let bytesReturned = 0;
   let snapshotBytes = 0;
+  let closed = true;
+  let unresolvedDbPath: string | undefined;
+  const stateKey = `real-byte\u0000${opts.sessionId ?? ""}\u0000${opts.projectDir ?? ""}\u0000${opts.worktreeHash ?? ""}`;
 
   // Each branch returns the tuple in the SAME column order so callers
   // don't need to type-narrow per row.
   for (const file of dbFiles) {
     const dbPath = join(sessionsDir, file);
+    let databaseClosed = true;
+    if (!closeUnresolvedAnalyticsDatabase(dbPath)) {
+      return { value: getUnresolvedAnalyticsState<RealBytesStats>(dbPath, stateKey) ?? empty, closed: false };
+    }
     // v1.0.148 hotfix: historical DBs were created with pre-v1.0.130
     // schema (no bytes_avoided / bytes_returned / project_dir columns).
     // The SELECT below references those columns, so without an in-place
@@ -1245,11 +1370,17 @@ export function getRealBytesStats(opts: {
     // shared migration helper before opening readonly. Idempotent: a
     // PRAGMA check inside the helper short-circuits when the DB is
     // already current, so post-first-read calls are cheap.
-    ensureSessionEventsSchema(dbPath, DatabaseCtor as unknown as new (path: string, opts?: { readonly?: boolean }) => {
-      pragma: (q: string) => Array<{ name: string }>;
-      exec: (sql: string) => void;
-      close: () => void;
-    });
+    try {
+      ensureSessionEventsSchema(dbPath, DatabaseCtor as unknown as new (path: string, opts?: { readonly?: boolean }) => {
+        pragma: (q: string) => Array<{ name: string }>;
+        exec: (sql: string) => void;
+        close: () => void;
+      });
+    } catch (error) {
+      console.warn(`[analytics] failed to migrate session database ${dbPath}: ${error instanceof Error ? error.message : String(error)}`);
+      closed = false;
+      break;
+    }
     try {
       const sdb = new DatabaseCtor(dbPath, { readonly: true });
       try {
@@ -1360,9 +1491,14 @@ export function getRealBytesStats(opts: {
           } catch { /* old schema: no tool_calls table */ }
         }
       } finally {
-        sdb.close();
+        databaseClosed = closeAnalyticsDatabase(sdb, dbPath, "real-byte");
       }
     } catch { /* missing tables / corrupt — skip */ }
+    if (!databaseClosed) {
+      closed = false;
+      unresolvedDbPath = dbPath;
+      break;
+    }
   }
 
   // v1.0.133 Slice 3: fold content DB chunk bytes for this session into
@@ -1372,20 +1508,38 @@ export function getRealBytesStats(opts: {
   // re-inflated into context on every search if the model had to
   // re-read raw files.
   let contentBytes = 0;
-  if (opts.sessionId && opts.contentDbPath) {
-    contentBytes = getContentBytesForSession(
+  if (closed && opts.sessionId && opts.contentDbPath) {
+    const content = getContentBytesForSessionResult(
       opts.sessionId,
       opts.contentDbPath,
       { loadDatabase: opts.loadDatabase },
     );
+    contentBytes = content.value;
     bytesAvoided += contentBytes;
+    closed = content.closed;
   }
 
   const totalSavedTokens = Math.floor(
     (eventDataBytes + bytesAvoided + snapshotBytes) / 4,
   );
 
-  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens };
+  const result = {
+    value: { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens },
+    closed,
+  };
+  setUnresolvedAnalyticsState(unresolvedDbPath, stateKey, result.value);
+  return result;
+}
+
+export function getRealBytesStats(opts: {
+  sessionId?: string;
+  sessionsDir?: string;
+  worktreeHash?: string;
+  projectDir?: string;
+  contentDbPath?: string;
+  loadDatabase?: () => unknown;
+}): RealBytesStats {
+  return getRealBytesStatsResult(opts).value;
 }
 
 /**
@@ -1415,36 +1569,40 @@ export function getConversationWindowStats(opts: {
   worktreeHash: string;
   sessionsDir?: string;
   contentDbPath?: string;
+  loadDatabase?: () => unknown;
 }): RealBytesStats {
   // Whole current worktree: every session that shares this cwd-hash DB.
-  const pool = getRealBytesStats({
+  const pool = getRealBytesStatsResult({
     worktreeHash: opts.worktreeHash,
     sessionsDir: opts.sessionsDir,
+    loadDatabase: opts.loadDatabase,
   });
+  if (!pool.closed) return pool.value;
   // Just the live window: this session_id (folds its own ctx_search/ctx_fetch
   // retrieval + content chunks).
-  const mine = getRealBytesStats({
+  const mine = getRealBytesStatsResult({
     sessionId: opts.sessionId,
     worktreeHash: opts.worktreeHash,
     sessionsDir: opts.sessionsDir,
     contentDbPath: opts.contentDbPath,
+    loadDatabase: opts.loadDatabase,
   });
 
-  const windowReturned = mine.bytesReturned;
-  const movedTotal = pool.bytesAvoided + pool.bytesReturned;
+  const windowReturned = mine.value.bytesReturned;
+  const movedTotal = pool.value.bytesAvoided + pool.value.bytesReturned;
   // What context-mode kept OUT of the live window = everything moved across the
   // worktree minus the slice that actually entered this window. Clamp at 0 so a
   // stale/edge DB can never produce a negative bar.
   const keptOut = Math.max(0, movedTotal - windowReturned);
 
   return {
-    eventDataBytes: pool.eventDataBytes,
+    eventDataBytes: pool.value.eventDataBytes,
     bytesAvoided: keptOut,
     bytesReturned: windowReturned,
-    snapshotBytes: pool.snapshotBytes,
-    contentBytes: mine.contentBytes,
+    snapshotBytes: pool.value.snapshotBytes,
+    contentBytes: mine.value.contentBytes,
     totalSavedTokens: Math.floor(
-      (pool.eventDataBytes + keptOut + pool.snapshotBytes) / 4,
+      (pool.value.eventDataBytes + keptOut + pool.value.snapshotBytes) / 4,
     ),
   };
 }
@@ -1520,7 +1678,7 @@ function scanOneAdapter(
   entry: AdapterDirEntry,
   loadDb: () => unknown,
   filter: Required<Omit<RealUsageFilter, "nowMs">> & { nowMs: number },
-): AdapterScanResult {
+): LifecycleResult<AdapterScanResult> {
   const result: AdapterScanResult = {
     name: entry.name,
     eventCount: 0,
@@ -1534,29 +1692,37 @@ function scanOneAdapter(
     lastMs: 0,
     isReal: false,
   };
-  if (!existsSync(entry.sessionsDir)) return result;
+  if (!existsSync(entry.sessionsDir)) return { value: result, closed: true };
 
   let dbFiles: string[] = [];
   try {
     dbFiles = readdirSync(entry.sessionsDir).filter((f) => f.endsWith(".db"));
-  } catch { return result; }
-  if (dbFiles.length === 0) return result;
+  } catch { return { value: result, closed: true }; }
+  if (dbFiles.length === 0) return { value: result, closed: true };
 
   let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
   try {
     DatabaseCtor = loadDb() as ReturnType<typeof loadDatabaseImpl>;
-  } catch { return result; }
-  if (!DatabaseCtor) return result;
+  } catch { return { value: result, closed: true }; }
+  if (!DatabaseCtor) return { value: result, closed: true };
 
   const projectsSet = new Set<string>();
   const sessionsSet = new Set<string>();
+  let closed = true;
+  let unresolvedDbPath: string | undefined;
 
   for (const file of dbFiles) {
     const dbPath = join(entry.sessionsDir, file);
+    if (!closeUnresolvedAnalyticsDatabase(dbPath)) {
+      return {
+        value: getUnresolvedAnalyticsState<AdapterScanResult>(dbPath, "adapter") ?? result,
+        closed: false,
+      };
+    }
+    let sdb: any;
     try {
-      const sdb = new DatabaseCtor(dbPath, { readonly: true });
-      try {
-        const ev = sdb.prepare(
+      sdb = new DatabaseCtor(dbPath, { readonly: true });
+      const ev = sdb.prepare(
           "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM session_events",
         ).get() as { cnt: number; bytes: number } | undefined;
         if (ev) {
@@ -1600,10 +1766,16 @@ function scanOneAdapter(
           ).all() as Array<{ s: string }>;
           for (const row of sidRows) if (row.s) sessionsSet.add(row.s);
         } catch { /* old schema */ }
-      } finally {
-        sdb.close();
-      }
     } catch { /* missing tables / corrupt — skip */ }
+    finally {
+      if (sdb) {
+        closed = closeAnalyticsDatabase(sdb, dbPath, "adapter");
+      }
+    }
+    if (!closed) {
+      unresolvedDbPath = dbPath;
+      break;
+    }
   }
 
   result.projectDirs = Array.from(projectsSet);
@@ -1619,7 +1791,8 @@ function scanOneAdapter(
     recentEnough &&
     avgBytes           >= filter.minAvgBytes;
 
-  return result;
+  setUnresolvedAnalyticsState(unresolvedDbPath, "adapter", result);
+  return { value: result, closed };
 }
 
 /** Aggregated multi-adapter lifetime stats. */
@@ -1660,11 +1833,13 @@ export function getMultiAdapterLifetimeStats(opts?: {
 
   for (const entry of dirs) {
     if (!existsSync(entry.sessionsDir)) continue; // only surface adapters with a sessions dir
-    const r = scanOneAdapter(entry, loadDb, filter);
+    const scan = scanOneAdapter(entry, loadDb, filter);
+    const r = scan.value;
     perAdapter.push(r);
     totalEvents   += r.eventCount;
     totalSessions += r.sessionCount;
     totalBytes    += r.dataBytes + r.rescueBytes;
+    if (!scan.closed) break;
   }
 
   return { totalEvents, totalSessions, totalBytes, perAdapter };
@@ -1702,12 +1877,14 @@ export function getMultiAdapterRealBytesStats(opts?: {
 
   for (const entry of dirs) {
     if (!existsSync(entry.sessionsDir)) continue;
-    const one = getRealBytesStats({
+    const scan = getRealBytesStatsResult({
       sessionsDir: entry.sessionsDir,
       sessionId: opts?.sessionId,
       worktreeHash: opts?.worktreeHash,
       loadDatabase: opts?.loadDatabase,
     });
+    const one = scan.value;
+    let closed = scan.closed;
     // ARCH-REVIEW-V134-ABC SLICE C: aggregate this adapter's content DB
     // bytes into the lifetime sum. `getRealBytesStats` operates on
     // session events only and never touches the sibling content/ tree —
@@ -1715,19 +1892,21 @@ export function getMultiAdapterRealBytesStats(opts?: {
     // every adapter except whichever one happens to share the
     // sessionsDir of the caller. Lifetime tier ignores sessionId so
     // the all-sessions aggregator is the right helper here.
-    if (!opts?.sessionId) {
+    if (closed && !opts?.sessionId) {
       const contentDbPath = join(entry.contentDir, "content.db");
-      const adapterContentBytes = getContentBytesAllSessions(contentDbPath, {
+      const content = getContentBytesAllSessionsResult(contentDbPath, {
         loadDatabase: opts?.loadDatabase as (() => unknown) | undefined,
       });
-      one.contentBytes += adapterContentBytes;
-      sum.contentBytes += adapterContentBytes;
+      one.contentBytes += content.value;
+      sum.contentBytes += content.value;
+      closed = content.closed;
     }
     perAdapter.push({ name: entry.name, ...one });
     sum.eventDataBytes += one.eventDataBytes;
     sum.bytesAvoided   += one.bytesAvoided;
     sum.bytesReturned  += one.bytesReturned;
     sum.snapshotBytes  += one.snapshotBytes;
+    if (!closed) break;
   }
   sum.totalSavedTokens = Math.floor(
     (sum.eventDataBytes + sum.bytesAvoided + sum.snapshotBytes) / 4,

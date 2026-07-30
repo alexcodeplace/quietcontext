@@ -20,12 +20,12 @@
  * project filter).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, test } from "vitest";
-import { SessionDB } from "../../src/session/db.js";
+import { ensureSessionEventsSchema, SessionDB } from "../../src/session/db.js";
 import {
   formatReport,
   getContentBytesForSession,
@@ -403,6 +403,69 @@ describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
 // migration must be observable as columns added in place.
 // ──────────────────────────────────────────────────────────────────────
 describe("aggregator schema-migration recovery (#683 follow-up, v1.0.148)", () => {
+  test("throws migration and close failures as an operation-first aggregate", () => {
+    const primary = new Error("migration failed");
+    const cleanup = new Error("migration close failed");
+
+    try {
+      ensureSessionEventsSchema("ignored.db", class {
+        pragma() { throw primary; }
+        exec() { return undefined; }
+        close() { throw cleanup; }
+      });
+      expect.unreachable("ensureSessionEventsSchema must throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).errors).toEqual([primary, cleanup]);
+    }
+  });
+
+  test("preserves a single close failure", () => {
+    const cleanup = new Error("migration close failed");
+
+    expect(() => ensureSessionEventsSchema("ignored.db", class {
+      pragma() { return []; }
+      exec() { return undefined; }
+      close() { throw cleanup; }
+    })).toThrow(cleanup);
+  });
+
+  test("reports migration close failure and never opens readonly after it", () => {
+    const dir = mkSessionsDir();
+    const dbPath = dbPathFor(dir, "migration-close");
+    writeFileSync(dbPath, "");
+    const primary = new Error("migration failed");
+    const cleanup = new Error("migration close failed");
+    let readonlyOpens = 0;
+    const warning = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => warnings.push(args);
+
+    class Driver {
+      constructor(_path: string, opts?: { readonly?: boolean }) {
+        if (opts?.readonly) {
+          readonlyOpens++;
+          return { prepare: () => ({ get: () => ({ data_bytes: 1, bytes_avoided: 0, bytes_returned: 0 }) }), close: () => undefined };
+        }
+        return {
+          pragma: () => { throw primary; },
+          exec: () => undefined,
+          close: () => { throw cleanup; },
+        };
+      }
+    }
+
+    try {
+      expect(getRealBytesStats({ sessionsDir: dir, loadDatabase: () => Driver })).toMatchObject({ eventDataBytes: 0 });
+    } finally {
+      console.warn = warning;
+    }
+
+    expect(readonlyOpens).toBe(0);
+    expect(warnings).toEqual([[expect.stringContaining(dbPath)]]);
+    expect(String(warnings[0][0])).toContain(primary.message);
+  });
+
   /**
    * Build a pre-v1.0.130 session DB on disk — no `bytes_avoided`,
    * `bytes_returned`, `project_dir`, or attribution columns. Mirrors
@@ -736,7 +799,7 @@ describe("v1.0.148 Bug G — strict-compression formula (Section 1 Without/With)
     // Locate the "kept out of context" ratio line.
     const ratioLine = lines.find((l) => /kept out of context/.test(l));
     expect(ratioLine, `ratio line missing:\n${text}`).toBeDefined();
-    const m = ratioLine!.match(/(\d+)%\s+kept out of context/);
+    const m = ratioLine!.match(/(\d+(?:\.\d+)?)%\s+kept out of context/);
     expect(m, `cannot parse ratio: ${ratioLine}`).not.toBeNull();
     const pct = Number(m![1]);
 

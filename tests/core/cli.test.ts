@@ -12,7 +12,7 @@ import { readFileSync, existsSync, accessSync, constants, mkdirSync, writeFileSy
 import { resolve, join, dirname } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { toUnixPath } from "../../src/cli.js";
 import { findMissingLaunchFiles } from "../../src/util/plugin-cache-integrity.js";
 
@@ -713,6 +713,203 @@ describe("bun:sqlite adapter (#45)", () => {
     expect(typeof db.transaction).toBe("function");
     expect(typeof db.close).toBe("function");
     db.close();
+  });
+
+  test("finalizes owned and transient statements before forced close", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    const finalized: string[] = [];
+    const closeArgs: unknown[][] = [];
+    const raw = {
+      prepare(sql: string) {
+        return {
+          run: () => undefined,
+          get: () => null,
+          all: () => sql.startsWith("PRAGMA") ? [{ value: "ok" }] : [],
+          iterate: function* () {},
+          finalize: () => finalized.push(sql),
+        };
+      },
+      transaction: (fn: unknown) => fn,
+      close: (...args: unknown[]) => closeArgs.push(args),
+    };
+    const db = new BunSQLiteAdapter(raw);
+    const statement = db.prepare("SELECT 1");
+    db.pragma("cache_size");
+    db.exec("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1)");
+    statement.finalize();
+    statement.finalize();
+    db.close();
+
+    expect(finalized).toEqual([
+      "PRAGMA cache_size",
+      "CREATE TABLE t (id INTEGER)",
+      "INSERT INTO t VALUES (1)",
+      "SELECT 1",
+    ]);
+    expect(closeArgs).toEqual([[true]]);
+  });
+
+  test("continues statement cleanup and forced close after finalize failures", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    const finalized: string[] = [];
+    const closeArgs: unknown[][] = [];
+    const raw = {
+      prepare(sql: string) {
+        return {
+          run: () => undefined,
+          get: () => null,
+          all: () => [],
+          iterate: function* () {},
+          finalize: () => {
+            finalized.push(sql);
+            throw new Error(`${sql} finalize failed`);
+          },
+        };
+      },
+      transaction: (fn: unknown) => fn,
+      close: (...args: unknown[]) => {
+        closeArgs.push(args);
+        throw new Error("close failed");
+      },
+    };
+    const db = new BunSQLiteAdapter(raw);
+    db.prepare("SELECT 1");
+    db.prepare("SELECT 2");
+
+    expect(() => db.close()).toThrow(AggregateError);
+    expect(finalized).toEqual(["SELECT 1", "SELECT 2"]);
+    expect(closeArgs).toEqual([[true]]);
+  });
+
+  test("retains failed statement finalization for explicit and close retries", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    let finalizeAttempts = 0;
+    const closeArgs: unknown[][] = [];
+    const raw = {
+      prepare: () => ({
+        run: () => undefined,
+        get: () => null,
+        all: () => [],
+        iterate: function* () {},
+        finalize: () => {
+          finalizeAttempts++;
+          if (finalizeAttempts === 1) throw new Error("finalize failed");
+        },
+      }),
+      transaction: (fn: unknown) => fn,
+      close: (...args: unknown[]) => closeArgs.push(args),
+    };
+    const db = new BunSQLiteAdapter(raw);
+    const statement = db.prepare("SELECT 1");
+
+    expect(() => statement.finalize()).toThrow("finalize failed");
+    db.close();
+
+    expect(finalizeAttempts).toBe(2);
+    expect(closeArgs).toEqual([[true]]);
+  });
+
+  test("retries failed close cleanup before retrying forced raw close", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    let finalizeAttempts = 0;
+    let closeAttempts = 0;
+    const raw = {
+      prepare: () => ({
+        run: () => undefined,
+        get: () => null,
+        all: () => [],
+        iterate: function* () {},
+        finalize: () => {
+          finalizeAttempts++;
+          if (finalizeAttempts === 1) throw new Error("finalize failed");
+        },
+      }),
+      transaction: (fn: unknown) => fn,
+      close: (force: boolean) => {
+        closeAttempts++;
+        expect(force).toBe(true);
+        if (closeAttempts === 1) throw new Error("close failed");
+      },
+    };
+    const db = new BunSQLiteAdapter(raw);
+    db.prepare("SELECT 1");
+
+    expect(() => db.close()).toThrow(AggregateError);
+    db.close();
+
+    expect(finalizeAttempts).toBe(2);
+    expect(closeAttempts).toBe(2);
+  });
+
+  test("preserves SQL error before transient cleanup error", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    for (const [operation, sql] of [["pragma", "cache_size"], ["exec", "SELECT 1"]] as const) {
+      const operationError = new Error(`${operation} failed`);
+      const cleanupError = new Error(`${operation} cleanup failed`);
+      const raw = {
+        prepare: () => ({
+          run: () => { throw operationError; },
+          get: () => null,
+          all: () => { throw operationError; },
+          iterate: function* () {},
+          finalize: () => { throw cleanupError; },
+        }),
+        transaction: (fn: unknown) => fn,
+        close: () => undefined,
+      };
+      const db = new BunSQLiteAdapter(raw);
+
+      try {
+        operation === "pragma" ? db.pragma(sql) : db.exec(sql);
+        throw new Error("expected failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors).toEqual([operationError, cleanupError]);
+      }
+    }
+  });
+
+  test.skipIf(process.platform !== "linux" || !(globalThis as Record<string, unknown>).Bun)("keeps Bun SQLite file descriptors at a plateau across repeated lifetime scans", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    const { getLifetimeStats } = await import("../../src/session/analytics.js");
+    const { Database } = await import("bun:" + "sqlite") as { Database: new (path: string, options?: unknown) => any };
+    const sessionsDir = mkdtempSync(join(tmpdir(), "bun-lifetime-fds-"));
+    const countFds = () => readdirSync("/proc/self/fd").length;
+
+    try {
+      for (let i = 0; i < 12; i++) {
+        const path = join(sessionsDir, `${i}.db`);
+        const raw = new Database(path);
+        raw.exec("CREATE TABLE session_events (category TEXT, created_at TEXT, project_dir TEXT)");
+        raw.exec("CREATE TABLE session_meta (id TEXT)");
+        raw.close(true);
+      }
+      const DatabaseCtor: any = function (path: string, options?: unknown) {
+        return new BunSQLiteAdapter(new Database(path, options));
+      };
+      for (let i = 0; i < 20; i++) {
+        getLifetimeStats({ sessionsDir, memoryRoot: sessionsDir, loadDatabase: () => DatabaseCtor });
+      }
+      const samples: number[] = [];
+      for (let batch = 0; batch < 5; batch++) {
+        for (let scan = 0; scan < 10; scan++) {
+          getLifetimeStats({ sessionsDir, memoryRoot: sessionsDir, loadDatabase: () => DatabaseCtor });
+        }
+        samples.push(countFds());
+      }
+      expect(samples.slice(1).some((sample) => sample > samples[0])).toBe(false);
+    } finally {
+      rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform !== "linux")("runs the Bun FD regression from the Node Vitest lane", () => {
+    const bun = process.env.BUN_BINARY ?? (existsSync("/usr/bin/bun") ? "/usr/bin/bun" : "bun");
+    execFileSync(
+      bun,
+      ["test", "tests/core/cli.test.ts", "--test-name-pattern", "keeps Bun SQLite file descriptors at a plateau"],
+      { cwd: ROOT, encoding: "utf8" },
+    );
   });
 });
 
