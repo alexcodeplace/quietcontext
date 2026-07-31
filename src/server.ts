@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -896,10 +896,7 @@ function getStorePath(): string {
 
 function getStore(): ContentStore {
   if (!_store) {
-    // Content DB cleanup on fresh start is handled by SessionStart hook.
-    // Server just opens whatever DB exists (or creates new if hook deleted it).
-    const dbPath = getStorePath();
-    _store = new ContentStore(dbPath);
+    _store = new ContentStore();
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
@@ -921,18 +918,9 @@ function getStore(): ContentStore {
       }
     });
 
-    // One-time startup cleanup: remove stale content DBs (>14 days)
     try {
-      const contentDir = dirname(getStorePath());
-      cleanupStaleContentDBs(contentDir, 14);
       _store.cleanupStaleSources(14);
-      // Also clean legacy shared dir from before platform isolation
-      const legacyDir = join(homedir(), ".context-mode", "content");
-      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
     } catch { /* best-effort */ }
-
-    // Also clean old PID-based DBs from migration
-    cleanupStaleDBs();
   }
   return _store;
 }
@@ -4859,12 +4847,6 @@ server.registerTool(
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  // Clean up stale DB files from previous sessions
-  const cleaned = cleanupStaleDBs();
-  if (cleaned > 0) {
-    console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
-  }
-
   // MCP readiness sentinel path (#230, #347)
   // Uses process.pid (not ppid) — hooks use directory-scan to find any live sentinel.
   // Hardcoded /tmp on Unix to avoid TMPDIR mismatch (#347).
@@ -4876,7 +4858,7 @@ async function main() {
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.close(); // persist DB for --continue sessions
+    if (_store) _store.cleanup();
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
