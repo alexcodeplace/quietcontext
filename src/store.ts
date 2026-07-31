@@ -12,7 +12,7 @@ import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
 import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
@@ -348,6 +348,10 @@ function findMinSpan(positionLists: number[][]): number {
   return minSpan;
 }
 
+export function createProcessStorePath(): string {
+  return join(tmpdir(), `context-mode-${process.pid}-${randomBytes(8).toString("hex")}.db`);
+}
+
 export class ContentStore {
   #db: DatabaseInstance;
   #dbPath: string;
@@ -419,8 +423,7 @@ export class ContentStore {
 
   constructor(dbPath?: string) {
     const Database = loadDatabase();
-    this.#dbPath =
-      dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
+    this.#dbPath = dbPath ?? createProcessStorePath();
     cleanOrphanedWALFiles(this.#dbPath);
     let db: DatabaseInstance;
     try {
