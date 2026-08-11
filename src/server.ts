@@ -2528,8 +2528,7 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
       if (content) trackIndexed(Buffer.byteLength(content));
       else if (resolvedPath) {
         try {
-          const fs = await import("fs");
-          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
+          trackIndexed(statSync(resolvedPath).size);
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();

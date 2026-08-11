@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readFileSync, readSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -151,6 +151,9 @@ function maxEditDistance(wordLength: number): number {
 // length normalization and produce unwieldy search results. Split at paragraph
 // boundaries when a chunk exceeds this cap.
 const MAX_CHUNK_BYTES = 4096;
+const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+const MAX_CHUNK_TITLE_BYTES = 256;
+const MAX_CHUNKS_PER_SOURCE = 4096;
 
 // Blank-line sectioning is used only for output that is *naturally* sectioned:
 // at least a few sections, not an unbounded explosion, and no single section so
@@ -163,11 +166,6 @@ const BLANK_SECTION_STRATEGY_MAX_BYTES = 5000;
 
 // Number of leading characters of a chunk's first line used as its title.
 const CHUNK_TITLE_MAX_CHARS = 80;
-
-// When byte-splitting an oversized single line, prefer to break at a whitespace
-// boundary for readability — but only if that boundary is past this fraction of
-// the slice, otherwise we'd waste too much of the byte budget.
-const WHITESPACE_BREAK_RATIO = 0.5;
 
 // ─────────────────────────────────────────────────────────
 // ContentStore
@@ -407,12 +405,6 @@ export class ContentStore {
   #stmtCleanupChunksTrigram!: PreparedStatement;
   #stmtCleanupSources!: PreparedStatement;
 
-  // FTS5 optimization: track inserts and optimize periodically to defragment
-  // the index. FTS5 b-trees fragment over many insert/delete cycles, degrading
-  // search performance. SQLite's built-in 'optimize' merges b-tree segments.
-  #insertCount = 0;
-  static readonly OPTIMIZE_EVERY = 50;
-
   // Fuzzy correction cache (process-local LRU). fuzzyCorrect() hits the vocab
   // DB and runs levenshtein against every candidate within length tolerance,
   // which is CPU-linear in |candidates|. Repeated queries ("erro", "erro" …)
@@ -420,6 +412,7 @@ export class ContentStore {
   // entries only become stale when new words enter — we clear on actual insert.
   #fuzzyCache = new Map<string, string | null>();
   static readonly FUZZY_CACHE_SIZE = 256;
+  static readonly OPTIMIZE_EVERY = 50;
 
   constructor(dbPath?: string) {
     const Database = loadDatabase();
@@ -838,6 +831,30 @@ export class ContentStore {
 
   // ── Index ──
 
+  #assertSourceSize(content: string): void {
+    const bytes = Buffer.byteLength(content);
+    if (bytes > MAX_SOURCE_BYTES) {
+      throw new RangeError(
+        `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${bytes} bytes)`,
+      );
+    }
+  }
+
+  #assertChunkSizeLimit(maxChunkBytes: number): void {
+    if (!Number.isInteger(maxChunkBytes) || maxChunkBytes < 1) {
+      throw new RangeError("maxChunkBytes must be a positive integer");
+    }
+  }
+
+  #appendBoundedChunk<T>(chunks: T[], chunk: T): void {
+    if (chunks.length >= MAX_CHUNKS_PER_SOURCE) {
+      throw new RangeError(
+        `Source exceeds ${MAX_CHUNKS_PER_SOURCE}-chunk indexing limit`,
+      );
+    }
+    chunks.push(chunk);
+  }
+
   index(options: {
     content?: string;
     path?: string;
@@ -866,7 +883,7 @@ export class ContentStore {
     // gate (security.ts evaluateFilePath calls realpathSync) and the read
     // here. Lexical re-read by path string allowed an attacker to swap a
     // symlink to a denied target (e.g. ~/.ssh/id_rsa) AFTER gate passed.
-    // openSync + fstat + readFileSync(fd) binds the read to the inode
+    // openSync + fstat + readSync binds the read to the inode captured at
     // captured at gate-time. fstat also rejects non-regular files
     // (directories, character devices) which would otherwise read as ""
     // or throw inconsistently. See #442 round-3.
@@ -880,12 +897,40 @@ export class ContentStore {
         if (!st.isFile()) {
           throw new Error(`refusing to index ${path}: not a regular file`);
         }
-        text = readFileSync(fd, "utf-8");
+        if (st.size > MAX_SOURCE_BYTES) {
+          throw new RangeError(
+            `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${st.size} bytes)`,
+          );
+        }
+        const readBuffer = Buffer.allocUnsafe(
+          Math.min(Math.max(st.size, 4096), 64 * 1024),
+        );
+        const parts: Buffer[] = [];
+        let bytesRead = 0;
+        while (bytesRead <= MAX_SOURCE_BYTES) {
+          const count = readSync(
+            fd,
+            readBuffer,
+            0,
+            Math.min(readBuffer.length, MAX_SOURCE_BYTES + 1 - bytesRead),
+            null,
+          );
+          if (count === 0) break;
+          parts.push(Buffer.from(readBuffer.subarray(0, count)));
+          bytesRead += count;
+        }
+        if (bytesRead > MAX_SOURCE_BYTES) {
+          throw new RangeError(
+            `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${bytesRead}+ bytes)`,
+          );
+        }
+        text = Buffer.concat(parts, bytesRead).toString("utf-8");
       } finally {
         closeSync(fd);
       }
     }
     const label = source ?? path ?? "untitled";
+    this.#assertSourceSize(text);
     const chunks = this.#chunkMarkdown(text);
 
     // Stale detection: store file_path + SHA-256 for file-backed sources
@@ -977,6 +1022,8 @@ export class ContentStore {
       return this.#insertChunks([], source, "", undefined, undefined, attribution);
     }
 
+    this.#assertSourceSize(content);
+    this.#assertChunkSizeLimit(maxChunkBytes);
     const chunks = this.#chunkPlainText(content, linesPerChunk, maxChunkBytes);
 
     return withRetry(() => this.#insertChunks(
@@ -1008,6 +1055,8 @@ export class ContentStore {
       return this.indexPlainText("", source, undefined, attribution, maxChunkBytes);
     }
 
+    this.#assertSourceSize(content);
+    this.#assertChunkSizeLimit(maxChunkBytes);
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
@@ -1040,7 +1089,16 @@ export class ContentStore {
     contentHash?: string,
     attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
-    const codeChunks = chunks.filter((c) => c.hasCode).length;
+    if (chunks.length > MAX_CHUNKS_PER_SOURCE) {
+      throw new RangeError(
+        `Source exceeds ${MAX_CHUNKS_PER_SOURCE}-chunk indexing limit`,
+      );
+    }
+    const boundedChunks = chunks.map((chunk) => ({
+      ...chunk,
+      title: this.#byteCappedPrefix(chunk.title, MAX_CHUNK_TITLE_BYTES),
+    }));
+    const codeChunks = boundedChunks.filter((c) => c.hasCode).length;
     // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
     // "not-null but unattributed" sentinel used by legacy rows.
     const sessionIdCol = attribution?.sessionId ?? "";
@@ -1054,16 +1112,16 @@ export class ContentStore {
       this.#stmtDeleteChunksTrigramByLabel.run(label);
       this.#stmtDeleteSourcesByLabel.run(label);
 
-      if (chunks.length === 0) {
+      if (boundedChunks.length === 0) {
         const info = this.#stmtInsertSourceEmpty.run(label, filePath ?? null, contentHash ?? null);
         return Number(info.lastInsertRowid);
       }
 
-      const info = this.#stmtInsertSource.run(label, chunks.length, codeChunks, filePath ?? null, contentHash ?? null);
+      const info = this.#stmtInsertSource.run(label, boundedChunks.length, codeChunks, filePath ?? null, contentHash ?? null);
       const sourceId = Number(info.lastInsertRowid);
 
       const now = new Date().toISOString();
-      for (const chunk of chunks) {
+      for (const chunk of boundedChunks) {
         const ct = chunk.hasCode ? "code" : "prose";
         this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
         this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
@@ -1075,19 +1133,10 @@ export class ContentStore {
     const sourceId = transaction();
     if (text) this.#extractAndStoreVocabulary(text);
 
-    // Periodically optimize FTS5 indexes to merge b-tree segments.
-    // Fragmentation accumulates over insert/delete cycles (dedup re-indexes
-    // every source on update). The 'optimize' command merges segments into
-    // a single b-tree, improving search latency for long-running sessions.
-    this.#insertCount++;
-    if (this.#insertCount % ContentStore.OPTIMIZE_EVERY === 0) {
-      this.#optimizeFTS();
-    }
-
     return {
       sourceId,
       label,
-      totalChunks: chunks.length,
+      totalChunks: boundedChunks.length,
       codeChunks,
     };
   }
@@ -1607,17 +1656,8 @@ export class ContentStore {
     }
   }
 
-  /** Merge FTS5 b-tree segments for both porter and trigram indexes. */
-  #optimizeFTS(): void {
-    try {
-      this.#db.exec("INSERT INTO chunks(chunks) VALUES('optimize')");
-      this.#db.exec("INSERT INTO chunks_trigram(chunks_trigram) VALUES('optimize')");
-    } catch { /* best effort — don't block indexing */ }
-  }
-
   close(): void {
-    this.#optimizeFTS(); // defragment before close
-    closeDB(this.#db); // WAL checkpoint before close — important for persistent DBs
+    closeDB(this.#db);
   }
 
   // ── Vocabulary Extraction ──
@@ -1662,7 +1702,15 @@ export class ContentStore {
 
       // If under the cap, emit as-is (fast path — most chunks hit this)
       if (Buffer.byteLength(joined) <= maxChunkBytes) {
-        chunks.push({ title, content: joined, hasCode });
+        this.#appendBoundedChunk(chunks, { title, content: joined, hasCode });
+        currentContent = [];
+        return;
+      }
+
+      if (hasCode) {
+        for (const chunk of this.#splitOversizedMarkdownChunk(joined, title, maxChunkBytes)) {
+          this.#appendBoundedChunk(chunks, chunk);
+        }
         currentContent = [];
         return;
       }
@@ -1678,11 +1726,24 @@ export class ContentStore {
         if (part.length === 0) return;
         const partTitle = paragraphs.length > 1 ? `${title} (${partIndex})` : title;
         partIndex++;
-        chunks.push({
-          title: partTitle,
-          content: part,
-          hasCode: part.includes("```"),
-        });
+        if (Buffer.byteLength(part) <= maxChunkBytes) {
+          this.#appendBoundedChunk(chunks, {
+            title: partTitle,
+            content: part,
+            hasCode: part.includes("```"),
+          });
+        } else {
+          for (const split of this.#splitOversizedPlainChunk(
+            part.split("\n"),
+            partTitle,
+            maxChunkBytes,
+          )) {
+            this.#appendBoundedChunk(chunks, {
+              ...split,
+              hasCode: split.content.includes("```") || hasCode,
+            });
+          }
+        }
         accumulator = [];
       };
 
@@ -1765,13 +1826,73 @@ export class ContentStore {
     return chunks;
   }
 
-  /**
-   * Return the largest prefix of `str` whose UTF-8 byte length does not exceed
-   * `maxBytes`, walking by Unicode code point so multibyte sequences (CJK) and
-   * surrogate pairs (emoji) are never cut mid-character. Guarantees forward
-   * progress: if even the first code point exceeds `maxBytes`, it is still
-   * returned whole (a 1-4 byte overshoot beats an infinite loop).
-   */
+  #splitOversizedMarkdownChunk(
+    text: string,
+    title: string,
+    maxChunkBytes: number,
+  ): Chunk[] {
+    const chunks: Chunk[] = [];
+    const lines = text.split("\n");
+    let prose: string[] = [];
+
+    const flushProse = (hasCode = false) => {
+      if (prose.length === 0) return;
+      for (const chunk of this.#splitOversizedPlainChunk(prose, title, maxChunkBytes)) {
+        this.#appendBoundedChunk(chunks, { ...chunk, hasCode });
+      }
+      prose = [];
+    };
+
+    for (let i = 0; i < lines.length;) {
+      const openingMatch = lines[i].match(/^(`{3,})(.*)?$/);
+      if (!openingMatch) {
+        prose.push(lines[i]);
+        i++;
+        continue;
+      }
+
+      flushProse();
+      const opening = lines[i];
+      const fence = openingMatch[1];
+      const body: string[] = [];
+      i++;
+      while (i < lines.length && lines[i].trim() !== fence) {
+        body.push(lines[i]);
+        i++;
+      }
+      if (i >= lines.length) {
+        prose = [opening, ...body];
+        flushProse(true);
+        break;
+      }
+
+      const closing = lines[i];
+      i++;
+      const wholeBlock = [opening, ...body, closing].join("\n");
+      if (Buffer.byteLength(wholeBlock) <= maxChunkBytes) {
+        this.#appendBoundedChunk(chunks, { title, content: wholeBlock, hasCode: true });
+        continue;
+      }
+
+      const wrapperBytes = Buffer.byteLength(`${opening}\n\n${closing}`);
+      const bodyBudget = maxChunkBytes - wrapperBytes;
+      if (bodyBudget < 1) {
+        throw new RangeError("maxChunkBytes cannot fit a balanced fenced code block");
+      }
+      for (const chunk of this.#splitOversizedPlainChunk(body, title, bodyBudget)) {
+        this.#appendBoundedChunk(chunks, {
+          title: chunk.title,
+          content: `${opening}\n${chunk.content}\n${closing}`,
+          hasCode: true,
+        });
+      }
+    }
+
+    flushProse();
+    return chunks;
+  }
+
+  /** Return the largest whole-code-point prefix within `maxBytes`. */
   #byteCappedPrefix(str: string, maxBytes: number): string {
     if (Buffer.byteLength(str) <= maxBytes) return str;
     let prefix = "";
@@ -1782,22 +1903,49 @@ export class ContentStore {
       prefix += char;
       bytes += charBytes;
     }
-    // Defensive: a single code point wider than the cap (only possible with a
-    // pathologically small maxBytes) still advances by one character.
-    if (prefix.length === 0) return [...str][0] ?? "";
+    if (prefix.length === 0 && str.length > 0) {
+      const charBytes = Buffer.byteLength([...str][0]);
+      throw new RangeError(
+        `maxChunkBytes cannot fit a ${charBytes}-byte UTF-8 code point`,
+      );
+    }
     return prefix;
   }
 
-  /**
-   * Split a single oversized plain-text chunk into byte-capped sub-chunks
-   * by accumulating lines until the byte count would exceed maxChunkBytes.
-   * Falls back to byte-accurate splitting for extremely long single lines.
-   */
+  #forEachByteCappedSlice(
+    str: string,
+    maxBytes: number,
+    emit: (slice: string) => void,
+  ): void {
+    let start = 0;
+    let end = 0;
+    let bytes = 0;
+
+    for (const char of str) {
+      const charBytes = Buffer.byteLength(char);
+      if (charBytes > maxBytes) {
+        throw new RangeError(
+          `maxChunkBytes cannot fit a ${charBytes}-byte UTF-8 code point`,
+        );
+      }
+      if (bytes + charBytes > maxBytes) {
+        emit(str.slice(start, end));
+        start = end;
+        bytes = 0;
+      }
+      end += char.length;
+      bytes += charBytes;
+    }
+    if (end > start) emit(str.slice(start, end));
+  }
+
+  /** Split oversized plain text without cutting UTF-8 code points. */
   #splitOversizedPlainChunk(
     lines: string[],
     titlePrefix: string,
     maxChunkBytes: number,
   ): Array<{ title: string; content: string }> {
+    titlePrefix = this.#byteCappedPrefix(titlePrefix, MAX_CHUNK_TITLE_BYTES);
     const subChunks: Array<{ title: string; content: string }> = [];
     let accumulator: string[] = [];
     let partIndex = 1;
@@ -1806,41 +1954,23 @@ export class ContentStore {
       if (accumulator.length === 0) return;
       const content = accumulator.join("\n");
       const partTitle = partIndex === 1 ? titlePrefix : `${titlePrefix} (${partIndex})`;
-      subChunks.push({ title: partTitle, content });
+      this.#appendBoundedChunk(subChunks, { title: partTitle, content });
       partIndex++;
       accumulator = [];
     };
 
     for (const line of lines) {
-      // If a single line itself exceeds the cap (even as first line),
-      // split it by character before accumulating
       if (Buffer.byteLength(line) > maxChunkBytes) {
         flushAccumulator();
-        // Split the long line into byte-capped pieces
-        let remaining = line;
         let linePart = 1;
-        while (remaining.length > 0) {
-          // Byte-accurate slice: never exceeds the cap, never cuts a multibyte
-          // character (CJK) or surrogate pair (emoji) in half.
-          let slice = this.#byteCappedPrefix(remaining, maxChunkBytes);
-          // Try to break at a whitespace boundary near the end for readability,
-          // but only when text remains after this slice.
-          if (slice.length < remaining.length) {
-            const lastSpace = slice.lastIndexOf(" ");
-            const lastNewline = slice.lastIndexOf("\n");
-            const breakPoint = Math.max(lastSpace, lastNewline);
-            if (breakPoint > slice.length * WHITESPACE_BREAK_RATIO) {
-              slice = slice.slice(0, breakPoint);
-            }
-          }
+        this.#forEachByteCappedSlice(line, maxChunkBytes, (slice) => {
           const linePartTitle = partIndex === 1 && linePart === 1
             ? titlePrefix
             : `${titlePrefix} (${partIndex}.${linePart})`;
-          subChunks.push({ title: linePartTitle, content: slice });
-          remaining = remaining.slice(slice.length);
+          this.#appendBoundedChunk(subChunks, { title: linePartTitle, content: slice });
           linePart++;
           partIndex++;
-        }
+        });
         continue;
       }
 
@@ -1870,17 +2000,20 @@ export class ContentStore {
       sections.length <= MAX_BLANK_LINE_SECTIONS &&
       sections.every((s) => Buffer.byteLength(s) < BLANK_SECTION_STRATEGY_MAX_BYTES)
     ) {
-      return sections.flatMap((section, i) => {
-        const trimmed = section.trim();
-        if (trimmed.length === 0) return [];
+      const chunks: Array<{ title: string; content: string }> = [];
+      for (let i = 0; i < sections.length; i++) {
+        const trimmed = sections[i].trim();
+        if (trimmed.length === 0) continue;
         const title = trimmed.split("\n")[0].slice(0, CHUNK_TITLE_MAX_CHARS) || `Section ${i + 1}`;
-        // A section may pass the strategy guard yet still exceed the byte cap
-        // (4097–4999B band): sub-split it so no stored chunk breaks the cap.
         if (Buffer.byteLength(trimmed) <= maxChunkBytes) {
-          return [{ title, content: trimmed }];
+          this.#appendBoundedChunk(chunks, { title, content: trimmed });
+          continue;
         }
-        return this.#splitOversizedPlainChunk(trimmed.split("\n"), title, maxChunkBytes);
-      });
+        for (const chunk of this.#splitOversizedPlainChunk(trimmed.split("\n"), title, maxChunkBytes)) {
+          this.#appendBoundedChunk(chunks, chunk);
+        }
+      }
+      return chunks;
     }
 
     const lines = text.split("\n");
@@ -1908,7 +2041,7 @@ export class ContentStore {
 
       // Enforce byte cap: sub-split oversized line-group chunks
       if (Buffer.byteLength(joined) <= maxChunkBytes) {
-        chunks.push({
+        this.#appendBoundedChunk(chunks, {
           title: firstLine || `Lines ${startLine}-${endLine}`,
           content: joined,
         });
@@ -1918,7 +2051,9 @@ export class ContentStore {
           firstLine || `Lines ${startLine}-${endLine}`,
           maxChunkBytes,
         );
-        chunks.push(...subChunks);
+        for (const subChunk of subChunks) {
+          this.#appendBoundedChunk(chunks, subChunk);
+        }
       }
     }
 
@@ -1931,51 +2066,58 @@ export class ContentStore {
     chunks: Chunk[],
     maxChunkBytes: number,
   ): void {
-    const title = path.length > 0 ? path.join(" > ") : "(root)";
-    const serialized = JSON.stringify(value, null, 2);
+    const title = this.#byteCappedPrefix(
+      path.length > 0 ? path.join(" > ") : "(root)",
+      MAX_CHUNK_TITLE_BYTES,
+    );
 
-    // Small enough — emit as a single chunk
-    if (Buffer.byteLength(serialized) <= maxChunkBytes) {
-      // Exception: objects with nested structure (object/array values) always
-      // recurse so that key paths become chunk titles for searchability —
-      // even when the subtree fits in one chunk. Flat objects (all primitive
-      // values) stay as a single chunk since there's no hierarchy to expose.
-      const shouldRecurse =
-        typeof value === "object" &&
-        value !== null &&
-        !Array.isArray(value) &&
-        Object.values(value).some(
-          (v) => typeof v === "object" && v !== null,
-        );
-
-      if (!shouldRecurse) {
-        chunks.push({ title, content: serialized, hasCode: true });
-        return;
-      }
-    }
-
-    // Object — recurse into each key
-    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-      const entries = Object.entries(value);
-      if (entries.length > 0) {
-        for (const [key, val] of entries) {
-          this.#walkJSON(val, [...path, key], chunks, maxChunkBytes);
-        }
-        return;
-      }
-      // Empty object — emit as-is
-      chunks.push({ title, content: serialized, hasCode: true });
-      return;
-    }
-
-    // Array — batch by size with identity-field-aware titles
     if (Array.isArray(value)) {
       this.#chunkJSONArray(value, path, chunks, maxChunkBytes);
       return;
     }
 
-    // Primitive that exceeds maxChunkBytes (e.g., very long string)
-    chunks.push({ title, content: serialized, hasCode: false });
+    if (typeof value === "object" && value !== null) {
+      const entries = Object.entries(value);
+      if (entries.length === 0) {
+        this.#appendBoundedChunk(chunks, { title, content: "{}", hasCode: true });
+        return;
+      }
+
+      const shouldRecurse = entries.some(
+        ([, nested]) => typeof nested === "object" && nested !== null,
+      );
+      if (shouldRecurse) {
+        for (const [key, nested] of entries) {
+          this.#walkJSON(nested, [...path, key], chunks, maxChunkBytes);
+        }
+        return;
+      }
+
+      const serialized = JSON.stringify(value, null, 2);
+      if (Buffer.byteLength(serialized) <= maxChunkBytes) {
+        this.#appendBoundedChunk(chunks, { title, content: serialized, hasCode: true });
+        return;
+      }
+
+      for (const [key, nested] of entries) {
+        this.#walkJSON(nested, [...path, key], chunks, maxChunkBytes);
+      }
+      return;
+    }
+
+    const serialized = JSON.stringify(value, null, 2) ?? String(value);
+    if (Buffer.byteLength(serialized) <= maxChunkBytes) {
+      this.#appendBoundedChunk(chunks, { title, content: serialized, hasCode: true });
+      return;
+    }
+
+    for (const split of this.#splitOversizedPlainChunk(
+      [serialized],
+      title,
+      maxChunkBytes,
+    )) {
+      this.#appendBoundedChunk(chunks, { ...split, hasCode: false });
+    }
   }
 
   /**
@@ -2030,35 +2172,60 @@ export class ContentStore {
     chunks: Chunk[],
     maxChunkBytes: number,
   ): void {
-    const prefix = path.length > 0 ? path.join(" > ") : "(root)";
+    const prefix = this.#byteCappedPrefix(
+      path.length > 0 ? path.join(" > ") : "(root)",
+      MAX_CHUNK_TITLE_BYTES,
+    );
     const identityField = this.#findIdentityField(arr);
 
     let batch: unknown[] = [];
+    let serializedBatch: string[] = [];
+    let batchBytes = 4;
     let batchStart = 0;
 
+    const batchContent = () => `[\n${serializedBatch.join(",\n")}\n]`;
     const flushBatch = (batchEnd: number) => {
       if (batch.length === 0) return;
-      const title = this.#jsonBatchTitle(prefix, batchStart, batchEnd, batch, identityField);
-      chunks.push({
-        title,
-        content: JSON.stringify(batch, null, 2),
-        hasCode: true,
-      });
+      const title = this.#byteCappedPrefix(
+        this.#jsonBatchTitle(prefix, batchStart, batchEnd, batch, identityField),
+        MAX_CHUNK_TITLE_BYTES,
+      );
+      const content = batchContent();
+      if (Buffer.byteLength(content) <= maxChunkBytes) {
+        this.#appendBoundedChunk(chunks, { title, content, hasCode: true });
+      } else {
+        for (const split of this.#splitOversizedPlainChunk(
+          [content],
+          title,
+          maxChunkBytes,
+        )) {
+          this.#appendBoundedChunk(chunks, { ...split, hasCode: true });
+        }
+      }
+      batch = [];
+      serializedBatch = [];
+      batchBytes = 4;
     };
 
     for (let i = 0; i < arr.length; i++) {
-      batch.push(arr[i]);
-      const candidate = JSON.stringify(batch, null, 2);
+      const serialized = JSON.stringify(arr[i], null, 2) ?? "null";
+      const indented = serialized.split("\n").map((line) => `  ${line}`).join("\n");
+      const itemBytes = Buffer.byteLength(indented);
+      const candidateBytes = batchBytes + (batch.length > 0 ? 2 : 0) + itemBytes;
 
-      if (Buffer.byteLength(candidate) > maxChunkBytes && batch.length > 1) {
-        batch.pop();
+      if (candidateBytes > maxChunkBytes && batch.length > 0) {
         flushBatch(i - 1);
         batch = [arr[i]];
+        serializedBatch = [indented];
+        batchBytes = 4 + itemBytes;
         batchStart = i;
+      } else {
+        batch.push(arr[i]);
+        serializedBatch.push(indented);
+        batchBytes = candidateBytes;
       }
     }
 
-    // Flush remaining
     flushBatch(batchStart + batch.length - 1);
   }
 
@@ -2066,9 +2233,9 @@ export class ContentStore {
     headingStack: Array<{ level: number; text: string }>,
     currentHeading: string,
   ): string {
-    if (headingStack.length === 0) {
-      return currentHeading || "Untitled";
-    }
-    return headingStack.map((h) => h.text).join(" > ");
+    const title = headingStack.length === 0
+      ? currentHeading || "Untitled"
+      : headingStack.map((h) => h.text).join(" > ");
+    return this.#byteCappedPrefix(title, MAX_CHUNK_TITLE_BYTES);
   }
 }
