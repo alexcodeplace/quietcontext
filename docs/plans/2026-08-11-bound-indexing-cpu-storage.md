@@ -1,6 +1,6 @@
 # Bound QuietContext indexing CPU and storage
 
-status: ACTIVE
+status: DONE
 owner: main session
 task IDs: overdeck incident #2
 source request: owner reported recurring workstation CPU saturation; measured QuietContext processes consume 174% CPU, including one attached-session process at 91%.
@@ -61,6 +61,10 @@ Oversized tool output cannot create unbounded FTS work, disk amplification, or s
 - Candidate installed atomically into the actual QuietContext source with exact rollback at `/home/user/.local/state/quietcontext/backups/cpu-burn-20260811T163327Z`; no existing plugin process or attached session was restarted or signalled.
 - Actual installed `start.mjs` proof rejected 8 MiB + 1 byte in 1.446 s, then indexed and searched normal content, and exited cleanly: `installed-entrypoint-bounds: ok`.
 
+- Candidate commit was rebased as `694821f4a4ef49b6495483a796e50fe7e03c833d` onto current `quietcontext` history, the exact proven source/bundle hashes were preserved, and rebased store tests passed 131/131.
+- `origin/quietcontext` advanced by fast-forward to `694821f4`; the landed artifact was reinstalled atomically with rollback at `/home/user/.local/state/quietcontext/backups/pre-landed-20260811T163700Z`.
+- Landed actual-entrypoint proof again rejected 8 MiB + 1 byte, indexed/searched normal content, and exited cleanly: `landed-installed-entrypoint-bounds: ok` (0.412 s rejection).
+
 ## Next executable action
 
-Commit the reviewed candidate, transplant only that delta onto current `quietcontext` commit `1d8eaef`, land it, reinstall the landed artifact, and repeat the installed-entrypoint proof.
+None. Task delivered and installed; the parent Overdeck incident continues with its separate kill-guard bypass task.
