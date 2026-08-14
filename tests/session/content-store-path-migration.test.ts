@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ContentStore } from "../../src/store.js";
+import { loadDatabase } from "../../src/db-base.js";
+import {
+  acquireContentStoreMigrationFence,
+  acquireContentStoreOwnerFence,
+} from "../../src/content-store-fence.js";
 import {
   hashProjectDirCanonical,
   hashProjectDirLegacy,
@@ -21,6 +28,46 @@ function makeContentDir(): string {
   cleanup.push(d);
   return d;
 }
+
+describe("content-store filesystem fences", () => {
+  it("treats an incomplete migration marker as active", () => {
+    const contentDir = makeContentDir();
+    const dbPath = join(contentDir, "incomplete.db");
+    const accessDir = `${dbPath}.access`;
+    mkdirSync(accessDir, { recursive: true });
+    const marker = join(accessDir, "migration");
+    writeFileSync(marker, "");
+
+    expect(() => acquireContentStoreOwnerFence(dbPath)).toThrow(/migration is active/i);
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  it("uses process start identity to clear a reused-PID marker", () => {
+    const contentDir = makeContentDir();
+    const dbPath = join(contentDir, "reused-pid.db");
+    const accessDir = `${dbPath}.access`;
+    mkdirSync(accessDir, { recursive: true });
+    writeFileSync(
+      join(accessDir, "migration"),
+      JSON.stringify({ pid: process.pid, startToken: "not-this-process" }),
+    );
+
+    const release = acquireContentStoreOwnerFence(dbPath);
+    release();
+    expect(existsSync(join(accessDir, "migration"))).toBe(false);
+  });
+
+  it("publishes an active migration marker before admitting owners", () => {
+    const contentDir = makeContentDir();
+    const dbPath = join(contentDir, "active.db");
+    const release = acquireContentStoreMigrationFence(dbPath);
+    try {
+      expect(() => acquireContentStoreOwnerFence(dbPath)).toThrow(/migration is active/i);
+    } finally {
+      release();
+    }
+  });
+});
 
 describe("resolveContentStorePath", () => {
   it("fresh install — no legacy, no canonical: returns canonical path (file not yet created)", () => {
@@ -43,7 +90,7 @@ describe("resolveContentStorePath", () => {
   );
 
   it.skipIf(process.platform === "linux")(
-    "migrates legacy raw-casing FTS5 db (with -wal/-shm sidecars) to canonical path",
+    "migrates a legacy raw-casing FTS5 database without renaming live files",
     () => {
       const projectDir = "/Users/Mert/MigrateMe";
       const contentDir = makeContentDir();
@@ -52,21 +99,17 @@ describe("resolveContentStorePath", () => {
       if (legacyHash === canonicalHash) return; // nothing to migrate
 
       const legacyMain = join(contentDir, `${legacyHash}.db`);
-      const legacyWal  = `${legacyMain}-wal`;
-      const legacyShm  = `${legacyMain}-shm`;
-      writeFileSync(legacyMain, "MAIN-DB");
-      writeFileSync(legacyWal,  "WAL-DATA");
-      writeFileSync(legacyShm,  "SHM-DATA");
+      const legacy = new ContentStore(legacyMain);
+      legacy.index({ content: "legacy casing payload", source: "legacy-casing" });
+      legacy.close();
 
       const resolved = resolveContentStorePath({ projectDir, contentDir });
-
-      expect(resolved).toBe(join(contentDir, `${canonicalHash}.db`));
-      expect(readFileSync(resolved, "utf8")).toBe("MAIN-DB");
-      expect(readFileSync(`${resolved}-wal`, "utf8")).toBe("WAL-DATA");
-      expect(readFileSync(`${resolved}-shm`, "utf8")).toBe("SHM-DATA");
-      expect(existsSync(legacyMain)).toBe(false);
-      expect(existsSync(legacyWal)).toBe(false);
-      expect(existsSync(legacyShm)).toBe(false);
+      const canonicalPath = join(contentDir, `${canonicalHash}.db`);
+      expect(resolved).toBe(canonicalPath);
+      const migrated = new ContentStore(canonicalPath);
+      expect(migrated.search("legacy casing")[0]?.source).toBe("legacy-casing");
+      migrated.close();
+      expect(existsSync(legacyMain)).toBe(true);
     },
   );
 
@@ -84,14 +127,87 @@ describe("resolveContentStorePath", () => {
       writeFileSync(legacyPath, "LEGACY");
       writeFileSync(canonicalPath, "CANONICAL");
 
-      const resolved = resolveContentStorePath({ projectDir, contentDir });
-
-      expect(resolved).toBe(canonicalPath);
-      expect(readFileSync(canonicalPath, "utf8")).toBe("CANONICAL"); // untouched
-      expect(existsSync(legacyPath)).toBe(true);
-      expect(readFileSync(legacyPath, "utf8")).toBe("LEGACY"); // preserved
+      expect(() => resolveContentStorePath({ projectDir, contentDir }))
+        .toThrow(/Cannot safely converge/);
+      expect(readFileSync(canonicalPath, "utf8")).toBe("CANONICAL");
+      expect(readFileSync(legacyPath, "utf8")).toBe("LEGACY");
     },
   );
+
+  it("main and linked worktrees resolve to the same content store", () => {
+    const repoDir = mkdtempSync(join(tmpdir(), "ctx-content-repo-"));
+    const linkedDir = `${repoDir}-linked`;
+    const contentDir = makeContentDir();
+    cleanup.push(repoDir, linkedDir);
+    execFileSync("git", ["init", "-q", repoDir]);
+    execFileSync("git", ["-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "init"]);
+    execFileSync("git", ["-C", repoDir, "worktree", "add", "-q", "-b", "linked", linkedDir]);
+
+    expect(resolveContentStorePath({ projectDir: repoDir, contentDir }))
+      .toBe(resolveContentStorePath({ projectDir: linkedDir, contentDir }));
+  });
+
+  it("migrates a pre-upgrade linked-worktree database to the canonical store", () => {
+    const repoDir = mkdtempSync(join(tmpdir(), "ctx-content-legacy-repo-"));
+    const linkedDir = `${repoDir}-linked`;
+    const contentDir = makeContentDir();
+    cleanup.push(repoDir, linkedDir);
+    execFileSync("git", ["init", "-q", repoDir]);
+    execFileSync("git", ["-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "init"]);
+    execFileSync("git", ["-C", repoDir, "worktree", "add", "-q", "-b", "legacy-linked", linkedDir]);
+    const oldLinkedPath = join(contentDir, `${hashProjectDirCanonical(linkedDir)}.db`);
+    const legacy = new ContentStore(oldLinkedPath);
+    legacy.index({ content: "migrated linked payload", source: "legacy-linked" });
+    legacy.close();
+
+    const resolved = resolveContentStorePath({ projectDir: linkedDir, contentDir });
+    const canonical = resolveContentStorePath({ projectDir: repoDir, contentDir });
+    expect(resolved).toBe(canonical);
+    expect(resolved).not.toBe(oldLinkedPath);
+    const migrated = new ContentStore(resolved);
+    expect(migrated.search("migrated")[0]?.source).toBe("legacy-linked");
+    migrated.close();
+  });
+
+  it("fails closed for a pre-ownership legacy store", () => {
+    const repoDir = mkdtempSync(join(tmpdir(), "ctx-content-ownerless-repo-"));
+    const linkedDir = `${repoDir}-linked`;
+    const contentDir = makeContentDir();
+    cleanup.push(repoDir, linkedDir);
+    execFileSync("git", ["init", "-q", repoDir]);
+    execFileSync("git", ["-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "init"]);
+    execFileSync("git", ["-C", repoDir, "worktree", "add", "-q", "-b", "ownerless-linked", linkedDir]);
+    const legacyPath = join(contentDir, `${hashProjectDirCanonical(linkedDir)}.db`);
+    const Database = loadDatabase();
+    const legacy = new Database(legacyPath);
+    legacy.exec("CREATE TABLE legacy_content (payload TEXT); INSERT INTO legacy_content VALUES ('ownerless')");
+    legacy.close();
+
+    expect(() => resolveContentStorePath({ projectDir: linkedDir, contentDir }))
+      .toThrow(/Cannot safely migrate/);
+    expect(existsSync(legacyPath)).toBe(true);
+    expect(existsSync(resolveContentStorePath({ projectDir: repoDir, contentDir }))).toBe(false);
+  });
+
+  it("fails closed when a legacy store has an active peer", () => {
+    const repoDir = mkdtempSync(join(tmpdir(), "ctx-content-live-repo-"));
+    const linkedDir = `${repoDir}-linked`;
+    const contentDir = makeContentDir();
+    cleanup.push(repoDir, linkedDir);
+    execFileSync("git", ["init", "-q", repoDir]);
+    execFileSync("git", ["-C", repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "init"]);
+    execFileSync("git", ["-C", repoDir, "worktree", "add", "-q", "-b", "live-linked", linkedDir]);
+    const legacyPath = join(contentDir, `${hashProjectDirCanonical(linkedDir)}.db`);
+    const seed = new ContentStore(legacyPath);
+    seed.index({ content: "live migration payload", source: "live-source" });
+    seed.close();
+    const peer = new ContentStore(legacyPath);
+    const startedAt = Date.now();
+    expect(() => resolveContentStorePath({ projectDir: linkedDir, contentDir })).toThrow(/Cannot safely migrate/);
+    expect(Date.now() - startedAt).toBeLessThan(750);
+    peer.close();
+    expect(existsSync(resolveContentStorePath({ projectDir: linkedDir, contentDir }))).toBe(true);
+  });
 
   it("different projects stay in separate FTS5 files (no cross-migration)", () => {
     const contentDir = makeContentDir();

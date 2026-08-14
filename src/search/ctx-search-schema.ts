@@ -20,6 +20,20 @@
 
 import { z } from "zod";
 
+export const MAX_SEARCH_QUERIES = 8;
+export const MAX_SEARCH_QUERY_BYTES = 1024;
+export const MAX_SEARCH_REFS = 64;
+export const MAX_SEARCH_REF_BYTES = 256;
+
+const boundedQuery = z.string().refine(
+  (value) => Buffer.byteLength(value) <= MAX_SEARCH_QUERY_BYTES,
+  { message: `Search query exceeds ${MAX_SEARCH_QUERY_BYTES} bytes` },
+);
+const boundedRef = z.string().refine(
+  (value) => Buffer.byteLength(value) <= MAX_SEARCH_REF_BYTES,
+  { message: `Search reference exceeds ${MAX_SEARCH_REF_BYTES} bytes` },
+);
+
 /**
  * Helper that mirrors the Zod coercer used elsewhere in the server for
  * array-shaped tool args. Kept inline so this module has no runtime
@@ -75,11 +89,13 @@ export function buildCtxSearchInputSchema(isSharedMode = false) {
 
   return z.object({
     queries: z.preprocess(coerceJsonArray, z
-      .array(z.string())
+      .array(boundedQuery)
+      .max(MAX_SEARCH_QUERIES)
       .optional()
       .describe("Array of search queries. Batch ALL questions in one call.")),
     refs: z.preprocess(coerceJsonArray, z
-      .array(z.string())
+      .array(boundedRef)
+      .max(MAX_SEARCH_REFS)
       .optional()
       .describe("Exact result references returned by an earlier search call.")),
     preview: z
@@ -104,6 +120,9 @@ export function buildCtxSearchInputSchema(isSharedMode = false) {
     // Fixes #627.
     limit: z
       .coerce.number()
+      .int()
+      .min(1)
+      .max(20)
       .optional()
       .default(3)
       .describe("Results per query (default: 3)"),

@@ -33,6 +33,7 @@ export interface PreparedStatement {
   get(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
   iterate(...params: unknown[]): IterableIterator<unknown>;
+  finalize?(): void;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -45,7 +46,8 @@ export interface PreparedStatement {
  */
 export class BunSQLiteAdapter {
   #raw: any;
-  #statements = new Set<() => void>();
+  #statements = new Set<WeakRef<() => void>>();
+  #statementFinalizer = new FinalizationRegistry<() => void>((finalize) => finalize());
 
   constructor(rawDb: any) {
     this.#raw = rawDb;
@@ -93,23 +95,47 @@ export class BunSQLiteAdapter {
   prepare(sql: string): any {
     const stmt = this.#raw.prepare(sql);
     let finalized = false;
+    let reference: WeakRef<() => void>;
+    const unregisterToken = {};
     const finalize = () => {
       if (finalized) return;
       stmt.finalize?.();
       finalized = true;
-      this.#statements.delete(finalize);
+      this.#statementFinalizer.unregister(unregisterToken);
+      this.#statements.delete(reference);
     };
-    this.#statements.add(finalize);
-    return {
+    const wrapper: PreparedStatement = {
       run: (...args: unknown[]) => stmt.run(...args),
       get: (...args: unknown[]) => {
         const r = stmt.get(...args);
         return r === null ? undefined : r;
       },
       all: (...args: unknown[]) => stmt.all(...args),
-      iterate: (...args: unknown[]) => stmt.iterate(...args),
+      iterate(...args: unknown[]) {
+        const iterator = stmt.iterate(...args);
+        const ownedIterator = {
+          owner: this,
+          next: (value?: unknown) => iterator.next(value),
+          return: (value?: unknown) => typeof iterator.return === "function"
+            ? iterator.return(value)
+            : { done: true, value },
+          throw: (error?: unknown) => {
+            if (typeof iterator.throw === "function") return iterator.throw(error);
+            throw error;
+          },
+          [Symbol.iterator]: () => ownedIterator,
+        } as IterableIterator<unknown> & { owner: PreparedStatement };
+        return ownedIterator;
+      },
       finalize,
     };
+    reference = new WeakRef(finalize);
+    this.#statements.add(reference);
+    this.#statementFinalizer.register(wrapper, finalize, unregisterToken);
+    for (const candidate of this.#statements) {
+      if (!candidate.deref()) this.#statements.delete(candidate);
+    }
+    return wrapper;
   }
 
   transaction(fn: (...args: any[]) => any): any {
@@ -118,7 +144,9 @@ export class BunSQLiteAdapter {
 
   close(): void {
     const errors: unknown[] = [];
-    for (const finalize of Array.from(this.#statements)) {
+    for (const reference of Array.from(this.#statements)) {
+      const finalize = reference.deref();
+      if (!finalize) continue;
       try {
         finalize();
       } catch (error) {
@@ -440,15 +468,8 @@ export function deleteDBFiles(dbPath: string): void {
   }
 }
 
-/**
- * Safely close a database connection. Swallows errors so callers can
- * always call this in a finally/cleanup path without try/catch.
- */
+/** Close a database connection without checkpointing shared WAL state. */
 export function closeDB(db: DatabaseInstance): void {
-  try {
-    // Checkpoint WAL before close to prevent contention on restart (#103)
-    db.pragma("wal_checkpoint(TRUNCATE)");
-  } catch { /* WAL may not be active */ }
   try {
     db.close();
   } catch {
@@ -599,21 +620,19 @@ export abstract class SQLiteBase {
    * block in tests/util/db-base-platform-gate.test.ts for the
    * regression-proof anchor (source-pin + behavioural).
    */
-  constructor(dbPath: string) {
+  constructor(dbPath: string, timeoutMs: number = 30000, recoverCorrupt: boolean = true) {
     const Database = loadDatabase();
     this.#dbPath = dbPath;
-    cleanOrphanedWALFiles(dbPath);
     let db: DatabaseInstance;
     try {
-      db = new Database(dbPath, { timeout: 30000 });
+      db = new Database(dbPath, { timeout: timeoutMs });
       applyWALPragmas(db);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (isSQLiteCorruptionError(msg)) {
+      if (recoverCorrupt && isSQLiteCorruptionError(msg)) {
         renameCorruptDB(dbPath);
-        cleanOrphanedWALFiles(dbPath);
         try {
-          db = new Database(dbPath, { timeout: 30000 });
+          db = new Database(dbPath, { timeout: timeoutMs });
           applyWALPragmas(db);
         } catch (retryErr) {
           throw new Error(

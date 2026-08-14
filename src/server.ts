@@ -8,11 +8,11 @@ import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, MAX_INDEX_INPUT_BYTES, MAX_SOURCE_LABEL_BYTES, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -55,7 +55,13 @@ import {
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { appendRetrievalBytes } from "./session/retrieval-marker.js";
-import { buildCtxSearchInputSchema } from "./search/ctx-search-schema.js";
+import {
+  buildCtxSearchInputSchema,
+  MAX_SEARCH_QUERIES,
+  MAX_SEARCH_QUERY_BYTES,
+  MAX_SEARCH_REFS,
+  MAX_SEARCH_REF_BYTES,
+} from "./search/ctx-search-schema.js";
 import { FloodGuard } from "./search/flood-guard.js";
 import { buildNodeCommand, type HookAdapter, type PlatformId, isInProcessPluginPlatform } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
@@ -655,8 +661,9 @@ writeFileSync(
 // snippets under /tmp when the host process exits.
 process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
+// Lazy bounded per-project stores — no DB overhead unless index/search is used
+const MAX_OPEN_CONTENT_STORES = 16;
+const stores = new Map<string, ContentStore>();
 
 /**
  * Build the FK-attribution object passed to every ContentStore.index*() call
@@ -887,21 +894,23 @@ function getSessionDbPath(): string {
  */
 function getStorePath(): string {
   const dir = ensureWritableStorageDir(resolveContentStorageDir(getDefaultSessionDir));
-  // Delegate to resolveContentStorePath: same case-fold + one-shot legacy
-  // rename behavior as resolveSessionDbPath. On macOS / Windows, an
-  // existing legacy raw-casing FTS5 db (with -wal/-shm sidecars) is
-  // migrated in place on first call. On Linux it's a no-op.
+  // Delegate path identity and legacy-path continuity to the shared resolver.
   return resolveContentStorePath({ projectDir: getProjectDir(), contentDir: dir });
 }
 
-function getStore(): ContentStore {
-  if (!_store) {
-    _store = new ContentStore();
+export function getStore(): ContentStore {
+  const storePath = getStorePath();
+  let store = stores.get(storePath);
+  if (store) {
+    stores.delete(storePath);
+    stores.set(storePath, store);
+  } else {
+    store = new ContentStore(storePath);
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
     // made after a file was originally indexed. See #442 round-3.
-    _store.setDenyChecker((filePath: string) => {
+    store.setDenyChecker((filePath: string) => {
       try {
         const projectDir = getProjectDir();
         const denyGlobs = readToolDenyPatterns("Read", projectDir);
@@ -919,10 +928,18 @@ function getStore(): ContentStore {
     });
 
     try {
-      _store.cleanupStaleSources(14);
+      store.cleanupStaleSources(14);
     } catch { /* best-effort */ }
+    stores.set(storePath, store);
+    while (stores.size > MAX_OPEN_CONTENT_STORES) {
+      const oldest = stores.entries().next().value as [string, ContentStore] | undefined;
+      if (!oldest) break;
+      stores.delete(oldest[0]);
+      clearSearchReferencesForStore(oldest[0]);
+      oldest[1].close();
+    }
   }
-  return _store;
+  return store;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -2385,10 +2402,9 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
     inputSchema: z.object({
       content: z
         .string()
+        .max(MAX_INDEX_INPUT_BYTES)
         .optional()
-        .describe(
-          "Raw text/markdown to index. Provide this OR path, not both.",
-        ),
+        .describe("Raw text/markdown to index. Provide this OR path, not both."),
       path: z
         .string()
         .optional()
@@ -2397,6 +2413,9 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
         ),
       source: z
         .string()
+        .refine((value) => Buffer.byteLength(value) <= MAX_SOURCE_LABEL_BYTES, {
+          message: `Source label exceeds ${MAX_SOURCE_LABEL_BYTES} bytes`,
+        })
         .optional()
         .describe(
           "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
@@ -2527,10 +2546,7 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
       else if (resolvedPath) {
-        try {
-          const fs = await import("fs");
-          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
-        } catch { /* ignore — file read errors handled by store */ }
+        try { trackIndexed(statSync(resolvedPath).size); } catch { /* read errors handled by store */ }
       }
       const store = getStore();
       const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath, attribution: currentAttribution() });
@@ -2674,18 +2690,57 @@ interface SearchReference {
   content: string;
 }
 
-const searchReferences = new Map<string, SearchReference>();
-const searchReferenceIds = new Map<string, string>();
-let nextSearchReference = 1;
+interface StoredSearchReference {
+  namespace: string;
+  key: string;
+  bytes: number;
+  result: SearchReference;
+}
 
-function rememberSearchReference(result: SearchReference): string {
+const MAX_SEARCH_REFERENCES = 512;
+const MAX_SEARCH_REFERENCE_BYTES = 1024 * 1024;
+const searchReferences = new Map<string, StoredSearchReference>();
+const searchReferenceIds = new Map<string, string>();
+let searchReferenceBytes = 0;
+
+function searchReferenceNamespace(storePath: string): string {
+  return [storePath, searchFloodGuardKey()].join(String.fromCharCode(0));
+}
+
+export function rememberSearchReference(result: SearchReference, namespace: string): string {
   const key = `${result.source}\u0000${result.title}\u0000${result.content}`;
-  const existing = searchReferenceIds.get(key);
+  const namespacedKey = [namespace, key].join(String.fromCharCode(0));
+  const existing = searchReferenceIds.get(namespacedKey);
   if (existing) return existing;
-  const id = (nextSearchReference++).toString(36);
-  searchReferenceIds.set(key, id);
-  searchReferences.set(id, result);
+  const id = randomBytes(12).toString("base64url");
+  const bytes = Buffer.byteLength(namespacedKey);
+  searchReferenceIds.set(namespacedKey, id);
+  searchReferences.set(id, { namespace, key: namespacedKey, bytes, result });
+  searchReferenceBytes += bytes;
+  while (searchReferences.size > MAX_SEARCH_REFERENCES
+    || searchReferenceBytes > MAX_SEARCH_REFERENCE_BYTES) {
+    const oldest = searchReferences.entries().next().value as [string, StoredSearchReference] | undefined;
+    if (!oldest) break;
+    searchReferences.delete(oldest[0]);
+    searchReferenceIds.delete(oldest[1].key);
+    searchReferenceBytes -= oldest[1].bytes;
+  }
   return id;
+}
+
+export function resolveSearchReference(id: string, namespace: string): SearchReference | undefined {
+  const stored = searchReferences.get(id);
+  return stored?.namespace === namespace ? stored.result : undefined;
+}
+
+function clearSearchReferencesForStore(storePath: string): void {
+  const prefix = `${storePath}${String.fromCharCode(0)}`;
+  for (const [id, entry] of searchReferences) {
+    if (!entry.namespace.startsWith(prefix)) continue;
+    searchReferences.delete(id);
+    searchReferenceIds.delete(entry.key);
+    searchReferenceBytes -= entry.bytes;
+  }
 }
 
 registerQuietTool(
@@ -2711,6 +2766,7 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
   async (params) => {
     try {
       const store = getStore();
+      const referenceNamespace = searchReferenceNamespace(getStorePath());
       // Guard: ctx_search requires prior indexed content.
       if (store.getStats().chunks === 0) {
         return trackResponse("ctx_search", {
@@ -2731,12 +2787,36 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
       const raw = params as Record<string, unknown>;
       const responseLimit = typeof raw.max_bytes === "number" ? raw.max_bytes : 8 * 1024;
 
+      if (Array.isArray(raw.refs) && raw.refs.length > MAX_SEARCH_REFS) {
+        return trackResponse("ctx_search", {
+          content: [{ type: "text" as const, text: "Error: search reference budget exceeded." }],
+          isError: true,
+        });
+      }
       const requestedRefs = Array.isArray(raw.refs)
         ? raw.refs.filter((value): value is string => typeof value === "string")
         : [];
+      if (requestedRefs.length > MAX_SEARCH_REFS
+        || requestedRefs.some((value) => Buffer.byteLength(value) > MAX_SEARCH_REF_BYTES)) {
+        return trackResponse("ctx_search", {
+          content: [{ type: "text" as const, text: "Error: search reference budget exceeded." }],
+          isError: true,
+        });
+      }
       if (requestedRefs.length > 0) {
+        const now = Date.now();
+        const flood = searchFloodGuard.record(searchFloodGuardKey(), now, requestedRefs.length);
+        if (flood.blocked) {
+          return trackResponse("ctx_search", {
+            content: [{
+              type: "text" as const,
+              text: `BLOCKED: ${flood.count} search references in ${Math.round((now - flood.windowStart) / 1000)}s.`,
+            }],
+            isError: true,
+          });
+        }
         const exact = requestedRefs.map((id) => {
-          const result = searchReferences.get(id);
+          const result = resolveSearchReference(id, referenceNamespace);
           return result
             ? `[r:${id}] ${result.title} (${result.source})\n${result.content}`
             : `[r:${id}] not found`;
@@ -2747,6 +2827,12 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
       }
 
       // Normalize: accept both query (string) and queries (array)
+      if (Array.isArray(raw.queries) && raw.queries.length > MAX_SEARCH_QUERIES) {
+        return trackResponse("ctx_search", {
+          content: [{ type: "text" as const, text: "Error: search query budget exceeded." }],
+          isError: true,
+        });
+      }
       const queryList: string[] = [];
       if (Array.isArray(raw.queries) && raw.queries.length > 0) {
         queryList.push(...(raw.queries as string[]));
@@ -2754,6 +2840,13 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
         queryList.push(raw.query as string);
       }
 
+      if (queryList.some((query) => typeof query !== "string"
+        || Buffer.byteLength(query) > MAX_SEARCH_QUERY_BYTES)) {
+        return trackResponse("ctx_search", {
+          content: [{ type: "text" as const, text: "Error: search query budget exceeded." }],
+          isError: true,
+        });
+      }
       if (queryList.length === 0) {
         return trackResponse("ctx_search", {
           content: [{ type: "text" as const, text: "Error: provide query or queries." }],
@@ -2770,7 +2863,7 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
 
       // Progressive throttling: track calls per agent-context window (#769).
       const now = Date.now();
-      const flood = searchFloodGuard.record(searchFloodGuardKey(), now);
+      const flood = searchFloodGuard.record(searchFloodGuardKey(), now, queryList.length);
       const searchCallCount = flood.count;
 
       // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
@@ -2778,7 +2871,7 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
-            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
+            text: `BLOCKED: ${searchCallCount} search queries in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
               "You're flooding context. STOP making individual search calls. " +
               "Use ctx_batch_execute(commands, queries) for your next research step.",
           }],
@@ -2827,7 +2920,7 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
               title: r.title,
               source: r.source,
               content: r.content,
-            });
+            }, referenceNamespace);
             const label = `[r:${ref}] ${r.title} (${r.source})`;
             if (!preview) return label;
             const snippet = extractSnippet(r.content, q, 600, r.highlighted);
@@ -4542,9 +4635,13 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     try {
       storePathForPurge = getStorePath();
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
-    if (_store) {
-      try { _store.cleanup(); } catch { /* best effort */ }
-      _store = null;
+    if (storePathForPurge) {
+      clearSearchReferencesForStore(storePathForPurge);
+      const store = stores.get(storePathForPurge);
+      if (store) {
+        try { store.close(); } catch { /* best effort */ }
+        stores.delete(storePathForPurge);
+      }
     }
 
     // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
@@ -4858,7 +4955,8 @@ async function main() {
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.cleanup();
+    for (const store of stores.values()) store.close();
+    stores.clear();
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }

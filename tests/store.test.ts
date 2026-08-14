@@ -7,12 +7,13 @@
 
 import { describe, test, expect } from "vitest";
 import { strict as assert } from "node:assert";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, utimesSync, truncateSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { ContentStore, cleanupStaleDBs } from "../src/store.js";
+import { spawn } from "node:child_process";
+import { ContentStore, MAX_INDEX_INPUT_BYTES, MAX_INDEX_LINES, MAX_SOURCE_LABEL_BYTES, cleanupStaleDBs } from "../src/store.js";
 import {
   withRetry,
   closeDB,
@@ -31,6 +32,444 @@ function createStore(): ContentStore {
   );
   return new ContentStore(path);
 }
+
+function createLimitedStore(limits: ConstructorParameters<typeof ContentStore>[1]): { store: ContentStore; dbPath: string } {
+  const dbPath = join(
+    tmpdir(),
+    `context-mode-test-limits-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+  );
+  return { store: new ContentStore(dbPath, limits), dbPath };
+}
+
+describe("Bounded content store", () => {
+  test("bounds and accounts for retained source labels", () => {
+    const { store, dbPath } = createLimitedStore({});
+    try {
+      expect(() => store.index({ content: "small", source: "é".repeat(MAX_SOURCE_LABEL_BYTES) }))
+        .toThrow(/Source label exceeds/);
+      store.index({ content: " ", source: "eight123" });
+      const Database = loadDatabase();
+      const inspect = new Database(dbPath, { readonly: true });
+      const totals = inspect.prepare(
+        "SELECT indexed_bytes FROM store_totals WHERE singleton = 1",
+      ).get() as { indexed_bytes: number };
+      inspect.close();
+      expect(totals.indexed_bytes).toBe(Buffer.byteLength("eight123"));
+    } finally {
+      store.cleanup();
+    }
+  });
+
+  test("purges oversized pre-upgrade labels during bounded accounting migration", () => {
+    const { store, dbPath } = createLimitedStore({ maintenanceChunkBatch: 1 });
+    store.close();
+    const Database = loadDatabase();
+    const seed = new Database(dbPath);
+    seed.prepare("DELETE FROM store_meta WHERE key = 'label_bytes_backfill_cursor'").run();
+    seed.prepare("INSERT INTO sources (label, chunk_count, code_chunk_count, indexed_bytes) VALUES (?, 0, 0, 0)")
+      .run("x".repeat(MAX_SOURCE_LABEL_BYTES + 1));
+    seed.close();
+
+    const migrated = new ContentStore(dbPath, { maintenanceChunkBatch: 1 });
+    try {
+      expect(migrated.listSources()).toHaveLength(0);
+    } finally {
+      migrated.cleanup();
+    }
+  });
+
+  test("rejects newline-heavy input before allocating line arrays", () => {
+    const store = createStore();
+    try {
+      expect(() => store.index({ content: "\n".repeat(MAX_INDEX_LINES), source: "too-many-lines" }))
+        .toThrow(/line indexing limit/);
+    } finally {
+      store.cleanup();
+    }
+  });
+
+  test("chunks large single-line input in linear time", () => {
+    const store = createStore();
+    const startedAt = Date.now();
+    try {
+      const result = store.indexPlainText("x".repeat(8 * 1024 * 1024), "single-line");
+      expect(result.totalChunks).toBeGreaterThan(1_000);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      store.cleanup();
+    }
+  });
+
+  test("rejects oversized content and files before chunking or reading", () => {
+    const { store } = createLimitedStore({});
+    expect(() => store.indexPlainText("x".repeat(MAX_INDEX_INPUT_BYTES + 1), "oversized"))
+      .toThrow(/indexing limit/);
+    const path = join(tmpdir(), `context-mode-oversized-${Date.now()}.txt`);
+    writeFileSync(path, "");
+    truncateSync(path, MAX_INDEX_INPUT_BYTES + 1);
+    try {
+      expect(() => store.index({ path, source: "oversized-file" })).toThrow(/indexing limit/);
+    } finally {
+      unlinkSync(path);
+      store.close();
+    }
+  });
+
+  test("rejects deeply nested JSON before recursive chunking", () => {
+    const { store } = createLimitedStore({});
+    let value: unknown = "leaf";
+    for (let depth = 0; depth < 66; depth++) value = { child: value };
+    expect(() => store.indexJSON(JSON.stringify(value), "deep-json")).toThrow(/level indexing limit/);
+    store.close();
+  });
+
+  test("rejects wide JSON before parsing or allocating traversal frames", () => {
+    const { store } = createLimitedStore({});
+    const wide = `[${"0,".repeat(100_000)}0]`;
+    expect(() => store.indexJSON(wide, "wide-json")).toThrow(/node indexing limit/);
+    store.close();
+  });
+
+  test("evicts oldest sources transactionally when chunk budget is exceeded", () => {
+    const { store, dbPath } = createLimitedStore({ maxChunks: 3 });
+    for (const label of ["one", "two", "three", "four"]) {
+      store.index({ content: `# ${label}\nunique-${label}`, source: label });
+    }
+    expect(store.listSources().map((source) => source.label)).toEqual(["four", "three", "two"]);
+    expect(store.getStats().chunks).toBe(3);
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    const totals = db.prepare("SELECT chunks, sources FROM store_totals WHERE singleton = 1").get() as { chunks: number; sources: number };
+    expect(totals).toEqual({ chunks: 3, sources: 3 });
+    db.close();
+    store.close();
+  });
+
+  test("bounds source-capacity eviction to one maintenance batch per write", () => {
+    const dbPath = join(tmpdir(), `context-mode-bounded-admission-${Date.now()}-${Math.random()}.db`);
+    const initial = new ContentStore(dbPath, {
+      maxSources: 100,
+      maxChunks: 100,
+      maxIndexedBytes: 1024 * 1024,
+      maintenanceChunkBatch: 2,
+    });
+    initial.index({
+      content: Array.from({ length: 20 }, (_, index) => `# Part ${index}\npayload-${index}`).join("\n\n"),
+      source: "oldest",
+    });
+    initial.close();
+
+    const bounded = new ContentStore(dbPath, {
+      maxSources: 1,
+      maxChunks: 100,
+      maxIndexedBytes: 1024 * 1024,
+      maintenanceChunkBatch: 2,
+    });
+    const Database = loadDatabase();
+    const beforeDb = new Database(dbPath, { readonly: true });
+    const before = beforeDb.prepare("SELECT chunk_count FROM sources WHERE label = 'oldest'").get() as { chunk_count: number };
+    beforeDb.close();
+
+    expect(() => bounded.index({ content: "new payload", source: "newest" }))
+      .toThrow(/bounded retention maintenance/);
+
+    const afterDb = new Database(dbPath, { readonly: true });
+    const after = afterDb.prepare("SELECT chunk_count FROM sources WHERE label = 'oldest'").get() as { chunk_count: number };
+    const newest = afterDb.prepare("SELECT COUNT(*) AS count FROM sources WHERE label = 'newest'").get() as { count: number };
+    afterDb.close();
+    expect(after.chunk_count).toBe(before.chunk_count - 2);
+    expect(newest.count).toBe(0);
+    bounded.cleanup();
+  });
+
+  test("clears a stale retention queue without running a second admission batch", () => {
+    const dbPath = join(tmpdir(), `context-mode-stale-retention-${Date.now()}-${Math.random()}.db`);
+    const initial = new ContentStore(dbPath, {
+      maxChunks: 100,
+      maxIndexedBytes: 1024 * 1024,
+      maintenanceChunkBatch: 2,
+    });
+    initial.index({
+      content: Array.from({ length: 6 }, (_, index) => `# Part ${index}\npayload-${index}`).join("\n\n"),
+      source: "oldest",
+    });
+    initial.close();
+
+    const bounded = new ContentStore(dbPath, {
+      maxChunks: 5,
+      maxIndexedBytes: 1024 * 1024,
+      maintenanceChunkBatch: 2,
+    });
+    const before = bounded.getStats().chunks;
+    bounded.index({ content: "admitted payload", source: "newest" });
+
+    const Database = loadDatabase();
+    const inspect = new Database(dbPath, { readonly: true });
+    const queue = inspect.prepare("SELECT COUNT(*) AS count FROM retention_queue").get() as { count: number };
+    inspect.close();
+    expect(bounded.getStats().chunks).toBe(before + 1);
+    expect(queue.count).toBe(0);
+    bounded.cleanup();
+  });
+
+  test("caps retained indexed bytes at the write seam", () => {
+    const { store, dbPath } = createLimitedStore({ maxIndexedBytes: 120, maxChunks: 100 });
+    store.index({ content: `# first\n${"a".repeat(80)}`, source: "first" });
+    store.index({ content: `# second\n${"b".repeat(80)}`, source: "second" });
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT COALESCE(SUM(indexed_bytes), 0) AS bytes FROM sources").get() as { bytes: number };
+    expect(row.bytes).toBeLessThanOrEqual(120);
+    expect(store.listSources().map((source) => source.label)).toEqual(["second"]);
+    db.close();
+    store.close();
+  });
+
+  test("enforces global budgets across repeated oversized writes", () => {
+    const { store, dbPath } = createLimitedStore({ maxChunks: 3, maxIndexedBytes: 180 });
+    for (let write = 0; write < 5; write++) {
+      const content = Array.from(
+        { length: 8 },
+        (_, chunk) => `# Write ${write} Chunk ${chunk}\n${String(write).repeat(30)}-${chunk}`,
+      ).join("\n\n");
+      store.index({ content, source: `large-${write}` });
+
+      const Database = loadDatabase();
+      const db = new Database(dbPath, { readonly: true });
+      const totals = db.prepare(
+        "SELECT indexed_bytes, chunks FROM store_totals WHERE singleton = 1",
+      ).get() as { indexed_bytes: number; chunks: number };
+      const actual = db.prepare(`
+        SELECT COALESCE(SUM(indexed_bytes), 0) AS indexed_bytes,
+          COALESCE(SUM(chunk_count), 0) AS chunks FROM sources
+      `).get() as { indexed_bytes: number; chunks: number };
+      expect(totals).toEqual(actual);
+      expect(totals.chunks).toBeLessThanOrEqual(3);
+      expect(totals.indexed_bytes).toBeLessThanOrEqual(180);
+      db.close();
+    }
+    store.close();
+  });
+
+  test("replacement prunes orphaned vocabulary and respects vocabulary cap", () => {
+    const { store, dbPath } = createLimitedStore({ maxVocabularyTerms: 3 });
+    store.index({ content: "alpha bravo charlie delta", source: "terms" });
+    expect(store.fuzzyCorrect("alphx")).toBe("alpha");
+
+    store.index({ content: "echo foxtrot golf hotel", source: "terms" });
+    expect(store.fuzzyCorrect("alphx")).toBeNull();
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT COUNT(*) AS count FROM vocabulary").get() as { count: number };
+    expect(row.count).toBeLessThanOrEqual(3);
+    db.close();
+    store.close();
+  });
+
+  test("fills vocabulary capacity past already-known candidates", () => {
+    const { store, dbPath } = createLimitedStore({ maxVocabularyTerms: 3 });
+    store.index({ content: "alpha", source: "first" });
+    store.index({ content: "alpha beta gamma", source: "second" });
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    const words = db.prepare("SELECT word FROM vocabulary ORDER BY word").all() as Array<{ word: string }>;
+    expect(words.map((row) => row.word)).toEqual(["alpha", "beta", "gamma"]);
+    db.close();
+    store.close();
+  });
+
+  test("checkpoints WAL after the configured threshold", () => {
+    const { store } = createLimitedStore({ walCheckpointBytes: 1 });
+    store.index({ content: "checkpoint threshold payload", source: "wal" });
+    expect(store.checkpointCount).toBeGreaterThan(0);
+    store.close();
+  });
+
+  test("bounds distinctive-term scans", () => {
+    const { store } = createLimitedStore({ maxDistinctiveChunks: 3 });
+    const indexed = store.index({
+      content: [
+        "# one\nfirstterm commonterm",
+        "# two\nfirstterm commonterm",
+        "# three\nfirstterm commonterm",
+        "# four\nlateterm lateterm",
+        "# five\nlateterm lateterm",
+      ].join("\n\n"),
+      source: "distinctive",
+    });
+    expect(store.getDistinctiveTerms(indexed.sourceId, 20)).not.toContain("lateterm");
+    expect(store.lastDistinctiveChunkCount).toBe(3);
+    store.close();
+  });
+
+  test("bounds fuzzy candidates and file metadata checks", () => {
+    const { store } = createLimitedStore({
+      maxFuzzyCandidates: 2,
+      maxMetadataChecks: 2,
+      maxVocabularyTerms: 100,
+    });
+    store.index({ content: "plane place plate plume plain", source: "vocabulary" });
+    store.fuzzyCorrect("plaxe");
+    expect(store.lastFuzzyCandidateCount).toBeLessThanOrEqual(2);
+
+    const paths = [0, 1, 2].map((index) => join(tmpdir(), `context-mode-metadata-${Date.now()}-${index}.txt`));
+    try {
+      for (const [index, path] of paths.entries()) {
+        writeFileSync(path, `metadata source ${index}`);
+        store.index({ path, source: `file-${index}` });
+      }
+      store.searchWithFallback("missing-query");
+      expect(store.lastMetadataCheckCount).toBe(2);
+    } finally {
+      store.close();
+      for (const path of paths) {
+        try { unlinkSync(path); } catch { /* ignore */ }
+      }
+    }
+  });
+
+  test("advances legacy byte migration in durable bounded batches", () => {
+    const dbPath = join(tmpdir(), `context-mode-migration-batch-${Date.now()}.db`);
+    const Database = loadDatabase();
+    const db = new Database(dbPath);
+    applyWALPragmas(db);
+    db.exec(`
+      CREATE TABLE sources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        code_chunk_count INTEGER NOT NULL DEFAULT 0,
+        indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        file_path TEXT,
+        content_hash TEXT
+      );
+      CREATE VIRTUAL TABLE chunks USING fts5(
+        title, content, source_id UNINDEXED, content_type UNINDEXED,
+        source_category UNINDEXED, session_id UNINDEXED, event_id UNINDEXED,
+        timestamp UNINDEXED, tokenize='porter unicode61'
+      );
+      INSERT INTO sources (label, chunk_count) VALUES ('legacy', 5);
+    `);
+    for (let index = 0; index < 5; index++) {
+      db.prepare("INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, 1, 'prose', '', '', '', '')")
+        .run(`title-${index}`, `content-${index}`);
+    }
+    db.close();
+
+    const first = new ContentStore(dbPath, { maintenanceChunkBatch: 2 });
+    expect(first.lastMaintenanceBackfillRows).toBe(2);
+    expect(() => first.index({ content: "must wait for migration", source: "deferred" }))
+      .toThrow(/migration completes/);
+    first.close();
+    const second = new ContentStore(dbPath, { maintenanceChunkBatch: 2 });
+    expect(second.lastMaintenanceBackfillRows).toBe(1);
+    const inspect = new Database(dbPath, { readonly: true });
+    const cursor = inspect.prepare("SELECT value FROM store_meta WHERE key = 'indexed_bytes_backfill_cursor'").get() as { value: number };
+    expect(cursor.value).toBe(5);
+    inspect.close();
+    second.close();
+  });
+
+  test("decrements code counts during partial retention batches", () => {
+    const { store } = createLimitedStore({ maxChunks: 4, maintenanceChunkBatch: 1 });
+    store.index({
+      content: "# Code\n\n```js\nconst retained = false;\n```\n\n# Prose A\n\nalpha prose\n\n# Prose B\n\nbeta prose",
+      source: "old-mixed",
+    });
+    store.index({
+      content: "# New A\n\ngamma prose\n\n# New B\n\ndelta prose",
+      source: "new-prose",
+    });
+
+    const meta = store.getSourceMeta("old-mixed");
+    expect(meta.chunkCount).toBe(2);
+    expect(meta.codeChunkCount).toBe(0);
+    store.close();
+  });
+
+  test("caps empty sources", () => {
+    const { store } = createLimitedStore({ maxSources: 2 });
+    store.indexPlainText("", "empty-one");
+    store.indexPlainText("", "empty-two");
+    const rebuildsBeforeEviction = store.vocabularyRebuildCount;
+    store.indexPlainText("", "empty-three");
+    expect(store.listSources().map((item) => item.label)).toEqual(["empty-three", "empty-two"]);
+    expect(store.vocabularyRebuildCount).toBe(rebuildsBeforeEviction);
+    store.close();
+  });
+
+  test("finds the nearest late-alphabet vocabulary term within the candidate cap", () => {
+    const { store } = createLimitedStore({ maxFuzzyCandidates: 2 });
+    store.index({ content: "alpha alpine altar amber angle zzzzeta", source: "late-vocabulary" });
+    expect(store.fuzzyCorrect("zzzzetx")).toBe("zzzzeta");
+    expect(store.lastFuzzyCandidateCount).toBeLessThanOrEqual(2);
+    store.close();
+  });
+
+  test("invalidates the local fuzzy cache after retention eviction", () => {
+    const { store } = createLimitedStore({ maxChunks: 1 });
+    store.index({ content: "alpha", source: "old-vocabulary" });
+    expect(store.fuzzyCorrect("alphx")).toBe("alpha");
+    store.index({ content: "bravo", source: "new-vocabulary" });
+    expect(store.fuzzyCorrect("alphx")).toBeNull();
+    store.close();
+  });
+
+  test("invalidates fuzzy cache after a peer commits vocabulary", () => {
+    const dbPath = join(tmpdir(), `context-mode-fuzzy-peer-${Date.now()}.db`);
+    const first = new ContentStore(dbPath);
+    const second = new ContentStore(dbPath);
+    expect(first.fuzzyCorrect("alphx")).toBeNull();
+    second.index({ content: "alpha", source: "peer-vocabulary" });
+    expect(first.fuzzyCorrect("alphx")).toBe("alpha");
+    first.close();
+    second.close();
+  });
+
+  test("round-robins bounded metadata refreshes", () => {
+    const { store } = createLimitedStore({ maxMetadataChecks: 2 });
+    const paths = [0, 1, 2].map((index) => join(tmpdir(), `context-mode-refresh-${Date.now()}-${index}.txt`));
+    try {
+      for (const [index, path] of paths.entries()) {
+        writeFileSync(path, `original-${index}`);
+        store.index({ path, source: `refresh-${index}` });
+      }
+      writeFileSync(paths[0], "refreshed-oldest-term");
+      const future = new Date(Date.now() + 2_000);
+      utimesSync(paths[0], future, future);
+      store.searchWithFallback("refreshed-oldest-term");
+      expect(store.search("refreshed-oldest-term", 1)[0]?.source).toBe("refresh-0");
+    } finally {
+      store.close();
+      for (const path of paths) {
+        try { unlinkSync(path); } catch { /* ignore */ }
+      }
+    }
+  });
+
+  test("does not rebuild vocabulary when stale cleanup removes nothing", () => {
+    const { store } = createLimitedStore({});
+    store.index({ content: "stable vocabulary", source: "stable" });
+    const before = store.vocabularyRebuildCount;
+    expect(store.cleanupStaleSources(14)).toBe(0);
+    expect(store.vocabularyRebuildCount).toBe(before);
+    store.close();
+  });
+
+  test("backs off passive checkpoints instead of storming", () => {
+    const { store } = createLimitedStore({ walCheckpointBytes: 1 });
+    store.index({ content: "first checkpoint", source: "checkpoint-1" });
+    const firstCount = store.checkpointCount;
+    for (let index = 2; index <= 10; index++) {
+      store.index({ content: `checkpoint ${index}`, source: `checkpoint-${index}` });
+    }
+    expect(store.checkpointCount).toBe(firstCount);
+    store.close();
+  });
+});
 
 describe("Schema & Lifecycle", () => {
   test("creates store with empty stats", () => {
@@ -170,7 +609,9 @@ describe("Schema & Lifecycle", () => {
     const sourceCount = checkDb.prepare("SELECT COUNT(*) as cnt FROM sources").get() as { cnt: number };
     expect(sourceCount.cnt).toBe(1);
 
-    // Store still functional — can index new content
+    // Store still functional after bounded accounting migrations finish.
+    store.searchWithFallback("advance migration");
+    store.searchWithFallback("advance migration");
     const result = store.index({ content: "# Test\n\nNew content after migration.", source: "post-migration" });
     expect(result.totalChunks).toBeGreaterThan(0);
 
@@ -325,6 +766,154 @@ describe("Basic Indexing", () => {
     } finally {
       closeDB(db);
     }
+  });
+
+  test("session filtering happens before the FTS result limit", () => {
+    const store = createStore();
+    for (let index = 0; index < 50; index++) {
+      store.index({
+        content: `sharedneedle foreign ${index}`,
+        source: `foreign-source-${index}`,
+        attribution: { sessionId: `foreign-session-${index}` },
+      } as Parameters<typeof store.index>[0]);
+    }
+    store.index({
+      content: "sharedneedle allowed",
+      source: "allowed-source",
+      attribution: { sessionId: "allowed-session" },
+    } as Parameters<typeof store.index>[0]);
+
+    const results = store.searchWithFallback(
+      "sharedneedle", 1, "source", undefined, "like", new Set(["allowed-session"]),
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].source).toBe("allowed-source");
+    store.close();
+  });
+
+  test("rejects a write captured before a peer purge", () => {
+    const dbPath = join(tmpdir(), `context-mode-purge-generation-${Date.now()}.db`);
+    const staleWriter = new ContentStore(dbPath);
+    const purger = new ContentStore(dbPath);
+    staleWriter.index({ content: "existing payload", source: "existing" });
+    purger.purgeAll();
+
+    expect(() => staleWriter.indexPlainText(
+      "stale payload",
+      "stale-source",
+      20,
+      undefined,
+      undefined,
+      0,
+    )).toThrow(/purged during processing/);
+    expect(purger.listSources()).toEqual([]);
+    purger.close();
+    staleWriter.close();
+  });
+
+  test("session purge updates sources, totals, and vocabulary atomically", () => {
+    const dbPath = join(tmpdir(), `context-mode-purge-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+    store.index({
+      content: "alphaobsolete target payload",
+      source: "target-source",
+      attribution: { sessionId: "target-session" },
+    } as Parameters<typeof store.index>[0]);
+    store.index({
+      content: "gammakeep sibling payload",
+      source: "sibling-source",
+      attribution: { sessionId: "sibling-session" },
+    } as Parameters<typeof store.index>[0]);
+
+    expect(store.purgeSession("target-session")).toBeGreaterThan(0);
+    expect(store.listSources()).toEqual([{ label: "sibling-source", chunkCount: 1 }]);
+    expect(store.search("alphaobsolete")).toEqual([]);
+    expect(store.fuzzyCorrect("alphaobsoletx")).toBeNull();
+    store.close();
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const durable = db.prepare(
+        "SELECT indexed_bytes, chunks, sources FROM store_totals WHERE singleton = 1",
+      ).get();
+      const actual = db.prepare(
+        "SELECT COALESCE(SUM(indexed_bytes), 0) AS indexed_bytes, COALESCE(SUM(chunk_count), 0) AS chunks, COUNT(*) AS sources FROM sources",
+      ).get();
+      expect(durable).toEqual(actual);
+      expect((db.prepare("SELECT COUNT(*) AS count FROM vocabulary WHERE word = 'alphaobsolete'").get() as { count: number }).count).toBe(0);
+    } finally {
+      closeDB(db);
+    }
+  });
+
+  test("session purge waits for a concurrent writer and commits one atomic unit", async () => {
+    const dbPath = join(tmpdir(), `context-mode-purge-busy-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+    store.index({
+      content: "busy purge payload",
+      source: "busy-source",
+      attribution: { sessionId: "busy-session" },
+    } as Parameters<typeof store.index>[0]);
+    const locker = spawn(process.execPath, ["-e", `
+      const Database = process.versions.bun
+        ? require("bun:sqlite").Database
+        : require("better-sqlite3");
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.exec("BEGIN IMMEDIATE");
+      process.stdout.write("locked\\n");
+      setTimeout(() => {
+        db.exec("COMMIT");
+        db.close();
+      }, 50);
+    `], { stdio: ["ignore", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      locker.once("error", reject);
+      locker.stdout.once("data", () => resolve());
+    });
+
+    expect(store.purgeSession("busy-session")).toBeGreaterThan(0);
+    expect(store.listSources()).toEqual([]);
+    await new Promise<void>((resolve, reject) => {
+      if (locker.exitCode !== null) return locker.exitCode === 0 ? resolve() : reject(new Error(`locker exited ${locker.exitCode}`));
+      locker.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`locker exited ${code}`)));
+    });
+    store.close();
+  });
+
+  test("session purge fails within its explicit bound under persistent contention", async () => {
+    const dbPath = join(tmpdir(), `context-mode-purge-stuck-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+    store.index({
+      content: "persistently locked payload",
+      source: "locked-source",
+      attribution: { sessionId: "locked-session" },
+    } as Parameters<typeof store.index>[0]);
+    const locker = spawn(process.execPath, ["-e", `
+      const Database = process.versions.bun
+        ? require("bun:sqlite").Database
+        : require("better-sqlite3");
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.exec("BEGIN IMMEDIATE");
+      process.stdout.write("locked\\n");
+      setTimeout(() => {
+        db.exec("COMMIT");
+        db.close();
+      }, 2000);
+    `], { stdio: ["ignore", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      locker.once("error", reject);
+      locker.stdout.once("data", () => resolve());
+    });
+
+    const startedAt = Date.now();
+    expect(() => store.purgeSession("locked-session")).toThrow(/SQLITE_BUSY|database is locked/i);
+    expect(Date.now() - startedAt).toBeLessThan(750);
+    const clearStartedAt = Date.now();
+    expect(() => store.purgeAll()).toThrow(/SQLITE_BUSY|database is locked/i);
+    expect(Date.now() - clearStartedAt).toBeLessThan(750);
+    locker.kill();
+    store.close();
   });
 });
 
@@ -1182,6 +1771,23 @@ describe("DB Cleanup", () => {
     store.close();
   });
 
+  test("store.cleanup() preserves a live peer and permits a subsequent opener", () => {
+    const path = join(tmpdir(), `context-mode-cleanup-peer-${Date.now()}-${Math.random()}.db`);
+    const first = new ContentStore(path);
+    first.index({ content: "shared cleanup sentinel", source: "shared-cleanup" });
+    const peer = new ContentStore(path);
+
+    first.cleanup();
+
+    assert.ok(existsSync(path), "DB should remain while a peer owns it");
+    assert.equal(peer.search("cleanup sentinel").length, 1);
+    const fresh = new ContentStore(path);
+    assert.equal(fresh.search("cleanup sentinel").length, 1);
+    fresh.close();
+    peer.cleanup();
+    assert.ok(!existsSync(path), "last owner should remove the DB");
+  });
+
   test("store.cleanup() is safe to call multiple times", () => {
     const path = join(tmpdir(), `context-mode-cleanup-idempotent-${Date.now()}.db`);
     const store = new ContentStore(path);
@@ -1207,6 +1813,22 @@ describe("Max Chunk Size", () => {
       assert.ok(r.title.includes("Big Section"), `Expected heading in title, got: ${r.title}`);
     }
     store.close();
+  });
+
+  test("caps persisted chunks from oversized markdown and JSON values", () => {
+    const path = join(tmpdir(), `context-mode-chunk-cap-${Date.now()}-${Math.random()}.db`);
+    const store = new ContentStore(path);
+    store.index({ content: `# Huge\n\n${"m".repeat(1024 * 1024)}`, source: "huge-markdown" });
+    store.indexJSON(JSON.stringify({ payload: "j".repeat(1024 * 1024) }), "huge-json");
+
+    const Database = loadDatabase();
+    const inspect = new Database(path, { readonly: true });
+    const row = inspect.prepare(
+      "SELECT MAX(LENGTH(CAST(content AS BLOB))) AS max_bytes FROM chunks",
+    ).get() as { max_bytes: number };
+    inspect.close();
+    assert.ok(row.max_bytes <= 4096, `persisted ${row.max_bytes}-byte chunk`);
+    store.cleanup();
   });
 
   test("does not split chunks already under maxChunkBytes", () => {
@@ -1463,6 +2085,34 @@ describe("Persistent content store lifecycle", () => {
     store.close();
   });
 
+  test("cleanupStaleSources deletes one maintenance batch per call", () => {
+    const dbPath = join(tmpdir(), `stale-batch-${Date.now()}-${Math.random()}.db`);
+    const store = new ContentStore(dbPath, {
+      maxChunks: 100,
+      maxIndexedBytes: 1024 * 1024,
+      maintenanceChunkBatch: 2,
+    });
+    store.index({
+      content: Array.from({ length: 6 }, (_, index) => `# Part ${index}\nstale-${index}`).join("\n\n"),
+      source: "stale-source",
+    });
+    const Database = loadDatabase();
+    const age = new Database(dbPath);
+    age.prepare("UPDATE sources SET indexed_at = datetime('now', '-30 days') WHERE label = ?").run("stale-source");
+    const before = age.prepare("SELECT chunk_count FROM sources WHERE label = ?").get("stale-source") as { chunk_count: number };
+    age.close();
+
+    expect(store.cleanupStaleSources(14)).toBe(0);
+    const inspect = new Database(dbPath, { readonly: true });
+    const after = inspect.prepare("SELECT chunk_count FROM sources WHERE label = ?").get("stale-source") as { chunk_count: number };
+    inspect.close();
+    expect(after.chunk_count).toBe(before.chunk_count - 2);
+    expect(store.cleanupStaleSources(14)).toBe(0);
+    expect(store.cleanupStaleSources(14)).toBe(1);
+    expect(store.getSourceMeta("stale-source")).toBeNull();
+    store.cleanup();
+  });
+
   test("cleanupStaleSources returns number type", () => {
     const store = createStore();
     store.index({ content: "# Test\nContent", source: "test-source" });
@@ -1520,7 +2170,7 @@ describe("SQLITE_BUSY retry logic", () => {
       join(__dirname, "../src/store.ts"),
       "utf-8",
     );
-    expect(storeSrc).toContain("timeout: 30000");
+    expect(storeSrc).toContain("timeoutMs: number = 30000");
   });
 
   test("withRetry retries on SQLITE_BUSY and succeeds", () => {
@@ -1700,31 +2350,32 @@ describe("concurrent DB access", () => {
 
 // ── WAL checkpoint on close (#244) ──
 
-describe("closeDB — WAL checkpoint", () => {
-  test("closeDB checkpoints WAL so no -wal file remains", () => {
+describe("closeDB — shared WAL close", () => {
+  test("closes promptly without truncating a peer's active WAL", () => {
     const dbPath = join(tmpdir(), `wal-test-${Date.now()}.db`);
     const Database = loadDatabase();
-    const db = Database(dbPath, { timeout: 30000 });
-    applyWALPragmas(db);
-    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
-    db.exec("INSERT INTO t VALUES (1, 'hello')");
+    const writer = Database(dbPath, { timeout: 30000 });
+    const reader = Database(dbPath, { timeout: 30000 });
+    applyWALPragmas(writer);
+    applyWALPragmas(reader);
+    writer.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    writer.exec("INSERT INTO t VALUES (1, 'first')");
+    reader.exec("BEGIN");
+    expect((reader.prepare("SELECT COUNT(*) AS count FROM t").get() as { count: number }).count).toBe(1);
+    writer.exec("INSERT INTO t VALUES (2, 'second')");
 
-    // WAL file should exist after writes in WAL mode
-    expect(existsSync(dbPath + "-wal")).toBe(true);
+    const startedAt = Date.now();
+    closeDB(writer);
+    expect(Date.now() - startedAt).toBeLessThan(100);
+    expect((reader.prepare("SELECT COUNT(*) AS count FROM t").get() as { count: number }).count).toBe(1);
+    reader.exec("COMMIT");
+    reader.close();
 
-    closeDB(db);
-
-    // After closeDB, WAL should be checkpointed (truncated to 0 or removed)
-    // The file may still exist but should be empty, or may not exist
-    const walExists = existsSync(dbPath + "-wal");
-    if (walExists) {
-      const walSize = readFileSync(dbPath + "-wal").length;
-      expect(walSize).toBe(0);
-    }
-
-    // cleanup
-    for (const s of ["", "-wal", "-shm"]) {
-      try { unlinkSync(dbPath + s); } catch {}
+    const verify = Database(dbPath, { readonly: true });
+    expect((verify.prepare("SELECT COUNT(*) AS count FROM t").get() as { count: number }).count).toBe(2);
+    verify.close();
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { unlinkSync(dbPath + suffix); } catch {}
     }
   });
 });
@@ -1732,21 +2383,14 @@ describe("closeDB — WAL checkpoint", () => {
 // ── Corrupt DB recovery (#244) ──
 
 describe("ContentStore — corrupt DB recovery", () => {
-  // Windows file locking prevents WAL/SHM deletion while another worker holds them open
-  test.skipIf(process.platform === "win32")("recovers from corrupt DB file by deleting and recreating", () => {
+  test("fails closed without deleting a corrupt shared database", () => {
     const dbPath = join(tmpdir(), `corrupt-store-${Date.now()}.db`);
-    // Write garbage to simulate corrupt DB
-    writeFileSync(dbPath, "THIS IS NOT A SQLITE DATABASE FILE");
-    writeFileSync(dbPath + "-wal", "CORRUPT WAL");
+    const corrupt = "THIS IS NOT A SQLITE DATABASE FILE";
+    writeFileSync(dbPath, corrupt);
 
-    // Should recover: delete corrupt files and create fresh DB
-    const store = new ContentStore(dbPath);
-    // Store should be functional
-    store.index({ content: "test content", source: "test" });
-    const results = store.search("test content");
-    expect(results.length).toBeGreaterThan(0);
-
-    store.cleanup();
+    expect(() => new ContentStore(dbPath)).toThrow(/Failed to open shared content store/);
+    expect(readFileSync(dbPath, "utf8")).toBe(corrupt);
+    unlinkSync(dbPath);
   });
 
   test("non-SQLite errors still throw", () => {

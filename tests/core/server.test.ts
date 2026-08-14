@@ -2592,6 +2592,13 @@ describe("Platform-aware session paths via adapter", () => {
     // Must derive content dir from adapter/session dir (platform-specific)
     expect(body).toContain("resolveContentStorageDir(getDefaultSessionDir)");
   });
+
+  test("ContentStore singleton opens the canonical persistent path", () => {
+    const fn = serverSrc.match(/function getStore\(\)[\s\S]*?^}/m);
+    expect(fn).not.toBeNull();
+    expect(fn![0]).toMatch(/(?:const|let)\s+(\w+)\s*=\s*getStorePath\(\)[\s\S]*new ContentStore\(\1\)/);
+    expect(fn![0]).not.toContain("new ContentStore()");
+  });
 });
 
 // ─── Hash consistency ────────────────────────────────────────────────────────
@@ -2603,7 +2610,6 @@ describe("Project dir hash consistency", () => {
   );
 
   test("server.ts imports canonical hash + path resolvers from session/db.js", () => {
-    // After the case-fold migration + content-store migration, all DB
     // path computation lives in src/session/db.ts. The server MUST import
     // resolveSessionDbPath + resolveContentStorePath rather than rolling
     // its own hash + join inline.
@@ -2619,7 +2625,7 @@ describe("Project dir hash consistency", () => {
     expect(serverSrc).not.toMatch(/^function normalizeProjectDirForHash\(/m);
   });
 
-  test("getStorePath delegates to resolveContentStorePath (auto case-fold migration)", () => {
+  test("getStorePath delegates to the canonical content path resolver", () => {
     const fn = serverSrc.match(/function getStorePath[\s\S]*?^}/m);
     expect(fn).not.toBeNull();
     expect(fn![0]).toContain("resolveContentStorePath");

@@ -9,13 +9,17 @@
  */
 
 import type { Database as DatabaseInstance } from "better-sqlite3";
-import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
+import { loadDatabase, applyWALPragmas, withRetry } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
 import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
+import {
+  acquireContentStoreMigrationFence,
+  acquireContentStoreOwnerFence,
+} from "./content-store-fence.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -147,6 +151,15 @@ function maxEditDistance(wordLength: number): number {
   return 3;
 }
 
+function vocabularyGrams(word: string): string[] {
+  const padded = `^${word}$`;
+  const grams = new Set<string>();
+  for (let index = 0; index <= padded.length - 3; index++) {
+    grams.add(padded.slice(index, index + 3));
+  }
+  return [...grams];
+}
+
 // Oversized chunks (e.g., a 50KB section between two headings) hurt BM25
 // length normalization and produce unwieldy search results. Split at paragraph
 // boundaries when a chunk exceeds this cap.
@@ -168,6 +181,40 @@ const CHUNK_TITLE_MAX_CHARS = 80;
 // boundary for readability — but only if that boundary is past this fraction of
 // the slice, otherwise we'd waste too much of the byte budget.
 const WHITESPACE_BREAK_RATIO = 0.5;
+
+export const MAX_INDEX_INPUT_BYTES = 32 * 1024 * 1024;
+export const MAX_SOURCE_LABEL_BYTES = 4 * 1024;
+export const MAX_INDEX_LINES = 250_000;
+export const MAX_JSON_DEPTH = 64;
+export const MAX_JSON_NODES = 100_000;
+
+export const CONTENT_STORE_LIMITS = Object.freeze({
+  maxIndexedBytes: 32 * 1024 * 1024,
+  maxChunks: 12_000,
+  maxSources: 1_000,
+  maxVocabularyTerms: 50_000,
+  maxFuzzyCandidates: 256,
+  maxFuzzyWordLength: 64,
+  maxFuzzyQueryWords: 8,
+  maxMetadataChecks: 256,
+  maxDistinctiveChunks: 512,
+  maintenanceChunkBatch: 256,
+  walCheckpointBytes: 8 * 1024 * 1024,
+});
+
+export interface ContentStoreLimits {
+  maxIndexedBytes: number;
+  maxChunks: number;
+  maxSources: number;
+  maxVocabularyTerms: number;
+  maxFuzzyCandidates: number;
+  maxFuzzyWordLength: number;
+  maxFuzzyQueryWords: number;
+  maxMetadataChecks: number;
+  maxDistinctiveChunks: number;
+  maintenanceChunkBatch: number;
+  walCheckpointBytes: number;
+}
 
 // ─────────────────────────────────────────────────────────
 // ContentStore
@@ -353,8 +400,21 @@ export function createProcessStorePath(): string {
 }
 
 export class ContentStore {
-  #db: DatabaseInstance;
+  #db!: DatabaseInstance;
   #dbPath: string;
+  #limits: ContentStoreLimits;
+  #defaultBusyTimeoutMs: number;
+  #ownerId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  #releaseOwnerFence: () => void = () => {};
+  #closed = false;
+  checkpointCount = 0;
+  #writesSinceCheckpoint = 0;
+  #nextCheckpointAt = 0;
+  lastFuzzyCandidateCount = 0;
+  lastMetadataCheckCount = 0;
+  lastDistinctiveChunkCount = 0;
+  lastMaintenanceBackfillRows = 0;
+  vocabularyRebuildCount = 0;
   // Optional deny-policy callback. When set (by server.ts at startup),
   // #refreshStaleSources consults it before re-reading file_path during
   // auto-refresh. This catches policy edits between initial indexing and
@@ -373,6 +433,7 @@ export class ContentStore {
   #stmtInsertChunk!: PreparedStatement;
   #stmtInsertChunkTrigram!: PreparedStatement;
   #stmtInsertVocab!: PreparedStatement;
+  #stmtInsertVocabGram!: PreparedStatement;
 
   // Dedup path (delete previous source with same label before re-indexing)
   #stmtDeleteChunksByLabel!: PreparedStatement;
@@ -386,7 +447,6 @@ export class ContentStore {
   #stmtSearchTrigram!: PreparedStatement;
   #stmtSearchTrigramFiltered!: PreparedStatement;
   #stmtSearchTrigramExact!: PreparedStatement;
-  #stmtFuzzyVocab!: PreparedStatement;
   #stmtSearchPorterContentType!: PreparedStatement;
   #stmtSearchPorterFilteredContentType!: PreparedStatement;
   #stmtSearchPorterExactContentType!: PreparedStatement;
@@ -399,13 +459,15 @@ export class ContentStore {
   #stmtChunksBySource!: PreparedStatement;
   #stmtSourceChunkCount!: PreparedStatement;
   #stmtChunkContent!: PreparedStatement;
+  #stmtVocabularyContent!: PreparedStatement;
   #stmtStats!: PreparedStatement;
   #stmtSourceMeta!: PreparedStatement;
 
   // Cleanup path
+  #stmtCleanupSource!: PreparedStatement;
   #stmtCleanupChunks!: PreparedStatement;
   #stmtCleanupChunksTrigram!: PreparedStatement;
-  #stmtCleanupSources!: PreparedStatement;
+  #stmtCleanupSourceIfEmpty!: PreparedStatement;
 
   // FTS5 optimization: track inserts and optimize periodically to defragment
   // the index. FTS5 b-trees fragment over many insert/delete cycles, degrading
@@ -419,57 +481,181 @@ export class ContentStore {
   // recompute the same answer. The vocabulary table is insert-only, so cache
   // entries only become stale when new words enter — we clear on actual insert.
   #fuzzyCache = new Map<string, string | null>();
+  #fuzzyDataVersion = -1;
   static readonly FUZZY_CACHE_SIZE = 256;
 
-  constructor(dbPath?: string) {
+  constructor(dbPath?: string, limits: Partial<ContentStoreLimits> = {}, timeoutMs: number = 30000) {
     const Database = loadDatabase();
     this.#dbPath = dbPath ?? createProcessStorePath();
-    cleanOrphanedWALFiles(this.#dbPath);
-    let db: DatabaseInstance;
-    try {
-      db = new Database(this.#dbPath, { timeout: 30000 });
-      applyWALPragmas(db);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (isSQLiteCorruptionError(msg)) {
-        deleteDBFiles(this.#dbPath);
-        cleanOrphanedWALFiles(this.#dbPath);
-        try {
-          db = new Database(this.#dbPath, { timeout: 30000 });
-          applyWALPragmas(db);
-        } catch (retryErr) {
-          throw new Error(
-            `Failed to create fresh DB after deleting corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
-          );
-        }
-      } else {
-        throw err;
+    this.#limits = { ...CONTENT_STORE_LIMITS, ...limits };
+    this.#defaultBusyTimeoutMs = timeoutMs;
+    for (const [name, value] of Object.entries(this.#limits)) {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`ContentStore limit ${name} must be a positive safe integer`);
       }
     }
-    this.#db = db;
-    this.#initSchema();
-    this.#prepareStatements();
+    this.#releaseOwnerFence = acquireContentStoreOwnerFence(this.#dbPath);
+    let db: DatabaseInstance | undefined;
+    try {
+      db = new Database(this.#dbPath, { timeout: timeoutMs });
+      applyWALPragmas(db);
+      this.#db = db;
+      this.#initSchema();
+      this.#db.prepare("INSERT INTO store_owners (owner_id, pid) VALUES (?, ?)").run(this.#ownerId, process.pid);
+      this.#prepareStatements();
+      this.#runMaintenanceBatch();
+      this.#checkpointWALIfNeeded();
+    } catch (err) {
+      try { db?.close(); } catch { /* incomplete open */ }
+      this.#releaseOwnerFence();
+      const detail = err instanceof Error ? `: ${err.message}` : "";
+      throw new Error(`Failed to open shared content store ${this.#dbPath}${detail}`, { cause: err });
+    }
   }
 
-  /** Delete this session's DB files. Call on process exit. */
+  /** Delete this session's DB files when no shared peer remains. */
   cleanup(): void {
+    try { this.#db.prepare("DELETE FROM store_owners WHERE owner_id = ?").run(this.#ownerId); } catch { /* closed */ }
+    try { this.#db.close(); } catch { /* closed */ }
+    this.#releaseOwnerFence();
+    let releaseDeletionFence: (() => void) | undefined;
     try {
-      this.#db.close();
-    } catch { /* ignore */ }
-    for (const suffix of ["", "-wal", "-shm"]) {
-      try { unlinkSync(this.#dbPath + suffix); } catch { /* ignore */ }
+      releaseDeletionFence = acquireContentStoreMigrationFence(this.#dbPath);
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try { unlinkSync(this.#dbPath + suffix); } catch { /* absent */ }
+      }
+    } catch { /* a shared peer still owns the store */ }
+    finally { releaseDeletionFence?.(); }
+  }
+
+  #runBoundedWrite<T>(operation: () => T): T {
+    this.#db.pragma(`busy_timeout = ${Math.min(50, this.#defaultBusyTimeoutMs)}`);
+    try {
+      return withRetry(operation, [10, 25, 50]);
+    } finally {
+      this.#db.pragma(`busy_timeout = ${this.#defaultBusyTimeoutMs}`);
     }
+  }
+
+  /** Remove one session's attributed chunks while preserving source accounting. */
+  purgeSession(sessionId: string): number {
+    if (!sessionId) throw new TypeError("ContentStore.purgeSession requires a sessionId");
+    const purge = this.#db.transaction(() => {
+      this.#db.prepare("UPDATE store_meta SET value = value + 1 WHERE key = 'purge_generation'").run();
+      const row = this.#db.prepare(
+        "SELECT COUNT(*) AS count FROM chunks WHERE session_id = ?",
+      ).get(sessionId) as { count: number };
+      if (row.count === 0) return 0;
+
+      this.#db.exec("CREATE TEMP TABLE IF NOT EXISTS purge_source_ids (id INTEGER PRIMARY KEY); DELETE FROM purge_source_ids");
+      this.#db.prepare(
+        "INSERT INTO purge_source_ids SELECT DISTINCT source_id FROM chunks WHERE session_id = ?",
+      ).run(sessionId);
+      this.#db.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
+      this.#db.prepare("DELETE FROM chunks_trigram WHERE session_id = ?").run(sessionId);
+      this.#db.exec(`
+        UPDATE sources SET
+          chunk_count = (SELECT COUNT(*) FROM chunks WHERE chunks.source_id = sources.id),
+          code_chunk_count = (SELECT COUNT(*) FROM chunks WHERE chunks.source_id = sources.id AND chunks.content_type = 'code'),
+          indexed_bytes = COALESCE((SELECT SUM(length(CAST(chunks.title AS BLOB)) + length(CAST(chunks.content AS BLOB))) FROM chunks WHERE chunks.source_id = sources.id), 0)
+        WHERE id IN (SELECT id FROM purge_source_ids);
+        DELETE FROM retention_queue WHERE source_id IN (SELECT id FROM purge_source_ids) AND source_id IN (SELECT id FROM sources WHERE chunk_count = 0);
+        DELETE FROM sources WHERE id IN (SELECT id FROM purge_source_ids) AND chunk_count = 0;
+        DELETE FROM purge_source_ids;
+      `);
+      this.#rebuildVocabulary();
+      return row.count;
+    });
+
+    const removed = this.#runBoundedWrite(() => purge());
+    if (removed > 0) {
+      this.#fuzzyCache.clear();
+      this.#writesSinceCheckpoint++;
+      this.#checkpointWALIfNeeded();
+    }
+    return removed;
+  }
+
+  /** Clear indexed content without unlinking the shared SQLite database. */
+  purgeAll(): boolean {
+    const clear = this.#db.transaction(() => {
+      const existed = Boolean(this.#db.prepare("SELECT 1 FROM sources LIMIT 1").get());
+      this.#db.exec(`
+        DELETE FROM chunks;
+        DELETE FROM chunks_trigram;
+        DELETE FROM retention_queue;
+        DELETE FROM sources;
+        DELETE FROM vocabulary_grams;
+        DELETE FROM vocabulary;
+        UPDATE store_totals SET indexed_bytes = 0, chunks = 0, sources = 0 WHERE singleton = 1;
+        UPDATE store_meta SET value = CASE
+          WHEN key = 'metadata_cursor' THEN 0
+          WHEN key = 'purge_generation' THEN value + 1
+          ELSE -1
+        END;
+      `);
+      return existed;
+    });
+    const existed = this.#runBoundedWrite(() => clear());
+    this.#fuzzyCache.clear();
+    this.#writesSinceCheckpoint++;
+    this.#checkpointWALIfNeeded();
+    return existed;
   }
 
   // ── Schema ──
 
   #initSchema(): void {
+    this.#db.pragma(`busy_timeout = ${Math.min(250, this.#defaultBusyTimeoutMs)}`);
+    try {
+      withRetry(() => {
+        this.#db.exec("BEGIN IMMEDIATE");
+        try {
+          this.#initializeSchema();
+          this.#db.exec("COMMIT");
+        } catch (error) {
+          try { this.#db.exec("ROLLBACK"); } catch { /* transaction did not start */ }
+          throw error;
+        }
+      }, [10, 50, 200]);
+    } finally {
+      this.#db.pragma(`busy_timeout = ${this.#defaultBusyTimeoutMs}`);
+    }
+  }
+
+  #initializeSchema(): void {
+    const existingSources = Boolean(this.#db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sources'",
+    ).get());
+    const existingTotals = Boolean(this.#db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_totals'",
+    ).get());
+    const existingMeta = Boolean(this.#db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'",
+    ).get());
+    const existingLabelBytesCursor = existingMeta && Boolean(this.#db.prepare(
+      "SELECT 1 FROM store_meta WHERE key = 'label_bytes_backfill_cursor'",
+    ).get());
+    const existingSourceColumns = existingSources
+      ? this.#db.prepare("SELECT name FROM pragma_table_info('sources')").all() as Array<{ name: string }>
+      : [];
+    const needsIndexedBytesBackfill = existingSources
+      && !existingSourceColumns.some((column) => column.name === "indexed_bytes");
+    if (needsIndexedBytesBackfill) {
+      this.#db.exec("ALTER TABLE sources ADD COLUMN indexed_bytes INTEGER NOT NULL DEFAULT 0");
+    }
+    if (existingSources && !existingSourceColumns.some((column) => column.name === "totals_counted")) {
+      this.#db.exec("ALTER TABLE sources ADD COLUMN totals_counted INTEGER NOT NULL DEFAULT 0");
+    }
+
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         label TEXT NOT NULL,
         chunk_count INTEGER NOT NULL DEFAULT 0,
         code_chunk_count INTEGER NOT NULL DEFAULT 0,
+        indexed_bytes INTEGER NOT NULL DEFAULT 0,
+        totals_counted INTEGER NOT NULL DEFAULT 1,
         indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
         file_path TEXT,
         content_hash TEXT
@@ -503,8 +689,67 @@ export class ContentStore {
         word TEXT PRIMARY KEY
       );
 
+      CREATE TABLE IF NOT EXISTS vocabulary_grams (
+        gram TEXT NOT NULL,
+        word TEXT NOT NULL,
+        PRIMARY KEY (gram, word)
+      );
+
+      CREATE TABLE IF NOT EXISTS store_meta (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS store_owners (
+        owner_id TEXT PRIMARY KEY,
+        pid INTEGER NOT NULL,
+        opened_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS retention_queue (
+        source_id INTEGER PRIMARY KEY
+      );
+
+      CREATE TABLE IF NOT EXISTS store_totals (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        indexed_bytes INTEGER NOT NULL,
+        chunks INTEGER NOT NULL,
+        sources INTEGER NOT NULL
+      );
+      INSERT OR IGNORE INTO store_totals (singleton, indexed_bytes, chunks, sources)
+      VALUES (1, 0, 0, 0);
+
       CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
+      CREATE INDEX IF NOT EXISTS idx_sources_indexed_at_id ON sources(indexed_at, id);
+      CREATE INDEX IF NOT EXISTS idx_vocabulary_grams_word ON vocabulary_grams(word);
     `);
+    this.#db.prepare(`
+      CREATE TRIGGER IF NOT EXISTS sources_totals_insert
+      AFTER INSERT ON sources
+      WHEN NEW.totals_counted = 1
+      BEGIN
+        UPDATE store_totals SET indexed_bytes = indexed_bytes + NEW.indexed_bytes,
+          chunks = chunks + NEW.chunk_count, sources = sources + 1 WHERE singleton = 1;
+      END
+    `).run();
+    this.#db.prepare(`
+      CREATE TRIGGER IF NOT EXISTS sources_totals_delete
+      AFTER DELETE ON sources
+      WHEN OLD.totals_counted = 1
+      BEGIN
+        UPDATE store_totals SET indexed_bytes = MAX(0, indexed_bytes - OLD.indexed_bytes),
+          chunks = MAX(0, chunks - OLD.chunk_count), sources = MAX(0, sources - 1) WHERE singleton = 1;
+      END
+    `).run();
+    this.#db.prepare(`
+      CREATE TRIGGER IF NOT EXISTS sources_totals_update
+      AFTER UPDATE OF indexed_bytes, chunk_count ON sources
+      WHEN OLD.totals_counted = 1 AND NEW.totals_counted = 1
+      BEGIN
+        UPDATE store_totals SET indexed_bytes = MAX(0, indexed_bytes + NEW.indexed_bytes - OLD.indexed_bytes),
+          chunks = MAX(0, chunks + NEW.chunk_count - OLD.chunk_count) WHERE singleton = 1;
+      END
+    `).run();
 
     // FTS5 schema migration: old schema (4 cols) → new schema (8 cols).
     // FTS5 virtual tables do not support ALTER TABLE ADD COLUMN, so we must
@@ -552,15 +797,42 @@ export class ContentStore {
     // Stale detection columns — safe for existing DBs (ALTER is O(1) in SQLite)
     try { this.#db.exec("ALTER TABLE sources ADD COLUMN file_path TEXT"); } catch { /* already exists */ }
     try { this.#db.exec("ALTER TABLE sources ADD COLUMN content_hash TEXT"); } catch { /* already exists */ }
+    try { this.#db.exec("ALTER TABLE sources ADD COLUMN indexed_bytes INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
+    if (needsIndexedBytesBackfill) {
+      const maxRow = this.#db.prepare("SELECT COALESCE(MAX(rowid), 0) AS rowid FROM chunks").get() as { rowid: number };
+      this.#db.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('indexed_bytes_backfill_cursor', 0)").run();
+      this.#db.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('indexed_bytes_backfill_max_rowid', ?)").run(maxRow.rowid);
+      this.#db.prepare("UPDATE sources SET indexed_bytes = 0").run();
+      this.#db.prepare("DELETE FROM vocabulary_grams").run();
+      this.#db.prepare("DELETE FROM vocabulary").run();
+    } else {
+      this.#db.prepare("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('indexed_bytes_backfill_cursor', -1)").run();
+      this.#db.prepare("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('indexed_bytes_backfill_max_rowid', -1)").run();
+    }
+    this.#db.prepare("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('metadata_cursor', 0)").run();
+    if (!existingLabelBytesCursor) {
+      this.#db.prepare(
+        "INSERT INTO store_meta (key, value) VALUES ('label_bytes_backfill_cursor', ?)",
+      ).run(existingSources ? 0 : -1);
+    }
+    this.#db.prepare("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('purge_generation', 0)").run();
+    if (!existingSources) {
+      this.#db.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('totals_backfill_cursor', -1)").run();
+    } else if (!existingTotals) {
+      this.#db.prepare("UPDATE store_totals SET indexed_bytes = 0, chunks = 0, sources = 0 WHERE singleton = 1").run();
+      this.#db.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES ('totals_backfill_cursor', 0)").run();
+    } else {
+      this.#db.prepare("INSERT OR IGNORE INTO store_meta (key, value) VALUES ('totals_backfill_cursor', -1)").run();
+    }
   }
 
   #prepareStatements(): void {
     // Write path
     this.#stmtInsertSourceEmpty = this.#db.prepare(
-      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, 0, 0, ?, ?)",
+      "INSERT INTO sources (label, chunk_count, code_chunk_count, indexed_bytes, file_path, content_hash) VALUES (?, 0, 0, ?, ?, ?)",
     );
     this.#stmtInsertSource = this.#db.prepare(
-      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO sources (label, chunk_count, code_chunk_count, indexed_bytes, file_path, content_hash) VALUES (?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunk = this.#db.prepare(
       "INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -570,6 +842,9 @@ export class ContentStore {
     );
     this.#stmtInsertVocab = this.#db.prepare(
       "INSERT OR IGNORE INTO vocabulary (word) VALUES (?)",
+    );
+    this.#stmtInsertVocabGram = this.#db.prepare(
+      "INSERT OR IGNORE INTO vocabulary_grams (gram, word) VALUES (?, ?)",
     );
 
     // Dedup path: delete previous source with same label before re-indexing
@@ -780,14 +1055,9 @@ export class ContentStore {
       LIMIT ?
     `);
 
-    // Fuzzy path
-    this.#stmtFuzzyVocab = this.#db.prepare(
-      "SELECT word FROM vocabulary WHERE length(word) BETWEEN ? AND ?",
-    );
-
     // Read path
     this.#stmtListSources = this.#db.prepare(
-      "SELECT label, chunk_count as chunkCount FROM sources ORDER BY id DESC",
+      "SELECT label, chunk_count as chunkCount FROM sources ORDER BY id DESC LIMIT 1000",
     );
     this.#stmtChunksBySource = this.#db.prepare(
       `SELECT c.title, c.content, c.content_type, s.label
@@ -800,8 +1070,15 @@ export class ContentStore {
       "SELECT chunk_count FROM sources WHERE id = ?",
     );
     this.#stmtChunkContent = this.#db.prepare(
-      "SELECT content FROM chunks WHERE source_id = ?",
+      "SELECT content FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?",
     );
+    this.#stmtVocabularyContent = this.#db.prepare(`
+      SELECT chunks.content
+      FROM chunks
+      JOIN sources ON sources.id = chunks.source_id
+      ORDER BY sources.id DESC, chunks.rowid
+      LIMIT ?
+    `);
     this.#stmtSourceMeta = this.#db.prepare(
       "SELECT label, chunk_count, code_chunk_count, indexed_at, file_path, content_hash FROM sources WHERE label = ?",
     );
@@ -812,16 +1089,26 @@ export class ContentStore {
         (SELECT COUNT(*) FROM chunks WHERE content_type = 'code') AS codeChunks
     `);
 
-    // Cleanup path — cached to avoid recompiling SQL on each periodic call
-    this.#stmtCleanupChunks = this.#db.prepare(
-      "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
-    );
-    this.#stmtCleanupChunksTrigram = this.#db.prepare(
-      "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
-    );
-    this.#stmtCleanupSources = this.#db.prepare(
-      "DELETE FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days')",
-    );
+    this.#stmtCleanupSource = this.#db.prepare(`
+      SELECT id FROM sources
+      WHERE indexed_at < datetime('now', '-' || ? || ' days')
+      ORDER BY indexed_at, id LIMIT 1
+    `);
+    this.#stmtCleanupChunks = this.#db.prepare(`
+      DELETE FROM chunks WHERE rowid IN (
+        SELECT rowid FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?
+      )
+    `);
+    this.#stmtCleanupChunksTrigram = this.#db.prepare(`
+      DELETE FROM chunks_trigram WHERE rowid IN (
+        SELECT rowid FROM chunks_trigram WHERE source_id = ? ORDER BY rowid LIMIT ?
+      )
+    `);
+    this.#stmtCleanupSourceIfEmpty = this.#db.prepare(`
+      DELETE FROM sources WHERE id = ?
+        AND NOT EXISTS (SELECT 1 FROM chunks WHERE source_id = ? LIMIT 1)
+        AND NOT EXISTS (SELECT 1 FROM chunks_trigram WHERE source_id = ? LIMIT 1)
+    `);
   }
 
   // ── Deny Policy Hook ──
@@ -838,6 +1125,55 @@ export class ContentStore {
 
   // ── Index ──
 
+  #purgeGeneration(): number {
+    const row = this.#db.prepare("SELECT value FROM store_meta WHERE key = 'purge_generation'").get() as { value: number };
+    return row.value;
+  }
+
+  #assertInputSize(content: string): void {
+    if (Buffer.byteLength(content) > MAX_INDEX_INPUT_BYTES) {
+      throw new Error(`Content exceeds the ${MAX_INDEX_INPUT_BYTES}-byte indexing limit`);
+    }
+    let lines = 1;
+    let offset = 0;
+    while ((offset = content.indexOf("\n", offset)) >= 0) {
+      if (++lines > MAX_INDEX_LINES) {
+        throw new Error(`Content exceeds the ${MAX_INDEX_LINES}-line indexing limit`);
+      }
+      offset++;
+    }
+  }
+
+  #assertSourceLabel(label: string): void {
+    if (Buffer.byteLength(label) > MAX_SOURCE_LABEL_BYTES) {
+      throw new Error(`Source label exceeds the ${MAX_SOURCE_LABEL_BYTES}-byte indexing limit`);
+    }
+  }
+
+  #assertJSONTextBounds(content: string): void {
+    let depth = 0;
+    let nodes = 1;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < content.length; index++) {
+      const char = content[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') inString = true;
+      else if (char === "{" || char === "[") {
+        if (++depth > MAX_JSON_DEPTH) throw new Error(`JSON exceeds the ${MAX_JSON_DEPTH}-level indexing limit`);
+        if (++nodes > MAX_JSON_NODES) throw new Error(`JSON exceeds the ${MAX_JSON_NODES}-node indexing limit`);
+      } else if (char === "}" || char === "]") depth--;
+      else if (char === "," || char === ":") {
+        if (++nodes > MAX_JSON_NODES) throw new Error(`JSON exceeds the ${MAX_JSON_NODES}-node indexing limit`);
+      }
+    }
+  }
+
   index(options: {
     content?: string;
     path?: string;
@@ -848,8 +1184,12 @@ export class ContentStore {
      * chunks fall back to empty-string columns (legacy behaviour).
      */
     attribution?: { sessionId?: string; eventId?: string };
+    expectedPurgeGeneration?: number;
   }): IndexResult {
     const { content, path, source, attribution } = options;
+    const expectedPurgeGeneration = options.expectedPurgeGeneration ?? this.#purgeGeneration();
+    const label = source ?? path ?? "untitled";
+    this.#assertSourceLabel(label);
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -872,6 +1212,7 @@ export class ContentStore {
     // or throw inconsistently. See #442 round-3.
     let text: string;
     if (hasContent) {
+      this.#assertInputSize(content!);
       text = content!;
     } else {
       const fd = openSync(path!, "r");
@@ -880,19 +1221,22 @@ export class ContentStore {
         if (!st.isFile()) {
           throw new Error(`refusing to index ${path}: not a regular file`);
         }
+        if (st.size > MAX_INDEX_INPUT_BYTES) {
+          throw new Error(`File exceeds the ${MAX_INDEX_INPUT_BYTES}-byte indexing limit`);
+        }
         text = readFileSync(fd, "utf-8");
+        this.#assertInputSize(text);
       } finally {
         closeSync(fd);
       }
     }
-    const label = source ?? path ?? "untitled";
     const chunks = this.#chunkMarkdown(text);
 
     // Stale detection: store file_path + SHA-256 for file-backed sources
     const filePath = path ?? undefined;
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
-    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+    return this.#insertChunks(chunks, label, text, filePath, contentHash, attribution, expectedPurgeGeneration);
   }
 
   // ── Index Directory (#687) ──
@@ -923,6 +1267,7 @@ export class ContentStore {
     label: string;
   } {
     const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
+    const expectedPurgeGeneration = this.#purgeGeneration();
     const walked = walkDirectoryDetailed(rootPath, walkOpts);
 
     let filesIndexed = 0;
@@ -938,7 +1283,12 @@ export class ContentStore {
       try {
         // Per-file source label so ctx_search(source: "<file>") still works.
         const fileSource = source ? `${source}:${file}` : file;
-        const r = this.index({ path: file, source: fileSource, attribution });
+        const r = this.index({
+          path: file,
+          source: fileSource,
+          attribution,
+          expectedPurgeGeneration,
+        });
         filesIndexed++;
         totalChunks += r.totalChunks;
       } catch {
@@ -972,21 +1322,25 @@ export class ContentStore {
     linesPerChunk: number = 20,
     attribution?: { sessionId?: string; eventId?: string },
     maxChunkBytes: number = MAX_CHUNK_BYTES,
+    expectedPurgeGeneration: number = this.#purgeGeneration(),
   ): IndexResult {
+    this.#assertSourceLabel(source);
+    this.#assertInputSize(content);
     if (!content || content.trim().length === 0) {
-      return this.#insertChunks([], source, "", undefined, undefined, attribution);
+      return this.#insertChunks([], source, "", undefined, undefined, attribution, expectedPurgeGeneration);
     }
 
     const chunks = this.#chunkPlainText(content, linesPerChunk, maxChunkBytes);
 
-    return withRetry(() => this.#insertChunks(
+    return this.#insertChunks(
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
       undefined,
       undefined,
       attribution,
-    ));
+      expectedPurgeGeneration,
+    );
   }
 
   // ── Index JSON ──
@@ -1003,26 +1357,30 @@ export class ContentStore {
     source: string,
     maxChunkBytes: number = MAX_CHUNK_BYTES,
     attribution?: { sessionId?: string; eventId?: string },
+    expectedPurgeGeneration: number = this.#purgeGeneration(),
   ): IndexResult {
+    this.#assertSourceLabel(source);
+    this.#assertInputSize(content);
     if (!content || content.trim().length === 0) {
-      return this.indexPlainText("", source, undefined, attribution, maxChunkBytes);
+      return this.indexPlainText("", source, undefined, attribution, maxChunkBytes, expectedPurgeGeneration);
     }
 
+    this.#assertJSONTextBounds(content);
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
     } catch {
-      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
+      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes, expectedPurgeGeneration);
     }
 
     const chunks: Chunk[] = [];
     this.#walkJSON(parsed, [], chunks, maxChunkBytes);
 
     if (chunks.length === 0) {
-      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
+      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes, expectedPurgeGeneration);
     }
 
-    return withRetry(() => this.#insertChunks(chunks, source, content, undefined, undefined, attribution));
+    return this.#insertChunks(chunks, source, content, undefined, undefined, attribution, expectedPurgeGeneration);
   }
 
   // ── Shared DB Insertion ──
@@ -1035,12 +1393,27 @@ export class ContentStore {
   #insertChunks(
     chunks: Chunk[],
     label: string,
-    text: string,
-    filePath?: string,
-    contentHash?: string,
-    attribution?: { sessionId?: string; eventId?: string },
+    _text: string,
+    filePath: string | undefined,
+    contentHash: string | undefined,
+    attribution: { sessionId?: string; eventId?: string } | undefined,
+    expectedPurgeGeneration: number,
   ): IndexResult {
-    const codeChunks = chunks.filter((c) => c.hasCode).length;
+    this.#assertSourceLabel(label);
+    this.#runMaintenanceBatch(false);
+    const boundedChunks: Chunk[] = [];
+    for (const chunk of chunks) {
+      if (Buffer.byteLength(chunk.content) <= MAX_CHUNK_BYTES) {
+        boundedChunks.push(chunk);
+      } else {
+        for (const part of this.#splitOversizedPlainChunk([chunk.content], chunk.title, MAX_CHUNK_BYTES)) {
+          boundedChunks.push({ ...part, hasCode: chunk.hasCode });
+          if (boundedChunks.length >= this.#limits.maxChunks) break;
+        }
+      }
+      if (boundedChunks.length >= this.#limits.maxChunks) break;
+    }
+    const candidateChunks = boundedChunks.slice(0, this.#limits.maxChunks);
     // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
     // "not-null but unattributed" sentinel used by legacy rows.
     const sessionIdCol = attribution?.sessionId ?? "";
@@ -1050,30 +1423,145 @@ export class ContentStore {
     // then insert new content — all within a single transaction.
     // Prevents stale results in iterative workflows. (See: GitHub issue #67)
     const transaction = this.#db.transaction(() => {
+      const generation = this.#purgeGeneration();
+      if (generation !== expectedPurgeGeneration) {
+        throw new Error("Indexing aborted because the content store was purged during processing");
+      }
+      const migration = this.#db.prepare(`
+        SELECT
+          (SELECT value FROM store_meta WHERE key = 'indexed_bytes_backfill_cursor') AS bytes_cursor,
+          (SELECT value FROM store_meta WHERE key = 'label_bytes_backfill_cursor') AS label_cursor,
+          (SELECT value FROM store_meta WHERE key = 'totals_backfill_cursor') AS totals_cursor
+      `).get() as { bytes_cursor: number; label_cursor: number; totals_cursor: number };
+      if (migration.bytes_cursor >= 0 || migration.label_cursor >= 0 || migration.totals_cursor >= 0) {
+        throw new Error("Indexing deferred until bounded content-store migration completes");
+      }
+      const totals = this.#db.prepare(
+        "SELECT indexed_bytes, chunks, sources FROM store_totals WHERE singleton = 1",
+      ).get() as { indexed_bytes: number; chunks: number; sources: number };
+      const replaced = this.#db.prepare(`
+        SELECT COUNT(*) AS sources, COALESCE(SUM(indexed_bytes), 0) AS indexed_bytes,
+          COALESCE(SUM(chunk_count), 0) AS chunks
+        FROM sources WHERE label = ?
+      `).get(label) as { sources: number; indexed_bytes: number; chunks: number };
+      const replacing = replaced.sources > 0;
+      let retainedChunks: Chunk[] = [];
+      let indexedBytes = Buffer.byteLength(label);
+      for (const chunk of candidateChunks) {
+        const chunkBytes = Buffer.byteLength(chunk.title) + Buffer.byteLength(chunk.content);
+        if (retainedChunks.length >= this.#limits.maxChunks
+          || indexedBytes + chunkBytes > this.#limits.maxIndexedBytes) break;
+        retainedChunks.push(chunk);
+        indexedBytes += chunkBytes;
+      }
+
+      let currentChunks = totals.chunks - replaced.chunks;
+      let currentBytes = totals.indexed_bytes - replaced.indexed_bytes;
+      let currentSources = totals.sources - replaced.sources;
+      let vocabularyChanged = replacing;
+      const capacityExceeded = () => currentChunks + retainedChunks.length > this.#limits.maxChunks
+        || currentBytes + indexedBytes > this.#limits.maxIndexedBytes
+        || currentSources + 1 > this.#limits.maxSources;
+      if (capacityExceeded()) {
+        const oldest = this.#db.prepare(`
+          SELECT id, chunk_count, indexed_bytes FROM sources
+          WHERE label <> ? ORDER BY id LIMIT 1
+        `).get(label) as { id: number; chunk_count: number; indexed_bytes: number } | undefined;
+        if (oldest) {
+          const deleteLimit = Math.min(oldest.chunk_count, this.#limits.maintenanceChunkBatch);
+          const removed = this.#db.prepare(`
+            SELECT COUNT(*) AS chunks,
+              COALESCE(SUM(length(CAST(title AS BLOB)) + length(CAST(content AS BLOB))), 0) AS bytes
+            FROM (SELECT title, content FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?)
+          `).get(oldest.id, deleteLimit) as { chunks: number; bytes: number };
+          this.#db.prepare(`
+            DELETE FROM chunks WHERE rowid IN (
+              SELECT rowid FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?
+            )
+          `).run(oldest.id, deleteLimit);
+          this.#db.prepare(`
+            DELETE FROM chunks_trigram WHERE rowid IN (
+              SELECT rowid FROM chunks_trigram WHERE source_id = ? ORDER BY rowid LIMIT ?
+            )
+          `).run(oldest.id, deleteLimit);
+          currentChunks -= removed.chunks;
+          currentBytes -= removed.bytes;
+          vocabularyChanged ||= removed.chunks > 0;
+          const remainingChunks = oldest.chunk_count - removed.chunks;
+          if (remainingChunks <= 0) {
+            currentBytes -= Math.max(0, oldest.indexed_bytes - removed.bytes);
+            this.#db.prepare("DELETE FROM retention_queue WHERE source_id = ?").run(oldest.id);
+            this.#db.prepare("DELETE FROM sources WHERE id = ?").run(oldest.id);
+            currentSources--;
+          } else {
+            this.#db.prepare(`
+              UPDATE sources SET chunk_count = ?, indexed_bytes = MAX(0, indexed_bytes - ?),
+                code_chunk_count = (SELECT COUNT(*) FROM chunks WHERE source_id = ? AND content_type = 'code')
+              WHERE id = ?
+            `).run(remainingChunks, removed.bytes, oldest.id, oldest.id);
+          }
+        }
+      }
+
+      if (capacityExceeded()) {
+        if (vocabularyChanged) this.#rebuildVocabulary();
+        this.#scheduleRetention();
+        return { deferred: true as const };
+      }
+
+      const availableChunks = Math.max(0, this.#limits.maxChunks - currentChunks);
+      const availableBytes = Math.max(0, this.#limits.maxIndexedBytes - currentBytes);
+      if (retainedChunks.length > availableChunks || indexedBytes > availableBytes) {
+        const admitted: Chunk[] = [];
+        indexedBytes = Buffer.byteLength(label);
+        for (const chunk of retainedChunks) {
+          const chunkBytes = Buffer.byteLength(chunk.title) + Buffer.byteLength(chunk.content);
+          if (admitted.length >= availableChunks || indexedBytes + chunkBytes > availableBytes) break;
+          admitted.push(chunk);
+          indexedBytes += chunkBytes;
+        }
+        retainedChunks = admitted;
+      }
+      const codeChunks = retainedChunks.filter((chunk) => chunk.hasCode).length;
+      this.#db.prepare("DELETE FROM retention_queue WHERE source_id IN (SELECT id FROM sources WHERE label = ?)").run(label);
       this.#stmtDeleteChunksByLabel.run(label);
       this.#stmtDeleteChunksTrigramByLabel.run(label);
       this.#stmtDeleteSourcesByLabel.run(label);
 
-      if (chunks.length === 0) {
-        const info = this.#stmtInsertSourceEmpty.run(label, filePath ?? null, contentHash ?? null);
-        return Number(info.lastInsertRowid);
+      if (retainedChunks.length === 0) {
+        const info = this.#stmtInsertSourceEmpty.run(label, indexedBytes, filePath ?? null, contentHash ?? null);
+        if (vocabularyChanged) this.#rebuildVocabulary();
+        this.#scheduleRetention();
+        return {
+          sourceId: Number(info.lastInsertRowid),
+          totalChunks: 0,
+          codeChunks: 0,
+        };
       }
 
-      const info = this.#stmtInsertSource.run(label, chunks.length, codeChunks, filePath ?? null, contentHash ?? null);
+      const info = this.#stmtInsertSource.run(label, retainedChunks.length, codeChunks, indexedBytes, filePath ?? null, contentHash ?? null);
       const sourceId = Number(info.lastInsertRowid);
 
       const now = new Date().toISOString();
-      for (const chunk of chunks) {
+      for (const chunk of retainedChunks) {
         const ct = chunk.hasCode ? "code" : "prose";
         this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
         this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
       }
 
-      return sourceId;
+      if (vocabularyChanged) this.#rebuildVocabulary();
+      else this.#addVocabulary(retainedChunks);
+      this.#scheduleRetention();
+      return { sourceId, totalChunks: retainedChunks.length, codeChunks };
     });
 
-    const sourceId = transaction();
-    if (text) this.#extractAndStoreVocabulary(text);
+    const result = withRetry(() => transaction(), [10, 50, 200]);
+    this.#fuzzyCache.clear();
+    this.#writesSinceCheckpoint++;
+    this.#checkpointWALIfNeeded();
+    if ("deferred" in result) {
+      throw new Error("Indexing deferred until bounded retention maintenance completes");
+    }
 
     // Periodically optimize FTS5 indexes to merge b-tree segments.
     // Fragmentation accumulates over insert/delete cycles (dedup re-indexes
@@ -1085,10 +1573,10 @@ export class ContentStore {
     }
 
     return {
-      sourceId,
+      sourceId: result.sourceId,
       label,
-      totalChunks: chunks.length,
-      codeChunks,
+      totalChunks: result.totalChunks,
+      codeChunks: result.codeChunks,
     };
   }
 
@@ -1122,6 +1610,54 @@ export class ContentStore {
     return `%${escaped}%`;
   }
 
+  #searchWithSessionFilter(
+    table: "chunks" | "chunks_trigram",
+    sanitized: string,
+    limit: number,
+    allowSet: Set<string>,
+    source?: string,
+    contentType?: "code" | "prose",
+    sourceMatchMode: SourceMatchMode = "like",
+  ): SearchResult[] {
+    const conditions = [
+      `${table} MATCH ?`,
+      `(${table}.session_id = '' OR ${table}.session_id IN (SELECT value FROM json_each(?)))`,
+    ];
+    const params: unknown[] = [sanitized, JSON.stringify([...allowSet])];
+    if (source) {
+      conditions.push(sourceMatchMode === "exact"
+        ? "sources.label = ?"
+        : "sources.label LIKE ? ESCAPE '\\'");
+      params.push(this.#sourceFilterParam(source, sourceMatchMode));
+    }
+    if (contentType) {
+      conditions.push(`${table}.content_type = ?`);
+      params.push(contentType);
+    }
+    params.push(limit);
+    const statement = this.#db.prepare(`
+      SELECT
+        ${table}.title,
+        ${table}.content,
+        ${table}.content_type,
+        ${table}.timestamp,
+        sources.label,
+        bm25(${table}, 5.0, 1.0) AS rank,
+        highlight(${table}, 1, char(2), char(3)) AS highlighted,
+        ${table}.session_id
+      FROM ${table}
+      JOIN sources ON sources.id = ${table}.source_id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY rank
+      LIMIT ?
+    `) as unknown as PreparedStatement;
+    try {
+      return withRetry(() => this.#mapSearchRows(statement.all(...params) as SearchRow[]));
+    } finally {
+      statement.finalize?.();
+    }
+  }
+
   search(
     query: string,
     limit: number = 3,
@@ -1129,8 +1665,14 @@ export class ContentStore {
     mode: "AND" | "OR" = "AND",
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
+    sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
     const sanitized = sanitizeQuery(query, mode);
+    if (sessionIdAllowSet) {
+      return this.#searchWithSessionFilter(
+        "chunks", sanitized, limit, sessionIdAllowSet, source, contentType, sourceMatchMode,
+      );
+    }
 
     let stmt: PreparedStatement;
     let params: unknown[];
@@ -1165,9 +1707,15 @@ export class ContentStore {
     mode: "AND" | "OR" = "AND",
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
+    sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
     const sanitized = sanitizeTrigramQuery(query, mode);
     if (!sanitized) return [];
+    if (sessionIdAllowSet) {
+      return this.#searchWithSessionFilter(
+        "chunks_trigram", sanitized, limit, sessionIdAllowSet, source, contentType, sourceMatchMode,
+      );
+    }
 
     let stmt: PreparedStatement;
     let params: unknown[];
@@ -1195,9 +1743,21 @@ export class ContentStore {
 
   // ── Fuzzy Correction (Layer 3) ──
 
+  #readDataVersion(): number {
+    const raw = this.#db.pragma("data_version") as unknown;
+    if (typeof raw === "number") return raw;
+    const row = (Array.isArray(raw) ? raw[0] : raw) as { data_version?: number } | undefined;
+    return row?.data_version ?? -1;
+  }
+
   fuzzyCorrect(query: string): string | null {
+    const dataVersion = this.#readDataVersion();
+    if (dataVersion !== this.#fuzzyDataVersion) {
+      this.#fuzzyCache.clear();
+      this.#fuzzyDataVersion = dataVersion;
+    }
     const word = query.toLowerCase().trim();
-    if (word.length < 3) return null;
+    if (word.length < 3 || word.length > this.#limits.maxFuzzyWordLength) return null;
 
     // Cache hit: promote to tail (Map preserves insertion order → LRU).
     if (this.#fuzzyCache.has(word)) {
@@ -1209,10 +1769,24 @@ export class ContentStore {
 
     const maxDist = maxEditDistance(word.length);
 
-    const candidates = this.#stmtFuzzyVocab.all(
+    const grams = vocabularyGrams(word);
+    const placeholders = grams.map(() => "?").join(", ");
+    const candidates = this.#db.prepare(`
+      SELECT word
+      FROM vocabulary_grams
+      WHERE gram IN (${placeholders})
+        AND length(word) BETWEEN ? AND ?
+      GROUP BY word
+      ORDER BY COUNT(*) DESC, abs(length(word) - ?), word
+      LIMIT ?
+    `).all(
+      ...grams,
       word.length - maxDist,
       word.length + maxDist,
+      word.length,
+      this.#limits.maxFuzzyCandidates,
     ) as Array<{ word: string }>;
+    this.lastFuzzyCandidateCount = candidates.length;
 
     let bestWord: string | null = null;
     let bestDist = maxDist + 1;
@@ -1250,12 +1824,13 @@ export class ContentStore {
     source?: string,
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
+    sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
     const K = 60; // Standard RRF constant
     const fetchLimit = Math.max(limit * 2, 10);
 
-    const porterResults = this.search(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
-    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType, sourceMatchMode);
+    const porterResults = this.search(query, fetchLimit, source, "OR", contentType, sourceMatchMode, sessionIdAllowSet);
+    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType, sourceMatchMode, sessionIdAllowSet);
 
     const scoreMap = new Map<string, { result: SearchResult; score: number }>();
     const key = (r: SearchResult) => `${r.source}::${r.title}`;
@@ -1348,22 +1923,16 @@ export class ContentStore {
     sourceMatchMode: SourceMatchMode = "like",
     sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
-    // Step 0: Auto-refresh stale file-backed sources before searching
+    // Step 0: Advance bounded storage maintenance, then refresh stale sources.
+    this.#runMaintenanceBatch();
     this.#refreshStaleSources();
 
-    // When a session-id allow-set is in play (issue #737 project filter),
-    // fetch a larger candidate pool from the FTS5 layers so the post-filter
-    // can still deliver `limit` matches even if many candidates are excluded.
-    // The cap is bounded — even at the largest installs the chunk count
-    // dwarfs `limit * 8`, and the surplus is dropped on the post-filter.
-    const fetchLimit = sessionIdAllowSet ? Math.max(limit * 8, 40) : limit;
-    const sessionFilter = this.#makeSessionFilter(sessionIdAllowSet);
-
     // Step 1: RRF fusion (porter OR + trigram OR → merge)
-    const rrfResults = this.#rrfSearch(query, fetchLimit, source, contentType, sourceMatchMode);
-    const rrfFiltered = sessionFilter ? rrfResults.filter(sessionFilter) : rrfResults;
-    if (rrfFiltered.length > 0) {
-      const reranked = this.#applyProximityReranking(rrfFiltered.slice(0, limit), query);
+    const rrfResults = this.#rrfSearch(
+      query, limit, source, contentType, sourceMatchMode, sessionIdAllowSet,
+    );
+    if (rrfResults.length > 0) {
+      const reranked = this.#applyProximityReranking(rrfResults.slice(0, limit), query);
       return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
     }
 
@@ -1374,37 +1943,23 @@ export class ContentStore {
       .toLowerCase()
       .trim()
       .split(/\s+/)
-      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w))
+      .slice(0, this.#limits.maxFuzzyQueryWords);
     const original = words.join(" ");
     const correctedWords = words.map((w) => this.fuzzyCorrect(w) ?? w);
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyResults = this.#rrfSearch(correctedQuery, fetchLimit, source, contentType, sourceMatchMode);
-      const fuzzyFiltered = sessionFilter ? fuzzyResults.filter(sessionFilter) : fuzzyResults;
-      if (fuzzyFiltered.length > 0) {
-        const reranked = this.#applyProximityReranking(fuzzyFiltered.slice(0, limit), correctedQuery);
+      const fuzzyResults = this.#rrfSearch(
+        correctedQuery, limit, source, contentType, sourceMatchMode, sessionIdAllowSet,
+      );
+      if (fuzzyResults.length > 0) {
+        const reranked = this.#applyProximityReranking(fuzzyResults.slice(0, limit), correctedQuery);
         return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
       }
     }
 
     return [];
-  }
-
-  /**
-   * Build the session-id post-filter for the FTS5 candidate pool. Legacy
-   * chunks indexed before per-session attribution carry `session_id=''` and
-   * stay visible across projects so user-indexed content remains reachable
-   * after opting into the shared-DB mode (#737).
-   */
-  #makeSessionFilter(
-    allowSet: Set<string> | undefined,
-  ): ((r: SearchResult) => boolean) | null {
-    if (!allowSet) return null;
-    return (r: SearchResult) => {
-      const sid = r.sessionId ?? "";
-      return sid === "" || allowSet.has(sid);
-    };
   }
 
   /** Number of sources auto-refreshed in the last searchWithFallback call. */
@@ -1417,9 +1972,21 @@ export class ContentStore {
    */
   #refreshStaleSources(): void {
     this.lastRefreshCount = 0;
-    const sources = this.#db.prepare(
-      "SELECT label, file_path, content_hash, indexed_at FROM sources WHERE file_path IS NOT NULL",
-    ).all() as Array<{ label: string; file_path: string; content_hash: string; indexed_at: string }>;
+    const expectedPurgeGeneration = this.#purgeGeneration();
+    const cursor = this.#db.prepare("SELECT value FROM store_meta WHERE key = 'metadata_cursor'").get() as { value: number };
+    const statement = this.#db.prepare(
+      "SELECT id, label, file_path, content_hash, indexed_at FROM sources WHERE file_path IS NOT NULL AND id > ? ORDER BY id LIMIT ?",
+    );
+    let sources = statement.all(cursor.value, this.#limits.maxMetadataChecks) as Array<{
+      id: number; label: string; file_path: string; content_hash: string; indexed_at: string;
+    }>;
+    if (sources.length === 0 && cursor.value > 0) {
+      sources = statement.all(0, this.#limits.maxMetadataChecks) as typeof sources;
+    }
+    if (sources.length > 0) {
+      this.#db.prepare("UPDATE store_meta SET value = ? WHERE key = 'metadata_cursor'").run(sources.at(-1)!.id);
+    }
+    this.lastMetadataCheckCount = sources.length;
 
     for (const src of sources) {
       try {
@@ -1440,8 +2007,9 @@ export class ContentStore {
         let newContent: string;
         try {
           const st = fstatSync(fd);
-          if (!st.isFile()) continue; // skip non-regular targets
+          if (!st.isFile() || st.size > MAX_INDEX_INPUT_BYTES) continue;
           newContent = readFileSync(fd, "utf-8");
+          this.#assertInputSize(newContent);
         } finally {
           closeSync(fd);
         }
@@ -1453,7 +2021,12 @@ export class ContentStore {
         // by going through index() which stores them. Since we pass
         // content, index() does NOT re-read; the bytes hashed above
         // are exactly the bytes indexed.
-        this.index({ content: newContent, path: src.file_path, source: src.label });
+        this.index({
+          content: newContent,
+          path: src.file_path,
+          source: src.label,
+          expectedPurgeGeneration,
+        });
         this.lastRefreshCount++;
       } catch {
         // Graceful degradation — never break search for stale detection
@@ -1527,15 +2100,17 @@ export class ContentStore {
 
     if (!stats || stats.chunk_count < 3) return [];
 
-    const totalChunks = stats.chunk_count;
+    const totalChunks = Math.min(stats.chunk_count, this.#limits.maxDistinctiveChunks);
     const minAppearances = 2;
     const maxAppearances = Math.max(3, Math.ceil(totalChunks * 0.4));
 
     // Stream chunks one at a time to avoid loading all content into memory
     // Count document frequency (how many sections contain each word)
     const docFreq = new Map<string, number>();
+    this.lastDistinctiveChunkCount = 0;
 
-    for (const row of this.#stmtChunkContent.iterate(sourceId) as Iterable<{ content: string }>) {
+    for (const row of this.#stmtChunkContent.iterate(sourceId, this.#limits.maxDistinctiveChunks) as Iterable<{ content: string }>) {
+      this.lastDistinctiveChunkCount++;
       const words = new Set(
         row.content
           .toLowerCase()
@@ -1590,12 +2165,53 @@ export class ContentStore {
    */
   cleanupStaleSources(maxAgeDays: number): number {
     const cleanup = this.#db.transaction((days: number) => {
-      this.#stmtCleanupChunks.run(days);
-      this.#stmtCleanupChunksTrigram.run(days);
-      return this.#stmtCleanupSources.run(days);
+      const migration = this.#db.prepare(`
+        SELECT
+          (SELECT value FROM store_meta WHERE key = 'indexed_bytes_backfill_cursor') AS bytes_cursor,
+          (SELECT value FROM store_meta WHERE key = 'label_bytes_backfill_cursor') AS label_cursor,
+          (SELECT value FROM store_meta WHERE key = 'totals_backfill_cursor') AS totals_cursor
+      `).get() as { bytes_cursor: number; label_cursor: number; totals_cursor: number };
+      if (migration.bytes_cursor >= 0 || migration.label_cursor >= 0 || migration.totals_cursor >= 0) {
+        return { sources: 0, chunks: 0 };
+      }
+      const totals = this.#db.prepare(
+        "SELECT indexed_bytes, chunks, sources FROM store_totals WHERE singleton = 1",
+      ).get() as { indexed_bytes: number; chunks: number; sources: number };
+      if (totals.indexed_bytes > this.#limits.maxIndexedBytes
+        || totals.chunks > this.#limits.maxChunks
+        || totals.sources > this.#limits.maxSources) {
+        return { sources: 0, chunks: 0 };
+      }
+      const stale = this.#stmtCleanupSource.get(days) as { id: number } | undefined;
+      if (!stale) return { sources: 0, chunks: 0 };
+      const removed = this.#db.prepare(`
+        SELECT COUNT(*) AS chunks,
+          COALESCE(SUM(content_type = 'code'), 0) AS code_chunks,
+          COALESCE(SUM(length(CAST(title AS BLOB)) + length(CAST(content AS BLOB))), 0) AS bytes
+        FROM (SELECT title, content, content_type FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?)
+      `).get(stale.id, this.#limits.maintenanceChunkBatch) as { chunks: number; code_chunks: number; bytes: number };
+      const chunks = this.#stmtCleanupChunks.run(stale.id, this.#limits.maintenanceChunkBatch);
+      const trigram = this.#stmtCleanupChunksTrigram.run(stale.id, this.#limits.maintenanceChunkBatch);
+      if (removed.chunks > 0) {
+        this.#db.prepare(`
+          UPDATE sources SET
+            chunk_count = MAX(0, chunk_count - ?),
+            code_chunk_count = MAX(0, code_chunk_count - ?),
+            indexed_bytes = MAX(length(CAST(label AS BLOB)), indexed_bytes - ?)
+          WHERE id = ?
+        `).run(removed.chunks, removed.code_chunks, removed.bytes, stale.id);
+      }
+      const source = this.#stmtCleanupSourceIfEmpty.run(stale.id, stale.id, stale.id);
+      if (source.changes > 0) {
+        this.#db.prepare("DELETE FROM retention_queue WHERE source_id = ?").run(stale.id);
+      }
+      if (chunks.changes > 0 || trigram.changes > 0) this.#rebuildVocabulary();
+      return { sources: source.changes, chunks: Math.max(chunks.changes, trigram.changes) };
     });
-    const info = cleanup(maxAgeDays);
-    return info.changes;
+    const info = withRetry(() => cleanup(maxAgeDays), [10, 50, 200]);
+    if (info.chunks > 0) this.#fuzzyCache.clear();
+    this.#checkpointWALIfNeeded();
+    return info.sources;
   }
 
   /** Get DB file size in bytes. */
@@ -1616,32 +2232,250 @@ export class ContentStore {
   }
 
   close(): void {
-    this.#optimizeFTS(); // defragment before close
-    closeDB(this.#db); // WAL checkpoint before close — important for persistent DBs
+    if (this.#closed) return;
+    this.#closed = true;
+    try { this.#db.prepare("DELETE FROM store_owners WHERE owner_id = ?").run(this.#ownerId); } catch { /* closing damaged store */ }
+    try { this.#db.close(); } catch { /* already closed */ }
+    this.#releaseOwnerFence();
   }
 
   // ── Vocabulary Extraction ──
 
-  #extractAndStoreVocabulary(content: string): void {
-    const words = content
-      .toLowerCase()
-      .split(/[^\p{L}\p{N}_-]+/u)
-      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+  #scheduleRetention(): void {
+    const totals = this.#db.prepare(
+      "SELECT indexed_bytes AS bytes, chunks, sources FROM store_totals WHERE singleton = 1",
+    ).get() as { bytes: number; chunks: number; sources: number };
+    if (totals.bytes <= this.#limits.maxIndexedBytes
+      && totals.chunks <= this.#limits.maxChunks
+      && totals.sources <= this.#limits.maxSources) {
+      this.#db.prepare("DELETE FROM retention_queue").run();
+      return;
+    }
+    this.#db.prepare(`
+      INSERT OR IGNORE INTO retention_queue (source_id)
+      SELECT id FROM sources ORDER BY id LIMIT 1
+    `).run();
+  }
 
-    const unique = [...new Set(words)];
-
-    let inserted = 0;
-    this.#db.transaction(() => {
-      for (const word of unique) {
-        const info = this.#stmtInsertVocab.run(word);
-        inserted += info.changes;
+  #runRetentionChunkBatch(): boolean {
+    const queued = this.#db.prepare("SELECT source_id FROM retention_queue ORDER BY source_id LIMIT 1").get() as { source_id: number } | undefined;
+    if (!queued) return false;
+    const sourceId = queued.source_id;
+    const removed = this.#db.prepare(`
+      SELECT COUNT(*) AS chunks,
+             COALESCE(SUM(content_type = 'code'), 0) AS code_chunks,
+             COALESCE(SUM(length(CAST(title AS BLOB)) + length(CAST(content AS BLOB))), 0) AS bytes
+      FROM (SELECT title, content, content_type FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?)
+    `).get(sourceId, this.#limits.maintenanceChunkBatch) as { chunks: number; code_chunks: number; bytes: number };
+    this.#db.prepare(`
+      DELETE FROM chunks WHERE rowid IN (
+        SELECT rowid FROM chunks WHERE source_id = ? ORDER BY rowid LIMIT ?
+      )
+    `).run(sourceId, this.#limits.maintenanceChunkBatch);
+    this.#db.prepare(`
+      DELETE FROM chunks_trigram WHERE rowid IN (
+        SELECT rowid FROM chunks_trigram WHERE source_id = ? ORDER BY rowid LIMIT ?
+      )
+    `).run(sourceId, this.#limits.maintenanceChunkBatch);
+    this.#db.prepare(`
+      UPDATE sources
+      SET chunk_count = MAX(0, chunk_count - ?),
+          code_chunk_count = MAX(0, code_chunk_count - ?),
+          indexed_bytes = MAX(0, indexed_bytes - ?)
+      WHERE id = ?
+    `).run(removed.chunks, removed.code_chunks, removed.bytes, sourceId);
+    const remaining = this.#db.prepare("SELECT chunk_count FROM sources WHERE id = ?").get(sourceId) as { chunk_count: number } | undefined;
+    if (!remaining || remaining.chunk_count === 0) {
+      this.#db.prepare("DELETE FROM sources WHERE id = ?").run(sourceId);
+      this.#db.prepare("DELETE FROM retention_queue WHERE source_id = ?").run(sourceId);
+      if (removed.chunks > 0) {
+        this.#rebuildVocabulary();
+        this.#fuzzyCache.clear();
       }
-    })();
+    }
+    return true;
+  }
 
-    // Invalidate fuzzy cache when new vocab words actually land. INSERT OR
-    // IGNORE reports changes=0 for duplicates, so re-indexing identical
-    // content does not thrash the cache during iterative workflows.
-    if (inserted > 0) this.#fuzzyCache.clear();
+  #runIndexedBytesBackfillBatch(): boolean {
+    const cursor = this.#db.prepare("SELECT value FROM store_meta WHERE key = 'indexed_bytes_backfill_cursor'").get() as { value: number } | undefined;
+    const maximum = this.#db.prepare("SELECT value FROM store_meta WHERE key = 'indexed_bytes_backfill_max_rowid'").get() as { value: number } | undefined;
+    if (!cursor || cursor.value < 0 || !maximum || maximum.value < 0) {
+      this.lastMaintenanceBackfillRows = 0;
+      return false;
+    }
+    const rows = this.#db.prepare(`
+      SELECT rowid, source_id,
+             length(CAST(title AS BLOB)) + length(CAST(content AS BLOB)) AS bytes,
+             content
+      FROM chunks
+      WHERE rowid > ? AND rowid <= ?
+      ORDER BY rowid
+      LIMIT ?
+    `).all(cursor.value, maximum.value, this.#limits.maintenanceChunkBatch) as Array<{
+      rowid: number; source_id: number; bytes: number; content: string;
+    }>;
+    this.lastMaintenanceBackfillRows = rows.length;
+    if (rows.length === 0) {
+      this.#db.prepare("UPDATE store_meta SET value = -1 WHERE key = 'indexed_bytes_backfill_cursor'").run();
+      return false;
+    }
+    const bytesBySource = new Map<number, number>();
+    for (const row of rows) bytesBySource.set(row.source_id, (bytesBySource.get(row.source_id) ?? 0) + row.bytes);
+    for (const [sourceId, bytes] of bytesBySource) {
+      this.#db.prepare("UPDATE sources SET indexed_bytes = indexed_bytes + ? WHERE id = ?").run(bytes, sourceId);
+    }
+    this.#addVocabulary(rows.map((row) => ({ title: "", content: row.content, hasCode: false })));
+    this.#db.prepare("UPDATE store_meta SET value = ? WHERE key = 'indexed_bytes_backfill_cursor'").run(rows.at(-1)!.rowid);
+    return true;
+  }
+
+  #runLabelBytesBackfillBatch(): boolean {
+    const cursor = this.#db.prepare(
+      "SELECT value FROM store_meta WHERE key = 'label_bytes_backfill_cursor'",
+    ).get() as { value: number };
+    if (cursor.value < 0) return false;
+    const rows = this.#db.prepare(`
+      SELECT id, length(CAST(substr(label, 1, ?) AS BLOB)) AS bytes
+      FROM sources WHERE id > ? ORDER BY id LIMIT ?
+    `).all(MAX_SOURCE_LABEL_BYTES + 1, cursor.value, this.#limits.maintenanceChunkBatch) as Array<{ id: number; bytes: number }>;
+    if (rows.length === 0) {
+      this.#db.prepare(
+        "UPDATE store_meta SET value = -1 WHERE key = 'label_bytes_backfill_cursor'",
+      ).run();
+      return false;
+    }
+    let vocabularyChanged = false;
+    for (const row of rows) {
+      if (row.bytes > MAX_SOURCE_LABEL_BYTES) {
+        this.#db.prepare("DELETE FROM chunks WHERE source_id = ?").run(row.id);
+        this.#db.prepare("DELETE FROM chunks_trigram WHERE source_id = ?").run(row.id);
+        this.#db.prepare("DELETE FROM retention_queue WHERE source_id = ?").run(row.id);
+        this.#db.prepare("DELETE FROM sources WHERE id = ?").run(row.id);
+        vocabularyChanged = true;
+      } else {
+        this.#db.prepare("UPDATE sources SET indexed_bytes = indexed_bytes + ? WHERE id = ?")
+          .run(row.bytes, row.id);
+      }
+    }
+    if (vocabularyChanged) {
+      this.#rebuildVocabulary();
+      this.#fuzzyCache.clear();
+    }
+    this.#db.prepare(
+      "UPDATE store_meta SET value = ? WHERE key = 'label_bytes_backfill_cursor'",
+    ).run(rows.at(-1)!.id);
+    return true;
+  }
+
+  #runTotalsBackfillBatch(): boolean {
+    const cursor = this.#db.prepare("SELECT value FROM store_meta WHERE key = 'totals_backfill_cursor'").get() as { value: number };
+    if (cursor.value < 0) return false;
+    const rows = this.#db.prepare(`
+      SELECT id, indexed_bytes, chunk_count FROM sources
+      WHERE totals_counted = 0 AND id > ? ORDER BY id LIMIT ?
+    `).all(cursor.value, this.#limits.maintenanceChunkBatch) as Array<{
+      id: number; indexed_bytes: number; chunk_count: number;
+    }>;
+    if (rows.length === 0) {
+      this.#db.prepare("UPDATE store_meta SET value = -1 WHERE key = 'totals_backfill_cursor'").run();
+      return false;
+    }
+    let bytes = 0;
+    let chunks = 0;
+    for (const row of rows) {
+      bytes += row.indexed_bytes;
+      chunks += row.chunk_count;
+    }
+    this.#db.prepare(`
+      UPDATE store_totals SET indexed_bytes = indexed_bytes + ?, chunks = chunks + ?, sources = sources + ?
+      WHERE singleton = 1
+    `).run(bytes, chunks, rows.length);
+    const ids = rows.map((row) => row.id);
+    const placeholders = ids.map(() => "?").join(", ");
+    this.#db.prepare(`UPDATE sources SET totals_counted = 1 WHERE id IN (${placeholders})`).run(...ids);
+    this.#db.prepare("UPDATE store_meta SET value = ? WHERE key = 'totals_backfill_cursor'").run(rows.at(-1)!.id);
+    return true;
+  }
+
+  #runMaintenanceBatch(runRetention: boolean = true): void {
+    withRetry(() => this.#db.transaction(() => {
+      const byteMigrationActive = this.#runIndexedBytesBackfillBatch();
+      const labelMigrationActive = byteMigrationActive ? true : this.#runLabelBytesBackfillBatch();
+      if (!labelMigrationActive) this.#runTotalsBackfillBatch();
+      const totalsReady = this.#db.prepare("SELECT value FROM store_meta WHERE key = 'totals_backfill_cursor'").get() as { value: number };
+      if (totalsReady.value < 0 && runRetention) {
+        this.#scheduleRetention();
+        this.#runRetentionChunkBatch();
+      }
+    })(), [10, 50, 200]);
+  }
+
+  #insertVocabularyWord(word: string): number {
+    const info = this.#stmtInsertVocab.run(word);
+    if (info.changes > 0) {
+      for (const gram of vocabularyGrams(word)) this.#stmtInsertVocabGram.run(gram, word);
+    }
+    return info.changes;
+  }
+
+  #addVocabulary(chunks: Chunk[]): void {
+    const count = this.#db.prepare("SELECT COUNT(*) AS count FROM vocabulary").get() as { count: number };
+    let remaining = this.#limits.maxVocabularyTerms - count.count;
+    if (remaining <= 0) return;
+    const words = new Set<string>();
+    for (const chunk of chunks) {
+      for (const word of chunk.content.toLowerCase().split(/[^\p{L}\p{N}_-]+/u)) {
+        if (word.length < 3 || word.length > this.#limits.maxFuzzyWordLength || STOPWORDS.has(word) || words.has(word)) continue;
+        words.add(word);
+        remaining -= this.#insertVocabularyWord(word);
+        if (remaining <= 0) return;
+      }
+    }
+  }
+
+  #rebuildVocabulary(): void {
+    this.vocabularyRebuildCount++;
+    this.#db.prepare("DELETE FROM vocabulary_grams").run();
+    this.#db.prepare("DELETE FROM vocabulary").run();
+    const words = new Set<string>();
+    for (const row of this.#stmtVocabularyContent.iterate(this.#limits.maxChunks) as Iterable<{ content: string }>) {
+      for (const word of row.content.toLowerCase().split(/[^\p{L}\p{N}_-]+/u)) {
+        if (word.length < 3 || word.length > this.#limits.maxFuzzyWordLength || STOPWORDS.has(word)) continue;
+        words.add(word);
+        if (words.size >= this.#limits.maxVocabularyTerms) break;
+      }
+      if (words.size >= this.#limits.maxVocabularyTerms) break;
+    }
+    for (const word of words) this.#insertVocabularyWord(word);
+  }
+
+  #checkpointWALIfNeeded(): void {
+    try {
+      const now = Date.now();
+      if (now < this.#nextCheckpointAt) return;
+      if (this.checkpointCount > 0 && this.#writesSinceCheckpoint < 128) return;
+      const walBytes = statSync(`${this.#dbPath}-wal`).size;
+      if (walBytes < this.#limits.walCheckpointBytes) return;
+      const raw = this.#db.pragma("wal_checkpoint(PASSIVE)") as unknown;
+      const result = (Array.isArray(raw) ? raw[0] : raw) as {
+        busy?: number; log?: number; checkpointed?: number;
+      } | undefined;
+      this.checkpointCount++;
+      this.#writesSinceCheckpoint = 0;
+      const incomplete = (result?.busy ?? 0) > 0
+        || (result?.checkpointed ?? 0) < (result?.log ?? 0);
+      this.#nextCheckpointAt = now + (incomplete ? 5_000 : 1_000);
+    } catch {
+      this.#nextCheckpointAt = Date.now() + 5_000;
+    }
+  }
+
+  getWALSizeBytes(): number {
+    try {
+      return statSync(`${this.#dbPath}-wal`).size;
+    } catch {
+      return 0;
+    }
   }
 
   // ── Chunking ──
@@ -1766,29 +2600,6 @@ export class ContentStore {
   }
 
   /**
-   * Return the largest prefix of `str` whose UTF-8 byte length does not exceed
-   * `maxBytes`, walking by Unicode code point so multibyte sequences (CJK) and
-   * surrogate pairs (emoji) are never cut mid-character. Guarantees forward
-   * progress: if even the first code point exceeds `maxBytes`, it is still
-   * returned whole (a 1-4 byte overshoot beats an infinite loop).
-   */
-  #byteCappedPrefix(str: string, maxBytes: number): string {
-    if (Buffer.byteLength(str) <= maxBytes) return str;
-    let prefix = "";
-    let bytes = 0;
-    for (const char of str) {
-      const charBytes = Buffer.byteLength(char);
-      if (bytes + charBytes > maxBytes) break;
-      prefix += char;
-      bytes += charBytes;
-    }
-    // Defensive: a single code point wider than the cap (only possible with a
-    // pathologically small maxBytes) still advances by one character.
-    if (prefix.length === 0) return [...str][0] ?? "";
-    return prefix;
-  }
-
-  /**
    * Split a single oversized plain-text chunk into byte-capped sub-chunks
    * by accumulating lines until the byte count would exceed maxChunkBytes.
    * Falls back to byte-accurate splitting for extremely long single lines.
@@ -1816,28 +2627,33 @@ export class ContentStore {
       // split it by character before accumulating
       if (Buffer.byteLength(line) > maxChunkBytes) {
         flushAccumulator();
-        // Split the long line into byte-capped pieces
-        let remaining = line;
+        const encodedLine = Buffer.from(line);
+        let byteOffset = 0;
         let linePart = 1;
-        while (remaining.length > 0) {
-          // Byte-accurate slice: never exceeds the cap, never cuts a multibyte
-          // character (CJK) or surrogate pair (emoji) in half.
-          let slice = this.#byteCappedPrefix(remaining, maxChunkBytes);
-          // Try to break at a whitespace boundary near the end for readability,
-          // but only when text remains after this slice.
-          if (slice.length < remaining.length) {
+        while (byteOffset < encodedLine.length) {
+          let byteEnd = Math.min(byteOffset + maxChunkBytes, encodedLine.length);
+          while (byteEnd > byteOffset
+            && byteEnd < encodedLine.length
+            && (encodedLine[byteEnd] & 0xc0) === 0x80) byteEnd--;
+          if (byteEnd === byteOffset) {
+            byteEnd = Math.min(byteOffset + maxChunkBytes, encodedLine.length);
+            while (byteEnd < encodedLine.length && (encodedLine[byteEnd] & 0xc0) === 0x80) byteEnd++;
+          }
+          let slice = encodedLine.subarray(byteOffset, byteEnd).toString("utf8");
+          if (byteEnd < encodedLine.length) {
             const lastSpace = slice.lastIndexOf(" ");
             const lastNewline = slice.lastIndexOf("\n");
             const breakPoint = Math.max(lastSpace, lastNewline);
             if (breakPoint > slice.length * WHITESPACE_BREAK_RATIO) {
               slice = slice.slice(0, breakPoint);
+              byteEnd = byteOffset + Buffer.byteLength(slice);
             }
           }
           const linePartTitle = partIndex === 1 && linePart === 1
             ? titlePrefix
             : `${titlePrefix} (${partIndex}.${linePart})`;
           subChunks.push({ title: linePartTitle, content: slice });
-          remaining = remaining.slice(slice.length);
+          byteOffset = byteEnd;
           linePart++;
           partIndex++;
         }
@@ -1931,27 +2747,29 @@ export class ContentStore {
     chunks: Chunk[],
     maxChunkBytes: number,
   ): void {
-    const title = path.length > 0 ? path.join(" > ") : "(root)";
+    let title = "";
+    for (const segment of path) {
+      const separator = title ? " > " : "";
+      const remaining = CHUNK_TITLE_MAX_CHARS - title.length - separator.length;
+      if (remaining <= 0) break;
+      title += separator + segment.slice(0, remaining);
+    }
+    if (!title) title = "(root)";
+    const isNestedObject = typeof value === "object"
+      && value !== null
+      && !Array.isArray(value)
+      && Object.values(value).some((child) => typeof child === "object" && child !== null);
+    if (isNestedObject) {
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        this.#walkJSON(child, [...path, key], chunks, maxChunkBytes);
+      }
+      return;
+    }
     const serialized = JSON.stringify(value, null, 2);
 
-    // Small enough — emit as a single chunk
     if (Buffer.byteLength(serialized) <= maxChunkBytes) {
-      // Exception: objects with nested structure (object/array values) always
-      // recurse so that key paths become chunk titles for searchability —
-      // even when the subtree fits in one chunk. Flat objects (all primitive
-      // values) stay as a single chunk since there's no hierarchy to expose.
-      const shouldRecurse =
-        typeof value === "object" &&
-        value !== null &&
-        !Array.isArray(value) &&
-        Object.values(value).some(
-          (v) => typeof v === "object" && v !== null,
-        );
-
-      if (!shouldRecurse) {
-        chunks.push({ title, content: serialized, hasCode: true });
-        return;
-      }
+      chunks.push({ title, content: serialized, hasCode: true });
+      return;
     }
 
     // Object — recurse into each key
@@ -2034,6 +2852,8 @@ export class ContentStore {
     const identityField = this.#findIdentityField(arr);
 
     let batch: unknown[] = [];
+    let serializedBatch: string[] = [];
+    let batchBytes = 4;
     let batchStart = 0;
 
     const flushBatch = (batchEnd: number) => {
@@ -2041,24 +2861,27 @@ export class ContentStore {
       const title = this.#jsonBatchTitle(prefix, batchStart, batchEnd, batch, identityField);
       chunks.push({
         title,
-        content: JSON.stringify(batch, null, 2),
+        content: `[\n${serializedBatch.join(",\n")}\n]`,
         hasCode: true,
       });
     };
 
     for (let i = 0; i < arr.length; i++) {
-      batch.push(arr[i]);
-      const candidate = JSON.stringify(batch, null, 2);
-
-      if (Buffer.byteLength(candidate) > maxChunkBytes && batch.length > 1) {
-        batch.pop();
+      const serialized = JSON.stringify(arr[i], null, 2);
+      const serializedBytes = Buffer.byteLength(serialized);
+      const separatorBytes = batch.length > 0 ? 2 : 0;
+      if (batch.length > 0 && batchBytes + separatorBytes + serializedBytes > maxChunkBytes) {
         flushBatch(i - 1);
-        batch = [arr[i]];
+        batch = [];
+        serializedBatch = [];
+        batchBytes = 4;
         batchStart = i;
       }
+      batch.push(arr[i]);
+      serializedBatch.push(serialized);
+      batchBytes += (batch.length > 1 ? 2 : 0) + serializedBytes;
     }
 
-    // Flush remaining
     flushBatch(batchStart + batch.length - 1);
   }
 

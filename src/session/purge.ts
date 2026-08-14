@@ -34,16 +34,15 @@
 
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { loadDatabase } from "../db-base.js";
+import { ContentStore } from "../store.js";
+import { isSQLiteCorruptionError } from "../db-base.js";
+import { acquireContentStoreMigrationFence } from "../content-store-fence.js";
 import {
   getWorktreeSuffix,
   hashProjectDirCanonical,
   hashProjectDirLegacy,
   SessionDB,
 } from "./db.js";
-
-/** Canonical SQLite sidecar suffixes. The empty string is the main DB. */
-const SQLITE_SIDECARS = ["", "-wal", "-shm"] as const;
 
 export interface PurgeOpts {
   /**
@@ -155,17 +154,36 @@ function tryUnlink(p: string, wipedPaths: string[]): boolean {
   }
 }
 
-/**
- * Unlink a SQLite db at `path` plus its `-wal` / `-shm` sidecars.
- * Returns true when the MAIN db file (not a sidecar) was removed.
- */
-function tryUnlinkSqliteTriple(path: string, wipedPaths: string[]): boolean {
-  let mainRemoved = false;
-  for (const suffix of SQLITE_SIDECARS) {
-    const removed = tryUnlink(`${path}${suffix}`, wipedPaths);
-    if (removed && suffix === "") mainRemoved = true;
+function unlinkSqliteTripleOrThrow(dbPath: string, wipedPaths: string[]): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const path = dbPath + suffix;
+    try {
+      unlinkSync(path);
+      wipedPaths.push(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
-  return mainRemoved;
+}
+
+function purgeProjectContentStore(path: string, wipedPaths: string[]): void {
+  try {
+    const store = new ContentStore(path, {}, 50);
+    try {
+      store.purgeAll();
+    } finally {
+      store.close();
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isSQLiteCorruptionError(message)) throw error;
+    const releaseFence = acquireContentStoreMigrationFence(path);
+    try {
+      unlinkSqliteTripleOrThrow(path, wipedPaths);
+    } finally {
+      releaseFence();
+    }
+  }
 }
 
 /**
@@ -210,20 +228,13 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
     for (const h of hashes) {
       const dbPath = join(sessionsDir, `${h}${worktreeSuffix}.db`);
       if (!existsSync(dbPath)) continue;
-      let db: SessionDB | null = null;
+      const db = new SessionDB({ dbPath, timeoutMs: 50 });
       try {
-        db = new SessionDB({ dbPath });
         const before = db.getEvents(sessionId).length;
         db.deleteSession(sessionId);
         if (before > 0) rowsRemoved = true;
-      } catch {
-        // Best-effort — corrupt DB is logged elsewhere; do not block purge.
       } finally {
-        // close() releases the handle WITHOUT deleting the file —
-        // this is what makes the scoped wipe non-destructive at the
-        // file-system level. Using cleanup() here would erase the
-        // entire DB (main + WAL + SHM), defeating per-session scope.
-        try { db?.close(); } catch { /* best effort */ }
+        db.close();
       }
     }
     if (rowsRemoved) deleted.push(`session rows for ${sessionId}`);
@@ -251,22 +262,11 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
     }
     let chunksRemoved = false;
     for (const path of ftsTargets) {
+      const store = new ContentStore(path, {}, 50);
       try {
-        const Database = loadDatabase();
-        const fts = new Database(path, { timeout: 30000 });
-        try {
-          const before = (fts.prepare(
-            "SELECT COUNT(*) AS c FROM chunks WHERE session_id = ?"
-          ).get(sessionId) as { c: number }).c;
-          fts.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
-          fts.prepare("DELETE FROM chunks_trigram WHERE session_id = ?").run(sessionId);
-          if (before > 0) chunksRemoved = true;
-        } finally {
-          try { fts.close(); } catch { /* best effort */ }
-        }
-      } catch {
-        // Best-effort — schema mismatch / corrupt DB / missing FTS5 must not
-        // block the per-session SessionDB wipe that already succeeded.
+        if (store.purgeSession(sessionId) > 0) chunksRemoved = true;
+      } finally {
+        store.close();
       }
     }
     if (chunksRemoved) deleted.push(`FTS5 chunks for ${sessionId}`);
@@ -285,18 +285,20 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
   // Both inputs may be supplied; paths are de-duped via the unlink-or-fail
   // semantics of `tryUnlinkSqliteTriple`. The "knowledge base (FTS5)"
   // label appears at most once.
-  let storeFound = false;
-  if (storePath && tryUnlinkSqliteTriple(storePath, wipedPaths)) storeFound = true;
+  const ftsTargets = new Set<string>();
+  if (storePath && existsSync(storePath)) ftsTargets.add(storePath);
   if (contentDir) {
     const canonicalHash = hashProjectDirCanonical(projectDir);
-    const legacyHash    = hashProjectDirLegacy(projectDir);
-    const storeHashes = canonicalHash === legacyHash
-      ? [canonicalHash]
-      : [canonicalHash, legacyHash];
-    for (const h of storeHashes) {
-      const path = join(contentDir, `${h}.db`);
-      if (tryUnlinkSqliteTriple(path, wipedPaths)) storeFound = true;
+    const legacyHash = hashProjectDirLegacy(projectDir);
+    for (const hash of canonicalHash === legacyHash ? [canonicalHash] : [canonicalHash, legacyHash]) {
+      const path = join(contentDir, `${hash}.db`);
+      if (existsSync(path)) ftsTargets.add(path);
     }
+  }
+  let storeFound = false;
+  for (const path of ftsTargets) {
+    purgeProjectContentStore(path, wipedPaths);
+    storeFound = true;
   }
   if (storeFound) deleted.push("knowledge base (FTS5)");
 
@@ -307,8 +309,9 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
       throw new TypeError("purgeSession: contentHash is required when legacyContentDir is provided");
     }
     const legacyPath = join(legacyContentDir, `${contentHash}.db`);
-    tryUnlinkSqliteTriple(legacyPath, wipedPaths);
-    // No user-facing label — this is a silent legacy cleanup.
+    if (existsSync(legacyPath)) {
+      purgeProjectContentStore(legacyPath, wipedPaths);
+    }
   }
 
   // ── 3. Session-events kinds at BOTH canonical AND legacy hashes. ─────
@@ -327,7 +330,22 @@ export function purgeSession(opts: PurgeOpts): PurgeResult {
   let eventsFound = false;
   for (const h of hashes) {
     const base = join(sessionsDir, `${h}${worktreeSuffix}`);
-    if (tryUnlinkSqliteTriple(`${base}.db`, wipedPaths)) sessDbFound = true;
+    const dbPath = `${base}.db`;
+    if (existsSync(dbPath)) {
+      try {
+        const db = new SessionDB({ dbPath, timeoutMs: 50, recoverCorrupt: false });
+        try {
+          db.deleteAllSessions();
+        } finally {
+          db.close();
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!isSQLiteCorruptionError(message)) throw error;
+        unlinkSqliteTripleOrThrow(dbPath, wipedPaths);
+      }
+      sessDbFound = true;
+    }
     if (tryUnlink(`${base}-events.md`, wipedPaths)) eventsFound = true;
     tryUnlink(`${base}.cleanup`, wipedPaths); // no user-facing label
   }

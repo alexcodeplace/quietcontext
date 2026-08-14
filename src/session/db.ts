@@ -6,15 +6,16 @@
  * the shared package.
  */
 
-import { SQLiteBase, defaultDBPath } from "../db-base.js";
+import { SQLiteBase, defaultDBPath, loadDatabase, withRetry } from "../db-base.js";
 import type { PreparedStatement } from "../db-base.js";
 import type { SessionEvent } from "../types.js";
 import type { ProjectAttribution } from "./project-attribution.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
+import { accessSync, constants, existsSync, linkSync, mkdirSync, realpathSync, renameSync, statfsSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { acquireContentStoreMigrationFence } from "../content-store-fence.js";
 
 // ─────────────────────────────────────────────────────────
 // Storage root resolution
@@ -435,45 +436,126 @@ export function hashProjectDirCanonical(projectDir: string): string {
   return createHash("sha256").update(folded).digest("hex").slice(0, 16);
 }
 
+function contentMigrationKey(legacyPath: string): string {
+  return `canonical_migration_${createHash("sha256").update(legacyPath).digest("hex").slice(0, 16)}`;
+}
+
+function canonicalIncludesMigration(canonicalPath: string, legacyPath: string): boolean {
+  const Database = loadDatabase();
+  const db = new Database(canonicalPath, { readonly: true, timeout: 50 });
+  try {
+    const row = db.prepare("SELECT 1 FROM store_meta WHERE key = ?").get(contentMigrationKey(legacyPath));
+    return Boolean(row);
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
+}
+
+const MAX_CONTENT_STORE_MIGRATION_BYTES = 256 * 1024 * 1024;
+const CONTENT_STORE_MIGRATION_FREE_MARGIN = 16 * 1024 * 1024;
+
+function migrateContentStoreToCanonical(legacyPath: string, canonicalPath: string): void {
+  mkdirSync(dirname(canonicalPath), { recursive: true });
+  const temporaryPath = `${canonicalPath}.migrate-${process.pid}-${Date.now()}`;
+  const Database = loadDatabase();
+  let releaseMigrationFence: () => void = () => {};
+  let db: InstanceType<ReturnType<typeof loadDatabase>> | undefined;
+  try {
+    releaseMigrationFence = acquireContentStoreMigrationFence(legacyPath);
+    db = new Database(legacyPath, { timeout: 50 });
+    db.pragma("busy_timeout = 50");
+    db.pragma("locking_mode = EXCLUSIVE");
+    db.exec("BEGIN EXCLUSIVE");
+    const ownerTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_owners'").get();
+    if (!ownerTable) throw new Error("legacy content store has no ownership metadata");
+    const owners = db.prepare("SELECT owner_id, pid FROM store_owners").all() as Array<{ owner_id: string; pid: number }>;
+    for (const owner of owners) {
+      try { process.kill(owner.pid, 0); }
+      catch { db.prepare("DELETE FROM store_owners WHERE owner_id = ?").run(owner.owner_id); }
+    }
+    const live = db.prepare("SELECT COUNT(*) AS count FROM store_owners").get() as { count: number };
+    if (live.count > 0) throw new Error("legacy content store has live owners");
+    const pageCount = db.prepare("PRAGMA page_count").get() as { page_count: number };
+    const pageSize = db.prepare("PRAGMA page_size").get() as { page_size: number };
+    const snapshotBytes = pageCount.page_count * pageSize.page_size;
+    if (!Number.isSafeInteger(snapshotBytes) || snapshotBytes > MAX_CONTENT_STORE_MIGRATION_BYTES) {
+      throw new Error("legacy content store exceeds the bounded migration size");
+    }
+    const fs = statfsSync(dirname(canonicalPath));
+    const freeBytes = fs.bavail * fs.bsize;
+    if (freeBytes < snapshotBytes + CONTENT_STORE_MIGRATION_FREE_MARGIN) {
+      throw new Error("insufficient free space for content-store migration");
+    }
+    if (existsSync(canonicalPath)) {
+      db.exec("ROLLBACK");
+      return;
+    }
+    db.exec("COMMIT");
+    db.prepare("VACUUM INTO ?").run(temporaryPath);
+    const migrated = new Database(temporaryPath, { timeout: 50 });
+    try {
+      migrated.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, 1)")
+        .run(contentMigrationKey(legacyPath));
+    } finally {
+      migrated.close();
+    }
+    linkSync(temporaryPath, canonicalPath);
+    unlinkSync(temporaryPath);
+  } catch (error) {
+    try { db?.exec("ROLLBACK"); } catch { /* no active transaction */ }
+    try { unlinkSync(temporaryPath); } catch { /* no partial snapshot */ }
+    throw new Error(`Cannot safely migrate content store to ${canonicalPath}`, { cause: error });
+  } finally {
+    db?.close();
+    releaseMigrationFence();
+  }
+}
+
 /**
- * Resolve the per-project FTS5 content store DB path, performing a one-shot
- * migration from a legacy raw-casing filename to the canonical one when only
- * the legacy file (with optional `-wal` / `-shm` SQLite sidecars) exists.
- *
- * Same dual-hash safety contract as {@link resolveSessionDbPath}:
- *   - Linux: canonical hash equals legacy hash → no migration attempted.
- *   - Mac/Win: rename legacy → canonical when canonical missing.
- *   - Both exist: leave legacy alone (data-loss safety). Caller picks
- *     canonical; reconciliation is a manual operation.
- *
- * Differs from `resolveSessionDbPath` in two ways:
- *   1. No worktree suffix — the FTS5 store is per-project, not per-worktree.
- *   2. The `-wal` / `-shm` sidecars travel with the main `.db` during
- *      migration so an active SQLite WAL checkpoint is not stranded behind.
+ * Resolve the per-project FTS5 content store path. Linked worktrees share the
+ * main worktree's canonical database. Existing worktree databases are copied
+ * through SQLite under an exclusive lock before the canonical path is returned.
  */
 export function resolveContentStorePath(opts: {
   projectDir: string;
   contentDir: string;
 }): string {
   const { projectDir, contentDir } = opts;
-  const canonicalHash = hashProjectDirCanonical(projectDir);
+  let contentProjectDir = projectDir;
+  if (existsSync(join(projectDir, ".git"))) {
+    const currentRoot = getCurrentWorktreeRoot(projectDir);
+    if (!currentRoot) throw new Error(`Cannot resolve Git worktree root for ${projectDir}`);
+    const mainRoot = getMainWorktreeRoot(projectDir);
+    if (!mainRoot) throw new Error(`Cannot resolve main Git worktree for ${projectDir}`);
+    contentProjectDir = mainRoot;
+  }
+  const canonicalHash = hashProjectDirCanonical(contentProjectDir);
   const canonicalPath = join(contentDir, `${canonicalHash}.db`);
-  if (existsSync(canonicalPath)) return canonicalPath;
 
-  const legacyHash = hashProjectDirLegacy(projectDir);
-  if (legacyHash === canonicalHash) return canonicalPath; // Linux short-circuit
-
-  const legacyPath = join(contentDir, `${legacyHash}.db`);
-  if (existsSync(legacyPath)) {
-    try {
-      renameSync(legacyPath, canonicalPath);
-      // Travel the SQLite sidecars too so an active WAL is not orphaned.
-      for (const suffix of ["-wal", "-shm"]) {
-        try { renameSync(legacyPath + suffix, canonicalPath + suffix); } catch { /* sidecar may not exist */ }
-      }
-    } catch {
-      // Race or permission issue — caller will create canonicalPath fresh.
+  const migrationCandidates = new Set<string>();
+  if (normalizeWorktreePath(projectDir) !== normalizeWorktreePath(contentProjectDir)) {
+    migrationCandidates.add(join(contentDir, `${hashProjectDirCanonical(projectDir)}.db`));
+    migrationCandidates.add(join(contentDir, `${hashProjectDirLegacy(projectDir)}.db`));
+  }
+  migrationCandidates.add(join(contentDir, `${hashProjectDirLegacy(contentProjectDir)}.db`));
+  migrationCandidates.delete(canonicalPath);
+  const existingCandidates = [...migrationCandidates].filter((path) => existsSync(path));
+  if (existsSync(canonicalPath)) {
+    const divergent = existingCandidates.filter(
+      (path) => !canonicalIncludesMigration(canonicalPath, path),
+    );
+    if (divergent.length > 0) {
+      throw new Error(`Cannot safely converge legacy content stores into existing ${canonicalPath}`);
     }
+    return canonicalPath;
+  }
+  if (existingCandidates.length > 1) {
+    throw new Error(`Cannot safely converge multiple legacy content stores into ${canonicalPath}`);
+  }
+  if (existingCandidates.length === 1) {
+    migrateContentStoreToCanonical(existingCandidates[0], canonicalPath);
   }
   return canonicalPath;
 }
@@ -812,8 +894,8 @@ export class SessionDB extends SQLiteBase {
    */
   private declare stmts: Map<string, PreparedStatement>;
 
-  constructor(opts?: { dbPath?: string }) {
-    super(opts?.dbPath ?? defaultDBPath("session"));
+  constructor(opts?: { dbPath?: string; timeoutMs?: number; recoverCorrupt?: boolean }) {
+    super(opts?.dbPath ?? defaultDBPath("session"), opts?.timeoutMs, opts?.recoverCorrupt);
   }
 
   /** Shorthand to retrieve a cached statement. */
@@ -875,6 +957,12 @@ export class SessionDB extends SQLiteBase {
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         consumed INTEGER NOT NULL DEFAULT 0
       );
+
+      CREATE TABLE IF NOT EXISTS session_store_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        purge_generation INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO session_store_meta (singleton, purge_generation) VALUES (1, 0);
 
       CREATE TABLE IF NOT EXISTS tool_calls (
         session_id TEXT NOT NULL,
@@ -1133,6 +1221,28 @@ export class SessionDB extends SQLiteBase {
        FROM session_events WHERE session_id = ?`);
   }
 
+  private purgeGeneration(): number {
+    const row = this.db.prepare(
+      "SELECT purge_generation FROM session_store_meta WHERE singleton = 1",
+    ).get() as { purge_generation: number };
+    return row.purge_generation;
+  }
+
+  private assertPurgeGeneration(expected: number): void {
+    if (this.purgeGeneration() !== expected) {
+      throw new Error("Session write aborted because the session store was purged during processing");
+    }
+  }
+
+  private guardedWrite(operation: () => void): void {
+    const expected = this.purgeGeneration();
+    const transaction = this.db.transaction(() => {
+      this.assertPurgeGeneration(expected);
+      operation();
+    });
+    this.withRetry(() => transaction());
+  }
+
   // ═══════════════════════════════════════════
   // Events
   // ═══════════════════════════════════════════
@@ -1152,6 +1262,7 @@ export class SessionDB extends SQLiteBase {
     sourceHook: string = "PostToolUse",
     attribution?: Partial<ProjectAttribution>,
     bytes?: EventBytes,
+    expectedPurgeGeneration: number = this.purgeGeneration(),
   ): void {
     // SHA256-based dedup hash (first 16 hex chars = 8 bytes of entropy)
     const dataHash = createHash("sha256")
@@ -1183,6 +1294,7 @@ export class SessionDB extends SQLiteBase {
     // Atomic: dedup check + eviction + insert in a single transaction
     // to prevent race conditions from concurrent hook calls.
     const transaction = this.db.transaction(() => {
+      this.assertPurgeGeneration(expectedPurgeGeneration);
       // Deduplication check: same type + data_hash in last N events
       const dup = this.stmt(S.checkDuplicate).get(sessionId, DEDUP_WINDOW, event.type, dataHash);
       if (dup) return;
@@ -1233,11 +1345,12 @@ export class SessionDB extends SQLiteBase {
     sourceHook: string = "PostToolUse",
     attributions?: Array<Partial<ProjectAttribution> | undefined>,
     bytesList?: Array<EventBytes | undefined>,
+    expectedPurgeGeneration: number = this.purgeGeneration(),
   ): void {
     if (!events || events.length === 0) return;
     if (events.length === 1) {
       // Cheaper to fall through to insertEvent (its own dedicated transaction).
-      this.insertEvent(sessionId, events[0], sourceHook, attributions?.[0], bytesList?.[0]);
+      this.insertEvent(sessionId, events[0], sourceHook, attributions?.[0], bytesList?.[0], expectedPurgeGeneration);
       return;
     }
 
@@ -1282,6 +1395,7 @@ export class SessionDB extends SQLiteBase {
     });
 
     const transaction = this.db.transaction(() => {
+      this.assertPurgeGeneration(expectedPurgeGeneration);
       let cnt = (this.stmt(S.getEventCount).get(sessionId) as { cnt: number }).cnt;
       for (const row of prepared) {
         const dup = this.stmt(S.checkDuplicate).get(
@@ -1482,7 +1596,7 @@ export class SessionDB extends SQLiteBase {
    * `projectDir` is the session origin directory, not per-event attribution.
    */
   ensureSession(sessionId: string, projectDir: string): void {
-    this.stmt(S.ensureSession).run(sessionId, projectDir);
+    this.guardedWrite(() => { this.stmt(S.ensureSession).run(sessionId, projectDir); });
   }
 
   /**
@@ -1543,7 +1657,7 @@ export class SessionDB extends SQLiteBase {
    * Increment the compact_count for a session (tracks snapshot rebuilds).
    */
   incrementCompactCount(sessionId: string): void {
-    this.stmt(S.incrementCompactCount).run(sessionId);
+    this.guardedWrite(() => { this.stmt(S.incrementCompactCount).run(sessionId); });
   }
 
   /**
@@ -1561,7 +1675,7 @@ export class SessionDB extends SQLiteBase {
    * session_meta row does not exist yet (callers ensureSession first).
    */
   setUsageCursor(sessionId: string, uuid: string): void {
-    this.stmt(S.setUsageCursor).run(uuid, sessionId);
+    this.guardedWrite(() => { this.stmt(S.setUsageCursor).run(uuid, sessionId); });
   }
 
   // ═══════════════════════════════════════════
@@ -1572,7 +1686,7 @@ export class SessionDB extends SQLiteBase {
    * Upsert a resume snapshot for a session. Resets consumed flag on update.
    */
   upsertResume(sessionId: string, snapshot: string, eventCount?: number): void {
-    this.stmt(S.upsertResume).run(sessionId, snapshot, eventCount ?? 0);
+    this.guardedWrite(() => { this.stmt(S.upsertResume).run(sessionId, snapshot, eventCount ?? 0); });
   }
 
   /**
@@ -1587,7 +1701,7 @@ export class SessionDB extends SQLiteBase {
    * Mark the resume snapshot as consumed (already injected into conversation).
    */
   markResumeConsumed(sessionId: string): void {
-    this.stmt(S.markResumeConsumed).run(sessionId);
+    this.guardedWrite(() => { this.stmt(S.markResumeConsumed).run(sessionId); });
   }
 
   /**
@@ -1648,7 +1762,7 @@ export class SessionDB extends SQLiteBase {
   incrementToolCall(sessionId: string, tool: string, bytesReturned: number = 0): void {
     const safeBytes = Number.isFinite(bytesReturned) && bytesReturned > 0 ? Math.round(bytesReturned) : 0;
     try {
-      this.stmt(S.incrementToolCall).run(sessionId, tool, safeBytes);
+      this.guardedWrite(() => { this.stmt(S.incrementToolCall).run(sessionId, tool, safeBytes); });
     } catch {
       // best-effort: counter must never throw and break the parent call
     }
@@ -1695,11 +1809,37 @@ export class SessionDB extends SQLiteBase {
    * Delete all data for a session (events, meta, resume).
    */
   deleteSession(sessionId: string): void {
-    this.db.transaction(() => {
+    const remove = this.db.transaction(() => {
+      this.db.prepare("UPDATE session_store_meta SET purge_generation = purge_generation + 1 WHERE singleton = 1").run();
       this.stmt(S.deleteEvents).run(sessionId);
       this.stmt(S.deleteResume).run(sessionId);
+      this.db.prepare("DELETE FROM tool_calls WHERE session_id = ?").run(sessionId);
       this.stmt(S.deleteMeta).run(sessionId);
-    })();
+    });
+    this.db.pragma("busy_timeout = 50");
+    try {
+      withRetry(() => remove(), [10, 25, 50]);
+    } finally {
+      this.db.pragma("busy_timeout = 30000");
+    }
+  }
+
+  deleteAllSessions(): void {
+    const clear = this.db.transaction(() => {
+      this.db.exec(`
+        UPDATE session_store_meta SET purge_generation = purge_generation + 1 WHERE singleton = 1;
+        DELETE FROM session_events;
+        DELETE FROM session_resume;
+        DELETE FROM tool_calls;
+        DELETE FROM session_meta
+      `);
+    });
+    this.db.pragma("busy_timeout = 50");
+    try {
+      withRetry(() => clear(), [10, 25, 50]);
+    } finally {
+      this.db.pragma("busy_timeout = 30000");
+    }
   }
 
   /**

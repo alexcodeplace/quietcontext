@@ -72,7 +72,7 @@ export class FloodGuard {
    * Record one ctx_search call for `key` at time `now` (ms) and return the
    * throttle decision. Pure aside from the internal per-key counter state.
    */
-  record(key: string, now: number = Date.now()): FloodDecision {
+  record(key: string, now: number = Date.now(), units: number = 1): FloodDecision {
     let bucket = this.#buckets.get(key);
 
     if (!bucket || now - bucket.windowStart > this.#cfg.windowMs) {
@@ -81,7 +81,7 @@ export class FloodGuard {
       this.#evictIfNeeded();
     }
 
-    bucket.count++;
+    bucket.count += Math.max(1, Math.floor(units));
 
     return {
       count: bucket.count,

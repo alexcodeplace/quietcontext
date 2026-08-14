@@ -648,6 +648,81 @@ describe("bun:sqlite adapter (#45)", () => {
     db.close();
   });
 
+  test("finalized one-shot statements are not retained until close", async () => {
+    const { BunSQLiteAdapter } = await import("../../src/db-base.js");
+    let finalized = 0;
+    const raw = {
+      prepare: () => ({
+        run: () => undefined,
+        get: () => null,
+        all: () => [],
+        iterate: function* () {},
+        finalize: () => { finalized++; },
+      }),
+      close: () => undefined,
+    };
+    const db = new BunSQLiteAdapter(raw);
+    for (let index = 0; index < 1000; index++) {
+      db.prepare("SELECT 1").finalize();
+    }
+    expect(finalized).toBe(1000);
+    db.close();
+    expect(finalized).toBe(1000);
+  });
+
+  test("real Bun releases dropped transient statement wrappers", () => {
+    const script = `
+      import { Database } from "bun:sqlite";
+      import { BunSQLiteAdapter } from "./src/db-base.ts";
+      const raw = new Database(":memory:");
+      const originalPrepare = raw.prepare.bind(raw);
+      let finalized = 0;
+      raw.prepare = (sql) => {
+        const statement = originalPrepare(sql);
+        const originalFinalize = statement.finalize.bind(statement);
+        statement.finalize = () => { finalized++; return originalFinalize(); };
+        return statement;
+      };
+      const db = new BunSQLiteAdapter(raw);
+      for (let index = 0; index < 10000; index++) db.prepare("SELECT 1").get();
+      for (let attempt = 0; attempt < 20 && finalized === 0; attempt++) {
+        Bun.gc(true);
+        await Bun.sleep(10);
+      }
+      if (finalized === 0) throw new Error("transient statements remained retained");
+      db.close();
+    `;
+    expect(() => execFileSync("bun", ["--eval", script], { cwd: ROOT, stdio: "pipe" })).not.toThrow();
+  });
+
+  test("real Bun iterator retains its statement wrapper while active", () => {
+    const script = `
+      import { Database } from "bun:sqlite";
+      import { BunSQLiteAdapter } from "./src/db-base.ts";
+      const raw = new Database(":memory:");
+      raw.exec("CREATE TABLE t (value INTEGER); INSERT INTO t VALUES (1), (2), (3)");
+      const originalPrepare = raw.prepare.bind(raw);
+      let finalized = 0;
+      raw.prepare = (sql) => {
+        const statement = originalPrepare(sql);
+        const originalFinalize = statement.finalize.bind(statement);
+        statement.finalize = () => { finalized++; return originalFinalize(); };
+        return statement;
+      };
+      const db = new BunSQLiteAdapter(raw);
+      const iterator = db.prepare("SELECT value FROM t ORDER BY value").iterate();
+      for (let attempt = 0; attempt < 20; attempt++) {
+        Bun.gc(true);
+        await Bun.sleep(10);
+      }
+      if (finalized !== 0) throw new Error("active iterator lost its statement wrapper");
+      const values = Array.from(iterator, row => row.value);
+      if (values.join(",") !== "1,2,3") throw new Error("active iterator was corrupted");
+      db.close();
+    `;
+    expect(() => execFileSync("bun", ["--eval", script], { cwd: ROOT, stdio: "pipe" })).not.toThrow();
+  });
+
   test("get: adapter.prepare().get() returns undefined not null for missing row", async () => {
     const { BunSQLiteAdapter } = await import("../../src/db-base.js");
     const fake = await createBunLikeFake();
