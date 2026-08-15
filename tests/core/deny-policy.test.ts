@@ -17,13 +17,15 @@ import { describe, test, expect } from "vitest";
 import { evaluateFilePath } from "../../src/security.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// Moved from src/server.ts to src/server/deny-policy.ts (core-extraction
+// carve lane, 2026-08) — checkFilePathDenyPolicy now lives there.
 const serverSrc = readFileSync(
-  resolve(__dirname, "../../src/server.ts"),
+  resolve(__dirname, "../../src/server/deny-policy.ts"),
   "utf-8",
 );
 
 describe("checkFilePathDenyPolicy: project-dir resolution", () => {
-  test("function exists in server.ts", () => {
+  test("function exists in src/server/deny-policy.ts", () => {
     expect(serverSrc).toContain("function checkFilePathDenyPolicy");
   });
 

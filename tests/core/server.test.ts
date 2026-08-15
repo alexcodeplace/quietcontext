@@ -1729,12 +1729,17 @@ describe("ctx_insight: execFile migration source guard (#441)", () => {
 
   test("server.ts defines structured helpers (openBrowserSync, killProcessOnPort)", () => {
     // The helpers must be the ones that return BrowserOpenResult / KillResult
-    // so the ctx_insight handler can surface failures. They live inline in
-    // server.ts (PR #452 folded the prior src/process-utils.ts back in).
-    expect(serverSrc).toMatch(/export function openBrowserSync\b/);
-    expect(serverSrc).toMatch(/export function killProcessOnPort\b/);
-    expect(serverSrc).toMatch(/export type BrowserOpenResult\b/);
-    expect(serverSrc).toMatch(/export type KillResult\b/);
+    // so the ctx_insight handler can surface failures. Moved from inline in
+    // server.ts to src/server/legacy-insight.ts (core-extraction carve lane,
+    // 2026-08) — server.ts re-exports them so the import path is unchanged.
+    const legacyInsightSrc = readFileSync(
+      resolve(__dirname, "../../src/server/legacy-insight.ts"),
+      "utf-8",
+    );
+    expect(legacyInsightSrc).toMatch(/export function openBrowserSync\b/);
+    expect(legacyInsightSrc).toMatch(/export function killProcessOnPort\b/);
+    expect(legacyInsightSrc).toMatch(/export type BrowserOpenResult\b/);
+    expect(legacyInsightSrc).toMatch(/export type KillResult\b/);
   });
 
   test("port schema is bounded to a valid TCP port range", () => {
