@@ -30,6 +30,7 @@ import {
   VERSION,
   installStrictClientSchemaCompat,
   resolveSessionIdFromSessionDB,
+  setDaemonMode,
   withProjectDirOverride,
 } from "./server.js";
 export { releaseProcessResources } from "./server.js";
@@ -175,6 +176,10 @@ export async function startHttpDaemon(opts: HttpDaemonOptions = {}): Promise<Htt
   const host = opts.host ?? "127.0.0.1";
   const port = opts.port ?? DEFAULT_DAEMON_PORT;
   const token = ensureDaemonToken(opts.tokenFile);
+  // Item 3 — this process serves many roots for its whole (long) lifetime,
+  // unlike the stdio child (one root, one session). Only here does idle-store
+  // eviction make sense.
+  setDaemonMode(true);
 
   const httpServer = createServer(async (req, res) => {
     try {
@@ -244,6 +249,7 @@ export async function startHttpDaemon(opts: HttpDaemonOptions = {}): Promise<Htt
     port: boundPort,
     close: () =>
       new Promise<void>((resolvePromise, reject) => {
+        setDaemonMode(false);
         httpServer.close((err) => (err ? reject(err) : resolvePromise()));
       }),
   };

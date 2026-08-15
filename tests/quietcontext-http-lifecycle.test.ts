@@ -129,4 +129,74 @@ describe("quietcontext HTTP daemon store lifecycle", () => {
     },
     30_000,
   );
+
+  test(
+    "idle-store eviction closes without unlinking, and a later touch reopens the same store transparently",
+    async () => {
+      const scratch = mkdtempSync(join(tmpdir(), "qc-http-evict-"));
+      const runtimeDir = mkdtempSync(join(tmpdir(), "qc-http-evict-runtime-"));
+      cleanupTargets.push(scratch, runtimeDir);
+
+      const rootA = join(scratch, "project-a");
+      mkdirSync(rootA, { recursive: true });
+      const tokenFile = join(scratch, "daemon.token");
+
+      const { daemon, port } = await startDaemon({
+        QUIET_CONTEXT_DAEMON_PORT: "0",
+        QUIET_CONTEXT_DAEMON_TOKEN_FILE: tokenFile,
+        QUIET_CONTEXT_DIR: join(scratch, "data"),
+        TMPDIR: runtimeDir,
+        TEMP: runtimeDir,
+        TMP: runtimeDir,
+        // Fast sweep so the test doesn't wait out real 30-minute windows.
+        QUIET_CONTEXT_STORE_IDLE_EVICT_MS: "150",
+        QUIET_CONTEXT_STORE_EVICT_SWEEP_MS: "50",
+      });
+      const token = readFileSync(tokenFile, "utf8").trim();
+
+      try {
+        await callTool(port, token, rootA, "index", {
+          source: "evict-probe",
+          content: "the eviction survivor marker is quetzal-hologram-7734",
+        });
+
+        const ownedDbFiles = () => readdirSync(runtimeDir).filter((f) => f.endsWith(".db"));
+        expect(ownedDbFiles()).toHaveLength(1);
+
+        // Sit idle for several sweep cycles beyond the idle threshold —
+        // the store MUST be closed (not unlinked) by the time this returns.
+        await new Promise((r) => setTimeout(r, 500));
+        expect(ownedDbFiles()).toHaveLength(1); // close-only: file survives eviction
+
+        // Touch again: getStore() must reopen the SAME file and find the
+        // content indexed before eviction, not start from an empty store.
+        const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${token}`,
+            "x-quietcontext-root": rootA,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: nextId++,
+            method: "tools/call",
+            params: { name: "search", arguments: { queries: ["quetzal-hologram"], preview: true } },
+          }),
+        });
+        const text = await res.text();
+        const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
+        const body = JSON.parse(dataLine ? dataLine.slice(6) : text);
+        const resultText = (body?.result?.content ?? [])
+          .map((c: { text?: string }) => c.text ?? "")
+          .join("\n");
+        expect(resultText).toContain("quetzal-hologram-7734");
+      } finally {
+        daemon.kill("SIGTERM");
+        await waitForExit(daemon, 10_000);
+      }
+    },
+    30_000,
+  );
 });

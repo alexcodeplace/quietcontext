@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, createProcessStorePath, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -66,7 +66,7 @@ import { getHookScriptPaths } from "./util/hook-config.js";
 import { stripJsonComments } from "./util/jsonc.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
-import { loadDatabase } from "./db-base.js";
+import { loadDatabase, deleteDBFiles } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 export const VERSION: string = (() => {
@@ -496,6 +496,10 @@ function wrapToolHandler(
     // shuts the server down mid-execution during a long ctx_execute/batch that
     // emits no further inbound messages. Symmetric end in finally (success+error).
     noteRequestStart();
+    // Item 3 — claim this root for the duration of the call so the idle-store
+    // eviction sweep (daemon mode only) can never close a store mid-request.
+    const inFlightRoot = getProjectDir();
+    _rootInFlight.set(inFlightRoot, (_rootInFlight.get(inFlightRoot) ?? 0) + 1);
     try {
       return shortenToolResult(await handler(toolArgs));
     } catch (err) {
@@ -511,6 +515,9 @@ function wrapToolHandler(
       throw err;
     } finally {
       noteRequestEnd();
+      const remaining = (_rootInFlight.get(inFlightRoot) ?? 1) - 1;
+      if (remaining <= 0) _rootInFlight.delete(inFlightRoot);
+      else _rootInFlight.set(inFlightRoot, remaining);
     }
   };
 }
@@ -660,7 +667,69 @@ process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best ef
 // Lazy per-working-root stores — no DB overhead unless index/search is used.
 // Keyed by the resolved project dir: a shared HTTP daemon serves many
 // concurrent roots; the stdio child resolves one root, so it keeps one entry.
-const _stores = new Map<string, ContentStore>();
+//
+// Item 3 (idle-store eviction, daemon mode only): `store` goes null while
+// `dbPath`/`lastTouchedAt` survive eviction so a later touch can reopen the
+// SAME ephemeral file instead of losing everything indexed so far.
+interface StoreEntry {
+  store: ContentStore | null;
+  dbPath: string;
+  lastTouchedAt: number;
+}
+const _storeEntries = new Map<string, StoreEntry>();
+
+// Per-root in-flight request refcount — separate from _storeEntries because
+// a request can be in flight against a root BEFORE that root's store is
+// ever created (most tool calls never touch getStore() at all). Gates
+// eviction: a root mid-request is never closed out from under it. Bracketed
+// in wrapToolHandler() around every tool call, daemon or stdio alike (the
+// stdio child just never reads it, since it never enables the sweep).
+const _rootInFlight = new Map<string, number>();
+
+// Env-overridable (same convention as QUIET_CONTEXT_DAEMON_PORT /
+// QUIET_CONTEXT_DAEMON_TOKEN_FILE) so integration tests can run the sweep
+// on a millisecond cadence instead of waiting out real 30-minute windows.
+const STORE_IDLE_EVICT_MS = Number(process.env.QUIET_CONTEXT_STORE_IDLE_EVICT_MS) || 30 * 60 * 1000;
+const STORE_EVICT_SWEEP_INTERVAL_MS = Number(process.env.QUIET_CONTEXT_STORE_EVICT_SWEEP_MS) || 5 * 60 * 1000;
+let _storeEvictionTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Enable idle-store eviction. The stdio child MUST NEVER call this — it
+ * resolves exactly one root for its whole process lifetime, so "idle" has
+ * no meaning there and eviction would only add a race for zero benefit.
+ * Only the shared HTTP daemon (many roots, long-lived process) calls it.
+ */
+export function setDaemonMode(active: boolean): void {
+  if (active) startStoreEvictionSweep();
+  else stopStoreEvictionSweep();
+}
+
+function startStoreEvictionSweep(): void {
+  if (_storeEvictionTimer) return;
+  _storeEvictionTimer = setInterval(sweepIdleStores, STORE_EVICT_SWEEP_INTERVAL_MS);
+  // unref: the sweep must never keep the process alive on its own.
+  _storeEvictionTimer.unref?.();
+}
+
+function stopStoreEvictionSweep(): void {
+  if (!_storeEvictionTimer) return;
+  clearInterval(_storeEvictionTimer);
+  _storeEvictionTimer = null;
+}
+
+function sweepIdleStores(): void {
+  const now = Date.now();
+  for (const [root, entry] of _storeEntries.entries()) {
+    if (!entry.store) continue; // already evicted
+    if ((_rootInFlight.get(root) ?? 0) > 0) continue; // in-flight request owns it — never race a close
+    if (now - entry.lastTouchedAt < STORE_IDLE_EVICT_MS) continue;
+    // Close only — never unlink. Files are the only thing a later reopen()
+    // has to recover from; unlinking here would be silent data loss on the
+    // next touch (see configureStore()/getStore() reopen path).
+    try { entry.store.close(); } catch { /* best-effort */ }
+    entry.store = null;
+  }
+}
 
 /**
  * Build the FK-attribution object passed to every ContentStore.index*() call
@@ -908,48 +977,70 @@ function getStorePath(): string {
   return resolveContentStorePath({ projectDir: getProjectDir(), contentDir: dir });
 }
 
+function configureStore(_store: ContentStore): void {
+  // Wire deny-policy hook: store re-checks the Read deny list before
+  // re-reading any file_path during auto-refresh. Catches policy edits
+  // made after a file was originally indexed. See #442 round-3.
+  _store.setDenyChecker((filePath: string) => {
+    try {
+      const projectDir = getProjectDir();
+      const denyGlobs = readToolDenyPatterns("Read", projectDir);
+      const r = evaluateFilePath(
+        filePath,
+        denyGlobs,
+        process.platform === "win32",
+        projectDir,
+      );
+      return r.denied;
+    } catch {
+      // Fail-closed for refresh: skip on error rather than re-read.
+      return true;
+    }
+  });
+
+  try {
+    _store.cleanupStaleSources(14);
+  } catch { /* best-effort */ }
+}
+
 function getStore(): ContentStore {
   const storeRoot = getProjectDir();
-  const existing = _stores.get(storeRoot);
-  if (existing) return existing;
-  {
-    const _store = new ContentStore();
-    _stores.set(storeRoot, _store);
-
-    // Wire deny-policy hook: store re-checks the Read deny list before
-    // re-reading any file_path during auto-refresh. Catches policy edits
-    // made after a file was originally indexed. See #442 round-3.
-    _store.setDenyChecker((filePath: string) => {
-      try {
-        const projectDir = getProjectDir();
-        const denyGlobs = readToolDenyPatterns("Read", projectDir);
-        const r = evaluateFilePath(
-          filePath,
-          denyGlobs,
-          process.platform === "win32",
-          projectDir,
-        );
-        return r.denied;
-      } catch {
-        // Fail-closed for refresh: skip on error rather than re-read.
-        return true;
-      }
-    });
-
-    try {
-      _store.cleanupStaleSources(14);
-    } catch { /* best-effort */ }
-    return _store;
+  const existing = _storeEntries.get(storeRoot);
+  if (existing) {
+    existing.lastTouchedAt = Date.now();
+    if (existing.store) return existing.store;
+    // Reopen: item 3 evicted this store (closed, files left on disk) —
+    // the SAME dbPath must be reused or the reopened store starts empty.
+    const reopened = new ContentStore(existing.dbPath);
+    configureStore(reopened);
+    existing.store = reopened;
+    return reopened;
   }
+
+  // dbPath is server-owned (not ContentStore's internal default) so item 3
+  // can close the handle on idle eviction and reopen the SAME file later —
+  // ContentStore's own no-arg default picks a fresh random path every call.
+  const dbPath = createProcessStorePath();
+  const _store = new ContentStore(dbPath);
+  configureStore(_store);
+  _storeEntries.set(storeRoot, { store: _store, dbPath, lastTouchedAt: Date.now() });
+  return _store;
 }
 
 /** Shared shutdown path for the stdio child and the HTTP daemon. */
 export function releaseProcessResources(): void {
   executor.cleanupBackgrounded();
-  for (const store of _stores.values()) {
-    try { store.cleanup(); } catch { /* best effort */ }
+  stopStoreEvictionSweep();
+  for (const entry of _storeEntries.values()) {
+    if (entry.store) {
+      try { entry.store.cleanup(); } catch { /* best effort */ }
+    } else {
+      // Already evicted (closed, not unlinked) — the process is exiting
+      // for real now, so the ephemeral files can finally go.
+      try { deleteDBFiles(entry.dbPath); } catch { /* best effort */ }
+    }
   }
-  _stores.clear();
+  _storeEntries.clear();
   try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
   try { flushAllBurstState(); } catch { /* best effort */ }
 }
@@ -4321,10 +4412,16 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
     {
       const purgeRoot = getProjectDir();
-      const purgeStore = _stores.get(purgeRoot);
-      if (purgeStore) {
-        try { purgeStore.cleanup(); } catch { /* best effort */ }
-        _stores.delete(purgeRoot);
+      const purgeEntry = _storeEntries.get(purgeRoot);
+      if (purgeEntry) {
+        // Explicit user wipe — unlike idle eviction this MUST delete the
+        // files (cleanup(), not close()); purgeSession below expects them gone.
+        if (purgeEntry.store) {
+          try { purgeEntry.store.cleanup(); } catch { /* best effort */ }
+        } else {
+          try { deleteDBFiles(purgeEntry.dbPath); } catch { /* best effort */ }
+        }
+        _storeEntries.delete(purgeRoot);
       }
     }
 
