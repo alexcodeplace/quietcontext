@@ -44,6 +44,17 @@ Small on purpose: six tools, and the surface is pinned by contract tests (29 con
 
 Public names above are canonical. Do not use inherited `ctx_*` names.
 
+## Token budgets
+
+- MCP `tools/list`: ≤4 KiB serialized.
+- `execute` and `exec-file`: never echo submitted code; programs ≥256 bytes return reusable `[s:<ref>]` handles.
+- Direct execution output: ≤8 KiB; larger output is indexed and returned as a pointer.
+- `search`: titles + `[r:<id>]` references by default; `preview: true` adds ≤600 characters per unique result.
+- `batch`: ≤12 KiB total.
+- `fetch-index`: no content preview by default.
+- `execute`, `exec-file`, `search`, and `batch` accept `max_bytes` below hard caps.
+- Script references are process-local; search references support exact follow-up retrieval.
+
 ## Known limitations
 
 - Per-session usage stats aggregate daemon-wide (the daemon has no per-session identity).
