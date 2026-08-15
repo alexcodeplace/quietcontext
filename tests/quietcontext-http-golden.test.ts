@@ -111,6 +111,15 @@ beforeAll(async () => {
     QUIET_CONTEXT_DIR: join(scratch, "data"),
   });
   token = readFileSync(tokenFile, "utf8").trim();
+
+  // Warm-up: every test below calls rootA in quick succession, which the
+  // burst-feedback feature (item 2) sees as one continuous burst against
+  // rootA. The ONE hint a burst gets is edge-triggered on its 2nd call —
+  // fire that edge here, against throwaway calls, so it lands before any
+  // golden exact-output assertion runs instead of nondeterministically on
+  // whichever test happens to be second in file/runtime order.
+  await callTool("execute", { language: "javascript", code: "1" });
+  await callTool("execute", { language: "javascript", code: "1" });
 }, 30_000);
 
 afterAll(async () => {

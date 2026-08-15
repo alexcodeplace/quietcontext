@@ -49,9 +49,11 @@ import {
 } from "./session/db.js";
 import { purgeSession } from "./session/purge.js";
 import {
+  emitBurstEvent,
   emitCacheHitEvent,
   emitIndexWriteEvent,
   emitSandboxExecuteEvent,
+  emitToolLedgerEvent,
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { appendRetrievalBytes } from "./session/retrieval-marker.js";
@@ -879,6 +881,16 @@ function getSessionDbPath(): string {
 }
 
 /**
+ * Resolve a SessionDB path for an explicit `root`, independent of the
+ * current AsyncLocalStorage override. Used by the burst-feedback flush
+ * (item 2), which must be able to flush a root other than the one
+ * attached to the currently-in-flight request (e.g. at process shutdown).
+ */
+function resolveDbPathForRoot(root: string): string {
+  return resolveSessionDbPath({ projectDir: root, sessionsDir: getSessionDir() });
+}
+
+/**
  * Compute a per-project, per-platform persistent path for the ContentStore.
  * Derives content dir from the adapter's session dir so each platform
  * has its own isolated FTS5 DB — no cross-platform data sharing.
@@ -939,6 +951,7 @@ export function releaseProcessResources(): void {
   }
   _stores.clear();
   try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
+  try { flushAllBurstState(); } catch { /* best effort */ }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1015,7 +1028,115 @@ function healCacheMidSession(): void {
   } catch { /* best effort */ }
 }
 
-export function trackResponse(toolName: string, response: ToolResult): ToolResult {
+// ─────────────────────────────────────────────────────────
+// Honest savings ledger (item 1) — maps the MCP tool name to the short
+// ledger name and the host's own truncation baseline: a raw payload over
+// 32KB is something the host would have shown as a ~2KB preview anyway,
+// so counting the full raw size as "avoided" overstates savings. Cap it.
+// ─────────────────────────────────────────────────────────
+const LEDGER_TOOL_NAMES: Record<string, string> = {
+  ctx_execute: "execute",
+  ctx_execute_file: "exec-file",
+  ctx_batch_execute: "batch",
+  ctx_search: "search",
+};
+const HOST_TRUNCATION_RAW_THRESHOLD = 32 * 1024;
+const HOST_TRUNCATION_PREVIEW_BYTES = 2 * 1024;
+
+function cappedCounterfactualBytes(rawBytes: number): number {
+  return rawBytes > HOST_TRUNCATION_RAW_THRESHOLD ? HOST_TRUNCATION_PREVIEW_BYTES : rawBytes;
+}
+
+// ─────────────────────────────────────────────────────────
+// Burst feedback (item 2) — per-working-root state for the shared HTTP
+// daemon (many roots, one process). A 2nd+ call to the SAME root within
+// BURST_GAP_MS is a burst; the edge (1st→2nd call) gets one hint appended
+// to that call's result, capped at BURST_HINT_MAX hints per idle window.
+// Approximation the daemon cannot avoid: it has no visibility into host-side
+// context compaction, so "idle window" only ever means wall-clock idle on
+// this root, not "new conversation".
+// ─────────────────────────────────────────────────────────
+interface BurstState {
+  lastCallAt: number;
+  inBurst: boolean;
+  burstCallCount: number;
+  burstStartAt: number;
+  hintsGivenInWindow: number;
+}
+const _burstState = new Map<string, BurstState>();
+const BURST_GAP_MS = 10_000;
+const BURST_HINT_MAX = 3;
+const BURST_IDLE_RESET_MS = 10 * 60 * 1000;
+const BURST_HINT_TEXT =
+  "\n\n[each extra call re-bills this entire conversation at cache-read prices — " +
+  "combine known-upfront queries into one batch; adaptive chains are fine.]";
+
+function flushBurst(root: string, state: BurstState): void {
+  if (state.burstCallCount < 2) return; // a lone call is not a burst
+  const secondsSpan = Math.max(0, (state.lastCallAt - state.burstStartAt) / 1000);
+  setImmediate(() =>
+    emitBurstEvent({
+      sessionDbPath: resolveDbPathForRoot(root),
+      workingRoot: root,
+      callsInBurst: state.burstCallCount,
+      secondsSpan,
+    })
+  );
+}
+
+/** Advance the burst state machine for `root` and return a hint line to append, if any. */
+function noteBurstAndMaybeHint(root: string): string | undefined {
+  const now = Date.now();
+  const prev = _burstState.get(root);
+  if (!prev) {
+    _burstState.set(root, { lastCallAt: now, inBurst: false, burstCallCount: 1, burstStartAt: now, hintsGivenInWindow: 0 });
+    return undefined;
+  }
+
+  const gap = now - prev.lastCallAt;
+
+  if (gap > BURST_IDLE_RESET_MS) {
+    flushBurst(root, prev);
+    prev.hintsGivenInWindow = 0;
+    prev.inBurst = false;
+    prev.burstCallCount = 1;
+    prev.burstStartAt = now;
+    prev.lastCallAt = now;
+    return undefined;
+  }
+
+  let hint: string | undefined;
+  if (gap <= BURST_GAP_MS) {
+    if (!prev.inBurst) {
+      prev.inBurst = true;
+      prev.burstCallCount = 2;
+      if (prev.hintsGivenInWindow < BURST_HINT_MAX) {
+        hint = BURST_HINT_TEXT;
+        prev.hintsGivenInWindow += 1;
+      }
+    } else {
+      prev.burstCallCount += 1;
+    }
+  } else {
+    flushBurst(root, prev);
+    prev.inBurst = false;
+    prev.burstCallCount = 1;
+    prev.burstStartAt = now;
+  }
+
+  prev.lastCallAt = now;
+  return hint;
+}
+
+/** Flush every still-open burst window. Called at shutdown — see releaseProcessResources(). */
+function flushAllBurstState(): void {
+  for (const [root, state] of _burstState.entries()) {
+    flushBurst(root, state);
+  }
+  _burstState.clear();
+}
+
+export function trackResponse(toolName: string, response: ToolResult, rawBytesOverride?: number): ToolResult {
   // #854: a response is activity too — refresh the bridge-child idle clock so a
   // chatty/streaming call keeps its server alive even between inbound frames.
   noteMcpActivity();
@@ -1068,6 +1189,38 @@ export function trackResponse(toolName: string, response: ToolResult): ToolResul
   // bytes_retrieved event. Off the hot path; never throws.
   if (toolName === "ctx_search" || toolName === "ctx_fetch_and_index") {
     setImmediate(() => appendRetrievalBytes(getSessionDbPath(), bytes));
+  }
+
+  // Item 1 — honest savings ledger for the four high-volume, previously
+  // uninstrumented tools. `rawBytesOverride` is the pre-truncation byte
+  // count at each call site; callers that omit it are sites where nothing
+  // was truncated before `response` was built, so raw == returned.
+  const ledgerTool = LEDGER_TOOL_NAMES[toolName];
+  if (ledgerTool) {
+    const rawBytes = rawBytesOverride ?? bytes;
+    const counterfactualBytes = cappedCounterfactualBytes(rawBytes);
+    const workingRoot = getProjectDir();
+    setImmediate(() =>
+      emitToolLedgerEvent({
+        sessionDbPath: getSessionDbPath(),
+        tool: ledgerTool,
+        workingRoot,
+        bytesReturned: bytes,
+        counterfactualBytes,
+      })
+    );
+  }
+
+  // Item 2 — burst feedback. Root-scoped across every tool (not just the
+  // ledger four) since a burst is about call cadence against one working
+  // root, not any single tool's byte accounting.
+  const burstRoot = getProjectDir();
+  const hint = noteBurstAndMaybeHint(burstRoot);
+  if (hint && response.content.length > 0) {
+    const content = response.content.slice();
+    const last = content[content.length - 1];
+    content[content.length - 1] = { ...last, text: last.text + hint };
+    return { ...response, content };
   }
 
   return response;
@@ -1611,23 +1764,25 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+          const rawOutputBytes = Buffer.byteLength(output);
+          trackIndexed(rawOutputBytes);
           return trackResponse("ctx_execute", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`)}` },
             ],
             isError,
-          });
+          }, rawOutputBytes);
         }
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+          const rawOutputBytes = Buffer.byteLength(output);
+          trackIndexed(rawOutputBytes);
           return trackResponse("ctx_execute", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`)}` },
             ],
             isError,
-          });
+          }, rawOutputBytes);
         }
         return trackResponse("ctx_execute", {
           content: [
@@ -1641,16 +1796,18 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        trackIndexed(Buffer.byteLength(stdout));
+        const rawStdoutBytes = Buffer.byteLength(stdout);
+        trackIndexed(rawStdoutBytes);
         return trackResponse("ctx_execute", {
           content: [
             { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`)}` },
           ],
-        });
+        }, rawStdoutBytes);
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
+        const rawStdoutBytes = Buffer.byteLength(stdout);
         const indexed = indexStdout(stdout, `execute:${language}`);
         // Prepend echo to the first text content so provenance still surfaces
         const echoed = {
@@ -1661,7 +1818,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
               : c,
           ),
         };
-        return trackResponse("ctx_execute", echoed);
+        return trackResponse("ctx_execute", echoed, rawStdoutBytes);
       }
 
       return trackResponse("ctx_execute", {
@@ -1891,23 +2048,25 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
           language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
         });
         if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+          const rawOutputBytes = Buffer.byteLength(output);
+          trackIndexed(rawOutputBytes);
           return trackResponse("ctx_execute_file", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
             ],
             isError,
-          });
+          }, rawOutputBytes);
         }
         // Auto-index large error output into FTS5 — no data loss
         if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          trackIndexed(Buffer.byteLength(output));
+          const rawOutputBytes = Buffer.byteLength(output);
+          trackIndexed(rawOutputBytes);
           return trackResponse("ctx_execute_file", {
             content: [
               { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
             ],
             isError,
-          });
+          }, rawOutputBytes);
         }
         return trackResponse("ctx_execute_file", {
           content: [
@@ -1920,16 +2079,18 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
       const stdout = result.stdout || "(no output)";
 
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        trackIndexed(Buffer.byteLength(stdout));
+        const rawStdoutBytes = Buffer.byteLength(stdout);
+        trackIndexed(rawStdoutBytes);
         return trackResponse("ctx_execute_file", {
           content: [
             { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
           ],
-        });
+        }, rawStdoutBytes);
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
+        const rawStdoutBytes = Buffer.byteLength(stdout);
         const indexed = indexStdout(stdout, `file:${path}`);
         const echoed = {
           ...indexed,
@@ -1939,7 +2100,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
               : c,
           ),
         };
-        return trackResponse("ctx_execute_file", echoed);
+        return trackResponse("ctx_execute_file", echoed, rawStdoutBytes);
       }
 
       return trackResponse("ctx_execute_file", {
@@ -2404,6 +2565,10 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
 
       const MAX_TOTAL = responseLimit;
       let totalSize = 0;
+      // Raw-counterfactual accounting (item 1): the full byte size of every
+      // matched chunk a raw grep/cat would have dumped, even though only a
+      // compact [r:id] label or a 600-byte preview snippet is returned.
+      let rawMatchedContentBytes = 0;
       const sections: string[] = [];
       const emitted = new Set<string>();
 
@@ -2431,6 +2596,7 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
             const key = `${r.source}\u0000${r.title}\u0000${r.content}`;
             if (emitted.has(key)) return false;
             emitted.add(key);
+            rawMatchedContentBytes += Buffer.byteLength(r.content);
             return true;
           })
           .map((r) => {
@@ -2466,7 +2632,7 @@ Use \`source\` to scope results and pass multiple queries in one call.`,
 
       return trackResponse("ctx_search", {
         content: [{ type: "text" as const, text: capUtf8(output, MAX_TOTAL) }],
-      });
+      }, rawMatchedContentBytes);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return trackResponse("ctx_search", {
@@ -3475,7 +3641,7 @@ Supports sequential or parallel execution; keep concurrency at 1 for stateful co
 
       return trackResponse("ctx_batch_execute", {
         content: [{ type: "text" as const, text: output }],
-      });
+      }, totalBytes);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return trackResponse("ctx_batch_execute", {

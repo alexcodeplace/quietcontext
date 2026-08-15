@@ -24,9 +24,11 @@ import { afterAll, describe, expect, test } from "vitest";
 import { SessionDB } from "../../src/session/db.js";
 import { loadDatabase } from "../../src/db-base.js";
 import {
+  emitBurstEvent,
   emitCacheHitEvent,
   emitIndexWriteEvent,
   emitSandboxExecuteEvent,
+  emitToolLedgerEvent,
 } from "../../src/session/event-emit.js";
 
 interface RawEventRow {
@@ -137,11 +139,62 @@ describe("event-emit (Phase 5/7 server-side emitters)", () => {
     expect(rows[0].bytes_returned).toBe(0);
   });
 
+  test("emitToolLedgerEvent writes a tool_ledger row", () => {
+    const dbPath = tmpDbPath();
+    const sid = `sess-${randomUUID()}`;
+    const sdb = seedSession(dbPath, sid);
+    cleanups.push(() => { try { sdb.close(); } catch {} try { if (existsSync(dbPath)) unlinkSync(dbPath); } catch {} });
+
+    emitToolLedgerEvent({
+      sessionDbPath: dbPath,
+      tool: "execute",
+      workingRoot: "/tmp/proj",
+      bytesReturned: 1024,
+      counterfactualBytes: 2048,
+    });
+    sdb.close();
+
+    const summarySdb = new SessionDB({ dbPath });
+    const summary = summarySdb.getToolLedgerSummary(sid);
+    expect(summary.execute).toEqual({
+      calls: 1,
+      bytesReturned: 1024,
+      counterfactualBytes: 2048,
+      bytesSaved: 1024,
+    });
+    summarySdb.close();
+  });
+
+  test("emitBurstEvent writes a tool_burst_events row", () => {
+    const dbPath = tmpDbPath();
+    const sid = `sess-${randomUUID()}`;
+    const sdb = seedSession(dbPath, sid);
+    cleanups.push(() => { try { sdb.close(); } catch {} try { if (existsSync(dbPath)) unlinkSync(dbPath); } catch {} });
+
+    emitBurstEvent({
+      sessionDbPath: dbPath,
+      workingRoot: "/tmp/proj",
+      callsInBurst: 4,
+      secondsSpan: 6.5,
+    });
+    sdb.close();
+
+    const readSdb = new SessionDB({ dbPath });
+    const events = readSdb.getBurstEvents(sid);
+    expect(events.length).toBe(1);
+    expect(events[0].workingRoot).toBe("/tmp/proj");
+    expect(events[0].callsInBurst).toBe(4);
+    expect(events[0].secondsSpan).toBe(6.5);
+    readSdb.close();
+  });
+
   test("emitters never throw on missing DB (best-effort)", () => {
     const missing = join(tmpdir(), `does-not-exist-${randomUUID()}.db`);
     expect(() => emitSandboxExecuteEvent({ sessionDbPath: missing, toolName: "x", bytesReturned: 1 })).not.toThrow();
     expect(() => emitIndexWriteEvent({ sessionDbPath: missing, source: "x", bytesAvoided: 1 })).not.toThrow();
     expect(() => emitCacheHitEvent({ sessionDbPath: missing, source: "x", bytesAvoided: 1 })).not.toThrow();
+    expect(() => emitToolLedgerEvent({ sessionDbPath: missing, tool: "search", workingRoot: "/tmp/proj", bytesReturned: 1, counterfactualBytes: 1 })).not.toThrow();
+    expect(() => emitBurstEvent({ sessionDbPath: missing, workingRoot: "/tmp/proj", callsInBurst: 2, secondsSpan: 1 })).not.toThrow();
   });
 
   test("emitters skip silently when no session exists in the DB", () => {

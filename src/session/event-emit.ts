@@ -130,3 +130,34 @@ export function emitCacheHitEvent(opts: {
     );
   });
 }
+
+/**
+ * Record one honest-ledger row for the four high-volume tools
+ * (execute / exec-file / batch / search) that `session_events.bytes_avoided`
+ * never covered. `counterfactualBytes` MUST already be capped at the host's
+ * own truncation baseline by the caller — this function stores whatever it
+ * is given without adjusting it.
+ */
+export function emitToolLedgerEvent(opts: {
+  sessionDbPath: string;
+  tool: string;
+  workingRoot: string;
+  bytesReturned: number;
+  counterfactualBytes: number;
+}): void {
+  withLatestSession(opts.sessionDbPath, (sdb, sid) => {
+    sdb.recordToolLedger(sid, opts.tool, opts.workingRoot, opts.bytesReturned, opts.counterfactualBytes);
+  });
+}
+
+/** Record one closed burst window (item 2 — burst feedback ledger). */
+export function emitBurstEvent(opts: {
+  sessionDbPath: string;
+  workingRoot: string;
+  callsInBurst: number;
+  secondsSpan: number;
+}): void {
+  withLatestSession(opts.sessionDbPath, (sdb, sid) => {
+    sdb.recordBurstEvent(sid, opts.workingRoot, opts.callsInBurst, opts.secondsSpan);
+  });
+}
