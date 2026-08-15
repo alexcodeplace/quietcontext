@@ -17,7 +17,7 @@ Every bug report, feature request, and behavioral claim MUST be proven true befo
 
 ```
 Step 1: Extract the claimed reproduction steps from the issue
-Step 2: Run them locally (use ctx_execute or a test)
+Step 2: Run them locally (use execute or a test)
 Step 3: Record the ACTUAL output
 Step 4: Compare actual vs. claimed behavior
 Step 5: VERDICT:
@@ -33,8 +33,8 @@ Step 5: VERDICT:
 ```
 Step 1: Identify the claim (e.g., "Claude Code strips env vars from child processes")
 Step 2: Find HARD EVIDENCE — official docs, source code, or measured benchmarks
-  → Use ctx_fetch_and_index on official docs/repos
-  → Use ctx_execute to run actual tests
+  → Use fetch-index on official docs/repos
+  → Use execute to run actual tests
   → NEVER trust LLM knowledge about platform behavior — LLMs hallucinate this constantly
 Step 3: VERDICT:
   → CONFIRMED: Claim is true, proceed to design
@@ -118,7 +118,7 @@ Step 5: VERDICT
 | Codex | `CODEX_CI`, `CODEX_THREAD_ID` | src/adapters/detect.ts |
 | VS Code Copilot | `VSCODE_PID`, `VSCODE_CWD` | src/adapters/detect.ts |
 | Cursor | `CURSOR_TRACE_ID`, `CURSOR_CLI` | src/adapters/detect.ts |
-| Override | `CONTEXT_MODE_PLATFORM` | src/adapters/detect.ts |
+| Override | `QUIET_CONTEXT_PLATFORM` | src/adapters/detect.ts |
 
 Any ENV var NOT in this table must go through the full verification protocol.
 
@@ -262,7 +262,7 @@ Each platform has different hook formats. Verify changes match:
 ### Sandbox Escape
 
 ```shell
-# File writing attempts through ctx_execute
+# File writing attempts through execute
 rg "writeFile\|appendFile\|createWriteStream" src/executor.ts
 
 # Path traversal

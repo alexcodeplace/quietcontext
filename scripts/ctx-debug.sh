@@ -343,7 +343,7 @@ section "4. better-sqlite3 Native Module"
 # Find .node binary
 SQLITE_NODE_FILE=""
 if [ -d "$PLUGIN_ROOT/node_modules/better-sqlite3" ]; then
-  SQLITE_NODE_FILE="$(find -H "$PLUGIN_ROOT/node_modules/better-sqlite3" -name '*.node' -type f 2>/dev/null | head -1)"
+  SQLITE_NODE_FILE="$(find "$PLUGIN_ROOT/node_modules/better-sqlite3" -name '*.node' -type f 2>/dev/null | head -1)"
 fi
 check "better-sqlite3 .node binary exists" "$([ -n "$SQLITE_NODE_FILE" ] && echo true || echo false)"
 [ -n "$SQLITE_NODE_FILE" ] && kv "Binary path" "$(abbrev_path "$SQLITE_NODE_FILE")"
@@ -373,7 +373,7 @@ section "5. Adapter Detection"
 printf '| Variable | Value |\n|----------|-------|\n'
 
 ADAPTER_VARS=(
-  CONTEXT_MODE_PLATFORM
+  QUIET_CONTEXT_PLATFORM
   CLAUDE_PROJECT_DIR CLAUDE_SESSION_ID
   GEMINI_PROJECT_DIR GEMINI_CLI
   OPENCLAW_HOME OPENCLAW_CLI
@@ -395,8 +395,8 @@ for var in "${ADAPTER_VARS[@]}"; do
 done
 
 # Detection logic (mirrors context-mode adapter selection)
-if [ -n "${CONTEXT_MODE_PLATFORM:-}" ]; then
-  DETECTED_ADAPTER="$CONTEXT_MODE_PLATFORM (explicit)"
+if [ -n "${QUIET_CONTEXT_PLATFORM:-}" ]; then
+  DETECTED_ADAPTER="$QUIET_CONTEXT_PLATFORM (explicit)"
 elif [ -n "${CURSOR_TRACE_ID:-}${CURSOR_CLI:-}" ]; then
   DETECTED_ADAPTER="cursor"
 elif [ -n "${VSCODE_PID:-}" ]; then
@@ -707,8 +707,8 @@ else
 fi
 
 # context-mode specific
-kv "CONTEXT_MODE_SESSION_SUFFIX" "${CONTEXT_MODE_SESSION_SUFFIX:-unset}"
-kv "CONTEXT_MODE_NODE" "${CONTEXT_MODE_NODE:-unset}"
+kv "QUIET_CONTEXT_SESSION_SUFFIX" "${QUIET_CONTEXT_SESSION_SUFFIX:-unset}"
+kv "QUIET_CONTEXT_NODE" "${QUIET_CONTEXT_NODE:-unset}"
 
 # PATH (abbreviated — show key directories)
 printf -- '- **PATH** (key dirs):\n'

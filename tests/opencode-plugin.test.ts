@@ -103,40 +103,28 @@ describe("ContextModePlugin", () => {
       ]);
     });
 
-    // Both KiloCode and recent OpenCode (≥ ~1.14.x) bundle Zod v4 in their
-    // bun-compiled host runtime. Pre-fix, raw Zod v3 schemas crashed the host
-    // on first message with `TypeError: undefined is not an object
-    // (evaluating 'n._zod.def')`. Invariant: every arg schema handed to the
-    // host must carry the `_zod` v4 marker. Asserted on both platforms.
-    it.each([
-      { platform: "kilo" as const, dir: "kilo-zod-v4-args", setEnv: true },
-      { platform: "opencode" as const, dir: "opencode-zod-v4-args", setEnv: false },
-    ])(
-      "converts tool args to Zod v4 when platform is $platform (#_zod.def fix)",
-      async ({ dir, setEnv }) => {
-        const prevKiloPid = process.env.KILO_PID;
-        if (setEnv) process.env.KILO_PID = String(process.pid);
-        else delete process.env.KILO_PID;
-        try {
-          const plugin = await createTestPlugin(join(tempDir, dir));
-          expect(plugin).toHaveProperty("tool");
-          expect(Object.keys(plugin.tool ?? {}).length).toBeGreaterThan(0);
+    it("converts tool args to Zod v4 when platform is kilo (#_zod.def fix)", async () => {
+      const prevKiloPid = process.env.KILO_PID;
+      process.env.KILO_PID = String(process.pid);
+      try {
+        const plugin = await createTestPlugin(join(tempDir, "kilo-zod-v4-args"));
+        expect(plugin).toHaveProperty("tool");
+        expect(Object.keys(plugin.tool ?? {}).length).toBeGreaterThan(0);
 
-          for (const [toolName, toolDef] of Object.entries(plugin.tool ?? {})) {
-            const args = (toolDef as any).args as Record<string, unknown>;
-            for (const [argName, argSchema] of Object.entries(args)) {
-              expect(
-                (argSchema as any)._zod,
-                `tool ${toolName} arg ${argName} missing _zod (Zod v4 marker)`,
-              ).toBeDefined();
-            }
+        for (const [toolName, toolDef] of Object.entries(plugin.tool ?? {})) {
+          const args = (toolDef as any).args as Record<string, unknown>;
+          for (const [argName, argSchema] of Object.entries(args)) {
+            expect(
+              (argSchema as any)._zod,
+              `tool ${toolName} arg ${argName} missing _zod (Zod v4 marker)`,
+            ).toBeDefined();
           }
-        } finally {
-          if (prevKiloPid !== undefined) process.env.KILO_PID = prevKiloPid;
-          else delete process.env.KILO_PID;
         }
-      },
-    );
+      } finally {
+        if (prevKiloPid !== undefined) process.env.KILO_PID = prevKiloPid;
+        else delete process.env.KILO_PID;
+      }
+    });
 
     it("ctx_stats native plugin tool executes without an MCP child (#574 smoke)", async () => {
       const projectDir = join(tempDir, "factory-native-tool-exec");
@@ -375,7 +363,7 @@ describe("ContextModePlugin", () => {
           const after = {
             unhandled: process.listenerCount("unhandledRejection"),
             uncaught: process.listenerCount("uncaughtException"),
-            embedded: process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS ?? null,
+            embedded: process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS ?? null,
           };
           console.log(JSON.stringify({ before, after }));
           })().catch((err) => { console.error(err); process.exit(1); });

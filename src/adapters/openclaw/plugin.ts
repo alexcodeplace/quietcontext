@@ -242,7 +242,7 @@ const configSchema = {
 // ── Helpers ───────────────────────────────────────────────
 
 function getSessionDir(): string {
-  // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+  // Issue #649: honor QUIET_CONTEXT_DATA_DIR universal storage override
   // ahead of the hardcoded ~/.openclaw root so dev-container/CI/NFS-home
   // users can relocate context-mode storage without patching the source.
   // Kept in sync with OpenClawAdapter.getSessionDir() (inherited from

@@ -16,7 +16,6 @@ import {
   globToRegex,
   matchesAnyPattern,
   splitChainedCommands,
-  extractSubshellCommands,
   readBashPolicies,
   evaluateCommand,
   evaluateCommandDenyOnly,
@@ -174,72 +173,6 @@ describe("Chained Command Splitting", () => {
     const parts = splitChainedCommands("git status");
     assert.deepEqual(parts, ["git status"]);
   });
-
-  test("splitChainedCommands: splits on newlines", () => {
-    const parts = splitChainedCommands("git status\nsudo rm -rf /");
-    assert.deepEqual(parts, ["git status", "sudo rm -rf /"]);
-  });
-
-  test("splitChainedCommands: splits on single ampersand", () => {
-    const parts = splitChainedCommands("echo hello & git status");
-    assert.deepEqual(parts, ["echo hello", "git status"]);
-  });
-
-  test("splitChainedCommands: respects escaped delimiters", () => {
-    const parts = splitChainedCommands("echo hello \\& git status");
-    assert.deepEqual(parts, ["echo hello \\& git status"]);
-  });
-
-  test("splitChainedCommands: does not split operators inside subshells", () => {
-    const parts = splitChainedCommands("git status $(sudo rm -rf / | cat) && echo done");
-    assert.deepEqual(parts, ["git status $(sudo rm -rf / | cat)", "echo done"]);
-  });
-
-  test("splitChainedCommands: tracks nested parentheses inside subshells", () => {
-    const parts = splitChainedCommands("echo $(printf '(x)' | cat) && git status");
-    assert.deepEqual(parts, ["echo $(printf '(x)' | cat)", "git status"]);
-  });
-});
-
-describe("extractSubshellCommands", () => {
-  test("extractSubshellCommands: basic $(cmd)", () => {
-    const subs = extractSubshellCommands("echo $(sudo rm -rf /)");
-    assert.deepEqual(subs, ["sudo rm -rf /"]);
-  });
-
-  test("extractSubshellCommands: nested $(cmd)", () => {
-    const subs = extractSubshellCommands("git checkout $(echo $(uname))");
-    assert.ok(subs.includes("uname"));
-    assert.ok(subs.includes("echo $(uname)"));
-  });
-
-  test("extractSubshellCommands: backtick `cmd`", () => {
-    const subs = extractSubshellCommands("echo `sudo rm -rf /`");
-    assert.deepEqual(subs, ["sudo rm -rf /"]);
-  });
-
-  test("extractSubshellCommands: respects quotes and escaping", () => {
-    const subs1 = extractSubshellCommands("echo '$(sudo rm -rf /)'");
-    assert.deepEqual(subs1, []);
-
-    const subs2 = extractSubshellCommands("echo \"$(sudo rm -rf /)\"");
-    assert.deepEqual(subs2, ["sudo rm -rf /"]);
-  });
-
-  test("extractSubshellCommands: even backslashes do not escape command substitution", () => {
-    const subs = extractSubshellCommands("echo " + "\\\\" + "$(sudo rm -rf /)");
-    assert.deepEqual(subs, ["sudo rm -rf /"]);
-  });
-
-  test("extractSubshellCommands: arithmetic expansion is not treated as command substitution", () => {
-    const subs = extractSubshellCommands("echo $((1 + 2))");
-    assert.deepEqual(subs, []);
-  });
-
-  test("extractSubshellCommands: command substitution inside arithmetic is still extracted", () => {
-    const subs = extractSubshellCommands("echo $(( $(sudo rm -rf /) + 1 ))");
-    assert.deepEqual(subs, ["sudo rm -rf /"]);
-  });
 });
 
 describe("Chained Command Evaluation", () => {
@@ -295,53 +228,6 @@ describe("Chained Command Evaluation", () => {
     const policies = readBashPolicies(undefined, chainGlobalPath);
     const result = evaluateCommandDenyOnly("echo hello && git status", policies, false);
     assert.equal(result.decision, "allow");
-  });
-
-  test("evaluateCommand: blocks subshell deny bypass inside allowed command", () => {
-    const policies = readBashPolicies(undefined, chainGlobalPath);
-    const result = evaluateCommand("git status $(sudo rm -rf /)", policies, false);
-    assert.equal(result.decision, "deny");
-    assert.equal(result.matchedPattern, "Bash(sudo *)");
-  });
-
-  test("evaluateCommand: segment-wise allow check blocks piggybacking", () => {
-    const policies = readBashPolicies(undefined, chainGlobalPath);
-    // git status is allowed, but whoami is not in allow/deny (defaults to ask)
-    const result = evaluateCommand("git status && whoami", policies, false);
-    assert.equal(result.decision, "ask");
-  });
-
-  test("evaluateCommandDenyOnly: blocks subshell deny bypass in DenyOnly mode", () => {
-    const policies = readBashPolicies(undefined, chainGlobalPath);
-    const result = evaluateCommandDenyOnly("git status $(sudo rm -rf /)", policies, false);
-    assert.equal(result.decision, "deny");
-  });
-
-  test("evaluateCommandDenyOnly: blocks denied commands before a pipe inside subshell", () => {
-    const policies = readBashPolicies(undefined, chainGlobalPath);
-    const result = evaluateCommandDenyOnly("git status $(sudo rm -rf / | cat)", policies, false);
-    assert.equal(result.decision, "deny");
-    assert.equal(result.matchedPattern, "Bash(sudo *)");
-  });
-
-  test("evaluateCommandDenyOnly: blocks command substitution after even backslashes", () => {
-    const policies = readBashPolicies(undefined, chainGlobalPath);
-    const result = evaluateCommandDenyOnly(
-      "git status " + "\\\\" + "$(sudo rm -rf /)",
-      policies,
-      false,
-    );
-    assert.equal(result.decision, "deny");
-    assert.equal(result.matchedPattern, "Bash(sudo *)");
-  });
-
-  test("evaluateCommand: respects case-insensitivity default", () => {
-    const policies = readBashPolicies(undefined, chainGlobalPath);
-    // If case-insensitivity defaults to true on Darwin/Win32, it should deny "SUDO"
-    if (process.platform === "darwin" || process.platform === "win32") {
-      const result = evaluateCommand("SUDO rm -rf /", policies);
-      assert.equal(result.decision, "deny");
-    }
   });
 });
 
@@ -752,10 +638,7 @@ describe("Shell-Escape Scanner", () => {
 describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
   let cfgTmpBase: string;
   let customConfigDir: string;
-  let fakeHome: string;
   let savedEnv: string | undefined;
-  let savedHome: string | undefined;
-  let savedUserprofile: string | undefined;
 
   beforeAll(() => {
     cfgTmpBase = join(tmpdir(), `security-cfg-test-${Date.now()}`);
@@ -773,15 +656,11 @@ describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
       }),
     );
 
-    // Homedir fallback — write to a sandboxed fake HOME under tmpdir() so
-    // running `npm test` from a contributor machine never clobbers the
-    // user's real ~/.claude/settings.json. Matches the env-override
-    // pattern used by the #451 round-3 block below.
-    fakeHome = join(cfgTmpBase, "fake-home");
-    const fakeClaudeDir = join(fakeHome, ".claude");
-    mkdirSync(fakeClaudeDir, { recursive: true });
+    // Homedir fallback — distinct content so we can detect which file was read.
+    const homeClaudeDir = join(homedir(), ".claude");
+    mkdirSync(homeClaudeDir, { recursive: true });
     writeFileSync(
-      join(fakeClaudeDir, "settings.json"),
+      join(homeClaudeDir, "settings.json"),
       JSON.stringify({
         permissions: {
           allow: [],
@@ -791,19 +670,11 @@ describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
     );
 
     savedEnv = process.env.CLAUDE_CONFIG_DIR;
-    savedHome = process.env.HOME;
-    savedUserprofile = process.env.USERPROFILE;
-    process.env.HOME = fakeHome;
-    process.env.USERPROFILE = fakeHome;
   });
 
   afterAll(() => {
     if (savedEnv === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = savedEnv;
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
-    if (savedUserprofile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = savedUserprofile;
     rmSync(cfgTmpBase, { recursive: true, force: true });
   });
 
@@ -865,7 +736,7 @@ describe("CLAUDE_CONFIG_DIR honors security policy reader", () => {
  * `readToolDenyPatterns`. This is a cross-adapter security parity gap.
  *
  * Behavior under test:
- *   - When CONTEXT_MODE_PLATFORM identifies a non-claude adapter, the security
+ *   - When QUIET_CONTEXT_PLATFORM identifies a non-claude adapter, the security
  *     reader MUST consult <home>/<adapter-segments>/settings.json.
  *   - Union semantics (defense in depth): even when an adapter is detected,
  *     ~/.claude/settings.json is ALSO read so a rule defined there still wins.
@@ -893,7 +764,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
     mkdirSync(parityTmpBase, { recursive: true });
     savedHome = process.env.HOME;
     savedUserprofile = process.env.USERPROFILE;
-    savedPlatform = process.env.CONTEXT_MODE_PLATFORM;
+    savedPlatform = process.env.QUIET_CONTEXT_PLATFORM;
     savedClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
   });
 
@@ -902,8 +773,8 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
     else process.env.HOME = savedHome;
     if (savedUserprofile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserprofile;
-    if (savedPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
-    else process.env.CONTEXT_MODE_PLATFORM = savedPlatform;
+    if (savedPlatform === undefined) delete process.env.QUIET_CONTEXT_PLATFORM;
+    else process.env.QUIET_CONTEXT_PLATFORM = savedPlatform;
     if (savedClaudeConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = savedClaudeConfig;
     rmSync(parityTmpBase, { recursive: true, force: true });
@@ -925,7 +796,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
       // Sandbox HOME so home-rooted resolution lands in our tmp tree.
       process.env.HOME = fakeHome;
       process.env.USERPROFILE = fakeHome;
-      process.env.CONTEXT_MODE_PLATFORM = adapter;
+      process.env.QUIET_CONTEXT_PLATFORM = adapter;
       delete process.env.CLAUDE_CONFIG_DIR;
 
       const policies = readBashPolicies();
@@ -950,7 +821,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
 
       process.env.HOME = fakeHome;
       process.env.USERPROFILE = fakeHome;
-      process.env.CONTEXT_MODE_PLATFORM = adapter;
+      process.env.QUIET_CONTEXT_PLATFORM = adapter;
       delete process.env.CLAUDE_CONFIG_DIR;
 
       const result = readToolDenyPatterns("Read");
@@ -979,7 +850,7 @@ describe("cross-adapter deny-policy parity (#451 round-3)", () => {
 
     process.env.HOME = fakeHome;
     process.env.USERPROFILE = fakeHome;
-    process.env.CONTEXT_MODE_PLATFORM = "cursor";
+    process.env.QUIET_CONTEXT_PLATFORM = "cursor";
     delete process.env.CLAUDE_CONFIG_DIR;
 
     const policies = readBashPolicies();

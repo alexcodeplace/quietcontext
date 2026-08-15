@@ -25,13 +25,7 @@ const ROOT = resolve(__dirname, "..", "..");
 
 const cliSrc = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
 const upgradeIdx = cliSrc.indexOf("async function upgrade");
-// Widened from 16000 → 20000 chars (#738): the bun-resolution probe added
-// ~400 chars to the post-normalizeHooksJsonOnly block, pushing
-// healPluginJsonMcpServers close enough to the original 16000 cutoff that the
-// downstream `Plugin manifest drift` throw fell outside the per-test slice.
-// Window the SOURCE generously here; per-test slices already cap their own
-// inspection windows below.
-const upgradeBody = cliSrc.slice(upgradeIdx, upgradeIdx + 20000);
+const upgradeBody = cliSrc.slice(upgradeIdx, upgradeIdx + 16000);
 
 describe("cli.ts upgrade() — Issue #523 plugin.json placeholder assertion", () => {
   test("post-bump block invokes healPluginJsonMcpServers from the shared module", () => {

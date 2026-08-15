@@ -9,29 +9,12 @@ describe("claude-code formatter", () => {
     expect(output).not.toHaveProperty("reason");
   });
 
-  // Per 4bc292f: CC ignores updatedInput.command for Bash, so allow+updatedInput
-  // never reaches the user. The forced-deny probe + echo payload in the reason
-  // is the only way to surface a redirect; for non-Bash tools we drop the
-  // explicit permissionDecision and let CC's default-allow path apply.
-  it("modify with bash command emits forced-deny probe", () => {
+  it("modify includes permissionDecision and permissionDecisionReason alongside updatedInput", () => {
     const result = formatters["claude-code"].modify({ command: "ls" });
     const output = result.hookSpecificOutput;
-    expect(output.permissionDecision).toBe("deny");
+    expect(output.permissionDecision).toBe("allow");
     expect(output.permissionDecisionReason).toBeDefined();
-  });
-
-  it("modify with bash echo payload extracts the quoted message as deny reason", () => {
-    const result = formatters["claude-code"].modify({ command: 'echo "use ctx_execute instead"' });
-    const output = result.hookSpecificOutput;
-    expect(output.permissionDecision).toBe("deny");
-    expect(output.permissionDecisionReason).toBe("use ctx_execute instead");
-  });
-
-  it("modify with non-bash input returns updatedInput and lets CC default-allow", () => {
-    const result = formatters["claude-code"].modify({ prompt: "modified" });
-    const output = result.hookSpecificOutput;
-    expect(output.updatedInput).toEqual({ prompt: "modified" });
-    expect(output).not.toHaveProperty("permissionDecision");
+    expect(output.updatedInput).toEqual({ command: "ls" });
   });
 });
 
@@ -58,10 +41,9 @@ describe("formatDecision integration", () => {
     expect(result.hookSpecificOutput).not.toHaveProperty("reason");
   });
 
-  it("claude-code modify with bash command flows through as forced-deny", () => {
+  it("claude-code modify flows through with permissionDecision", () => {
     const result = formatDecision("claude-code", { action: "modify", updatedInput: { command: "echo hi" } });
-    expect(result.hookSpecificOutput.permissionDecision).toBe("deny");
-    expect(result.hookSpecificOutput.permissionDecisionReason).toBeDefined();
+    expect(result.hookSpecificOutput.permissionDecision).toBe("allow");
+    expect(result.hookSpecificOutput.updatedInput).toEqual({ command: "echo hi" });
   });
-
 });

@@ -390,14 +390,14 @@ async function createContextModePlugin(ctx: PluginContext) {
     // transport. This is the plugin-only bridge for #574: OpenCode/Kilo
     // call ctx_* tools in-process through Hooks.tool instead of spawning
     // a separate MCP child per session.
-    const prevEmbedded = process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
-    process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = "1";
+    const prevEmbedded = process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS;
+    process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS = "1";
     let mod: typeof import("../../server.js");
     try {
       mod = await import("../../server.js");
     } finally {
-      if (prevEmbedded === undefined) delete process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
-      else process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
+      if (prevEmbedded === undefined) delete process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS;
+      else process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
     }
     const tools: Record<string, NativeToolDefinition> = {};
 

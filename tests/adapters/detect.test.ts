@@ -11,16 +11,13 @@ import { OpenCodeAdapter } from "../../src/adapters/opencode/index.js";
 import { OpenClawAdapter } from "../../src/adapters/openclaw/index.js";
 import { CodexAdapter } from "../../src/adapters/codex/index.js";
 import { VSCodeCopilotAdapter } from "../../src/adapters/vscode-copilot/index.js";
-import { CopilotCliAdapter } from "../../src/adapters/copilot-cli/index.js";
 import { CursorAdapter } from "../../src/adapters/cursor/index.js";
 import { AntigravityAdapter } from "../../src/adapters/antigravity/index.js";
-import { AntigravityCliAdapter } from "../../src/adapters/antigravity-cli/index.js";
 import { KiroAdapter } from "../../src/adapters/kiro/index.js";
 import { QwenCodeAdapter } from "../../src/adapters/qwen-code/index.js";
 import { JetBrainsCopilotAdapter } from "../../src/adapters/jetbrains-copilot/index.js";
 import { OMPAdapter } from "../../src/adapters/omp/index.js";
 import { PiAdapter } from "../../src/adapters/pi/index.js";
-import { KimiAdapter } from "../../src/adapters/kimi/index.js";
 
 // ─────────────────────────────────────────────────────────
 // detectPlatform — env var detection
@@ -64,12 +61,11 @@ describe("detectPlatform", () => {
     delete process.env.PI_CONFIG_DIR;
     delete process.env.PI_SESSION_FILE;
     delete process.env.PI_COMPILED;
-    delete process.env.PI_CODING_AGENT;
     delete process.env.PI_PROJECT_DIR;
     delete process.env.IDEA_INITIAL_DIRECTORY;
     delete process.env.IDEA_HOME;
     delete process.env.JETBRAINS_CLIENT_ID;
-    delete process.env.CONTEXT_MODE_PLATFORM;
+    delete process.env.QUIET_CONTEXT_PLATFORM;
     // Issue #539 slice 2: tests in this file pre-date the installed_plugins.json
     // fallback and assume env-var-only detection. Seed the plugin cache to a
     // "miss" so the fallback never triggers — explicit slice-2 coverage lives
@@ -253,8 +249,7 @@ describe("detectPlatform", () => {
   // refs/platforms/oh-my-pi/packages/coding-agent/src/mcp/transports/stdio.ts:55-63
   // — env passthrough only, no synthesis). Detection markers now use the
   // Pi-exclusive PI_CONFIG_DIR / PI_SESSION_FILE / PI_COMPILED set by
-  // the runtime. Issue #760 adds PI_CODING_AGENT=true as the package-server
-  // marker Pi passes to its spawned MCP child.
+  // the runtime.
 
   it("detects pi via PI_CONFIG_DIR env var", () => {
     process.env.PI_CONFIG_DIR = "/home/u/.pi";
@@ -265,13 +260,6 @@ describe("detectPlatform", () => {
 
   it("detects pi via PI_SESSION_FILE env var", () => {
     process.env.PI_SESSION_FILE = "/home/u/.pi/sessions/abc.json";
-    const signal = detectPlatform();
-    expect(signal.platform).toBe("pi");
-    expect(signal.confidence).toBe("high");
-  });
-
-  it("detects pi via PI_CODING_AGENT env var", () => {
-    process.env.PI_CODING_AGENT = "true";
     const signal = detectPlatform();
     expect(signal.platform).toBe("pi");
     expect(signal.confidence).toBe("high");
@@ -372,18 +360,6 @@ describe("detectPlatform", () => {
     expect(signal.reason).toContain("clientInfo");
   });
 
-  it("returns antigravity-cli when clientInfo name is agy", () => {
-    const signal = detectPlatform({ name: "agy", version: "1.0" });
-    expect(signal.platform).toBe("antigravity-cli");
-    expect(signal.confidence).toBe("high");
-  });
-
-  it("returns copilot-cli when clientInfo name is GitHub Copilot CLI", () => {
-    const signal = detectPlatform({ name: "GitHub Copilot CLI", version: "1.0" });
-    expect(signal.platform).toBe("copilot-cli");
-    expect(signal.confidence).toBe("high");
-  });
-
   it("returns kiro when clientInfo name is Kiro CLI", () => {
     const signal = detectPlatform({ name: "Kiro CLI", version: "1.0.0" });
     expect(signal.platform).toBe("kiro");
@@ -402,13 +378,6 @@ describe("detectPlatform", () => {
     expect(signal.confidence).toBe("high");
   });
 
-  it("returns kimi when clientInfo name is kimi-code", () => {
-    const signal = detectPlatform({ name: "kimi-code", version: "1.0" });
-    expect(signal.platform).toBe("kimi");
-    expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("clientInfo");
-  });
-
   it("clientInfo takes priority over env vars", () => {
     process.env.CLAUDE_PROJECT_DIR = "/some/project";
     const signal = detectPlatform({ name: "antigravity-client", version: "1.0" });
@@ -421,63 +390,39 @@ describe("detectPlatform", () => {
     expect(signal.platform).toBe("claude-code");
   });
 
-  // ── CONTEXT_MODE_PLATFORM override ──────────────────────
+  // ── QUIET_CONTEXT_PLATFORM override ──────────────────────
 
-  it("returns antigravity when CONTEXT_MODE_PLATFORM=antigravity", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity";
+  it("returns antigravity when QUIET_CONTEXT_PLATFORM=antigravity", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "antigravity";
     const signal = detectPlatform();
     expect(signal.platform).toBe("antigravity");
     expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
+    expect(signal.reason).toContain("QUIET_CONTEXT_PLATFORM");
   });
 
-  it("returns antigravity-cli when CONTEXT_MODE_PLATFORM=antigravity-cli", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
-    const signal = detectPlatform();
-    expect(signal.platform).toBe("antigravity-cli");
-    expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
-  });
-
-  it("returns copilot-cli when CONTEXT_MODE_PLATFORM=copilot-cli", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "copilot-cli";
-    const signal = detectPlatform();
-    expect(signal.platform).toBe("copilot-cli");
-    expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
-  });
-
-  it("returns kiro when CONTEXT_MODE_PLATFORM=kiro", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "kiro";
+  it("returns kiro when QUIET_CONTEXT_PLATFORM=kiro", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "kiro";
     const signal = detectPlatform();
     expect(signal.platform).toBe("kiro");
     expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
+    expect(signal.reason).toContain("QUIET_CONTEXT_PLATFORM");
   });
 
-  it("returns kimi when CONTEXT_MODE_PLATFORM=kimi", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "kimi";
-    const signal = detectPlatform();
-    expect(signal.platform).toBe("kimi");
-    expect(signal.confidence).toBe("high");
-    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
-  });
-
-  it("CONTEXT_MODE_PLATFORM takes priority over env vars", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity";
+  it("QUIET_CONTEXT_PLATFORM takes priority over env vars", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "antigravity";
     process.env.CLAUDE_PROJECT_DIR = "/some/project";
     const signal = detectPlatform();
     expect(signal.platform).toBe("antigravity");
   });
 
-  it("clientInfo takes priority over CONTEXT_MODE_PLATFORM", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "codex";
+  it("clientInfo takes priority over QUIET_CONTEXT_PLATFORM", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "codex";
     const signal = detectPlatform({ name: "antigravity-client", version: "1.0" });
     expect(signal.platform).toBe("antigravity");
   });
 
-  it("invalid CONTEXT_MODE_PLATFORM is ignored", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "not-a-platform";
+  it("invalid QUIET_CONTEXT_PLATFORM is ignored", () => {
+    process.env.QUIET_CONTEXT_PLATFORM = "not-a-platform";
     process.env.CLAUDE_PROJECT_DIR = "/some/project";
     const signal = detectPlatform();
     expect(signal.platform).toBe("claude-code");
@@ -518,7 +463,7 @@ describe("detectPlatform", () => {
   it("returns a valid platform as default when no env vars are set", () => {
     // No env vars set — result depends on which config dirs exist on this machine.
     const signal = detectPlatform();
-    expect(["claude-code", "gemini-cli", "codex", "cursor", "opencode", "kilo", "openclaw", "vscode-copilot", "copilot-cli", "antigravity", "antigravity-cli", "kiro", "pi", "omp", "zed", "qwen-code", "jetbrains-copilot", "kimi"]).toContain(signal.platform);
+    expect(["claude-code", "gemini-cli", "codex", "cursor", "opencode", "kilo", "openclaw", "vscode-copilot", "antigravity", "antigravity-cli", "kiro", "pi", "omp", "zed", "qwen-code", "jetbrains-copilot"]).toContain(signal.platform);
   });
 });
 
@@ -563,11 +508,6 @@ describe("getAdapter", () => {
     expect(adapter).toBeInstanceOf(VSCodeCopilotAdapter);
   });
 
-  it("returns CopilotCliAdapter for copilot-cli", async () => {
-    const adapter = await getAdapter("copilot-cli");
-    expect(adapter).toBeInstanceOf(CopilotCliAdapter);
-  });
-
   it("returns CursorAdapter for cursor", async () => {
     const adapter = await getAdapter("cursor");
     expect(adapter).toBeInstanceOf(CursorAdapter);
@@ -576,11 +516,6 @@ describe("getAdapter", () => {
   it("returns AntigravityAdapter for antigravity", async () => {
     const adapter = await getAdapter("antigravity");
     expect(adapter).toBeInstanceOf(AntigravityAdapter);
-  });
-
-  it("returns AntigravityCliAdapter for antigravity-cli", async () => {
-    const adapter = await getAdapter("antigravity-cli");
-    expect(adapter).toBeInstanceOf(AntigravityCliAdapter);
   });
 
   it("returns KiroAdapter for kiro", async () => {
@@ -655,11 +590,6 @@ describe("getAdapter", () => {
 
     const adapter = await getAdapter(signal.platform);
     expect(adapter).toBeInstanceOf(OMPAdapter);
-  });
-
-  it("returns KimiAdapter for kimi", async () => {
-    const adapter = await getAdapter("kimi");
-    expect(adapter).toBeInstanceOf(KimiAdapter);
   });
 
   it("returns ClaudeCodeAdapter for unknown platform", async () => {

@@ -1,1 +1,1 @@
-process.env.CONTEXT_MODE_PLATFORM = "qwen-code";
+process.env.QUIET_CONTEXT_PLATFORM = "qwen-code";

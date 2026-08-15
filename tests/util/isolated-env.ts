@@ -49,7 +49,7 @@ const REDIRECT_KEYS = [
   "TMPDIR",
   "TEMP",
   "TMP",
-  "CONTEXT_MODE_PROJECT_DIR",
+  "QUIET_CONTEXT_PROJECT_DIR",
 ] as const;
 
 /** Keys that get split out from the fake HOME (Windows drive convention). */
@@ -61,11 +61,11 @@ const HOMEDRIVE_HOMEPATH_KEYS = ["HOMEDRIVE", "HOMEPATH"] as const;
  * leak across the test boundary even with HOME redirected.
  */
 const DELETE_KEYS = [
-  "CONTEXT_MODE_DIR",
-  "CONTEXT_MODE_SESSION_DIR",
+  "QUIET_CONTEXT_DIR",
+  "QUIET_CONTEXT_SESSION_DIR",
   "CLAUDE_PLUGIN_ROOT",
-  "CONTEXT_MODE_SESSION_SUFFIX",
-  "CONTEXT_MODE_SESSION_DB",
+  "QUIET_CONTEXT_SESSION_SUFFIX",
+  "QUIET_CONTEXT_SESSION_DB",
 ] as const;
 
 const ALL_TRACKED = [
@@ -119,7 +119,7 @@ function envForHome(fakeHome: string, opts?: IsolatedEnvOpts): Record<string, st
     TMPDIR: fakeHome,
     TEMP: fakeHome,
     TMP: fakeHome,
-    CONTEXT_MODE_PROJECT_DIR: fakeHome,
+    QUIET_CONTEXT_PROJECT_DIR: fakeHome,
   };
   if (!opts?.keepXdg) {
     env.XDG_CONFIG_HOME = join(fakeHome, ".config");

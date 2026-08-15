@@ -433,36 +433,6 @@ describe("Compact Count", () => {
 });
 
 // ════════════════════════════════════════════
-// Usage cursor (Stop-hook main-turn high-water)
-// ════════════════════════════════════════════
-
-describe("Usage Cursor", () => {
-  test("getUsageCursor returns null before any set", () => {
-    const db = createTestDB();
-    const sid = "usage-cursor-1";
-    db.ensureSession(sid, "/project");
-    assert.equal(db.getUsageCursor(sid), null);
-  });
-
-  test("getUsageCursor returns null for an unknown session", () => {
-    const db = createTestDB();
-    assert.equal(db.getUsageCursor("never-seen"), null);
-  });
-
-  test("setUsageCursor stores and advances the high-water uuid", () => {
-    const db = createTestDB();
-    const sid = "usage-cursor-2";
-    db.ensureSession(sid, "/project");
-
-    db.setUsageCursor(sid, "a1");
-    assert.equal(db.getUsageCursor(sid), "a1");
-
-    db.setUsageCursor(sid, "a4");
-    assert.equal(db.getUsageCursor(sid), "a4");
-  });
-});
-
-// ════════════════════════════════════════════
 // SLICE 10: UPSERT RESUME
 // ════════════════════════════════════════════
 

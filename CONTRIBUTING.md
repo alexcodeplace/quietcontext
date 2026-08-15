@@ -78,7 +78,7 @@ MCP server        → detects markdown file on next getStore() call
 LLM               → searches source:"session-events" for details on demand
 ```
 
-Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `ctx_search()` MCP tool.
+Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `search()` MCP tool.
 
 ### Multi-writer contract (v1.0.130 — see [docs/adr/0001-sessiondb-multi-writer.md](docs/adr/0001-sessiondb-multi-writer.md))
 
@@ -139,7 +139,7 @@ The symlink in step 2 ensures `hooks.json` (which registers PostToolUse, PreComp
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute|mcp__(?!plugin_context-mode_)",
+        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__execute|mcp__plugin_context-mode_context-mode__exec-file|mcp__plugin_context-mode_context-mode__batch|mcp__(?!plugin_context-mode_)",
         "hooks": [
           {
             "type": "command",
@@ -297,8 +297,6 @@ npx skills add https://github.com/mksglu/context-mode/tree/main/.claude/skills/c
 | VS Code hooks | `tests/hooks/vscode-hooks.test.ts` |
 | JetBrains hooks | `tests/hooks/jetbrains-hooks.test.ts` |
 | Kiro hooks | `tests/hooks/kiro-hooks.test.ts` |
-| Copilot CLI hooks | `tests/hooks/copilot-cli-hooks.test.ts` |
-| Antigravity CLI hooks | `tests/hooks/antigravity-cli-hooks.test.ts` |
 | Session DB | `tests/session/session-db.test.ts` |
 | Session extract | `tests/session/session-extract.test.ts` |
 | Session snapshot | `tests/session/session-snapshot.test.ts` |
@@ -313,7 +311,7 @@ If your change doesn't fit any existing file, discuss with the maintainer before
 
 ### Output quality matters
 
-When your change affects tool output (ctx_execute, ctx_search, ctx_fetch_and_index, etc.), always compare before and after:
+When your change affects tool output (execute, search, fetch-index, etc.), always compare before and after:
 
 1. Run the same prompt **before** your change (on `main`)
 2. Run it **again** with your change
@@ -358,32 +356,11 @@ context-mode does not dictate how the model writes its final answer. The four pi
 - Do **not** add brevity directives to MCP tool descriptions in `src/server.ts`.
 - Do **not** add `<communication_style>` or `<response_format>` blocks to `hooks/routing-block.mjs`.
 - Do **not** put "Terse like caveman" / "Only fluff die" / "Drop articles, filler" / "fewer than N lines" wording in any shipped adapter config under `configs/*/`.
-- Workflow-discipline rules — "write artifacts to FILES", "use descriptive `ctx_search` source labels", `<artifact_policy>` — are fine. They describe *what to do* (file vs. inline), not *how to write*.
+- Workflow-discipline rules — "write artifacts to FILES", "use descriptive `search` source labels", `<artifact_policy>` — are fine. They describe *what to do* (file vs. inline), not *how to write*.
 
 The regression test at `tests/core/server.test.ts > prose-style policy (#482)` pins the deletion: any caveman-style language landing in `src/server.ts`, `hooks/routing-block.mjs`, or `README.md` will fail CI.
 
 If you genuinely need to nudge the model on style for a specific use case, do it in your own project's `CLAUDE.md` / `AGENTS.md`. Don't ship it inside the framework.
-
-## For Pi developers
-
-context-mode works on Pi now. The extension injects routing rules, registers
-ctx_* tools through the MCP bridge, and the lean `configs/pi/AGENTS.md` keeps
-context budget tight.
-
-**First-time setup:** If you open this project in Pi before running `npm install`
-and `npm run build`, you will see errors. That's normal — the extension needs
-the compiled server bundle. Run the build once and restart.
-
-- If you use Pi: remove `CLAUDE.md` from your project root. Pi.dev reads both
-  CLAUDE.md and AGENTS.md, burning double context on duplicated routing
-  instructions the extension already injects.
-- Use `ctx_search` to recall decisions, errors, and blockers from prior
-  sessions instead of re-reading raw files.
-- Use `ctx_insight` for personal analytics — session activity, tool usage,
-  error rate, project focus.
-
-For the full local dev workflow, build commands, and test instructions, see
-[the contributing guide above](#contributing-to-context-mode).
 
 ## Submitting a Bug Report
 

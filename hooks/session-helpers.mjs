@@ -76,7 +76,7 @@ function workTreeMarkerPath(projectDir) {
 }
 
 function getWorktreeSuffix(projectDir = process.cwd()) {
-  const envSuffix = process.env.CONTEXT_MODE_SESSION_SUFFIX;
+  const envSuffix = process.env.QUIET_CONTEXT_SESSION_SUFFIX;
   const normalizedProjectDir = normalizeWorktreePath(projectDir);
 
   if (
@@ -253,7 +253,7 @@ export function parseStdin(raw) {
 /**
  * Read all of stdin as a string (event-based, cross-platform safe).
  *
- * Idle-timeout semantics (override via env `CONTEXT_MODE_HOOK_STDIN_IDLE_MS`,
+ * Idle-timeout semantics (override via env `QUIET_CONTEXT_HOOK_STDIN_IDLE_MS`,
  * default 1500 ms):
  * - EOF before any data \u2192 resolve("")  \u2014 the original well-behaved path.
  * - EOF after data       \u2192 resolve(buffer) with BOM strip (#139 \u2014 Cursor on
@@ -272,7 +272,7 @@ export function parseStdin(raw) {
 export function readStdin() {
   return new Promise((resolve, reject) => {
     let data = "";
-    const idleMs = Number(process.env.CONTEXT_MODE_HOOK_STDIN_IDLE_MS || 1500);
+    const idleMs = Number(process.env.QUIET_CONTEXT_HOOK_STDIN_IDLE_MS || 1500);
     let done = false;
     let timer;
 

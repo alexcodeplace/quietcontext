@@ -15,9 +15,10 @@ const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
 const { loadSessionDB, loadExtract, loadProjectAttribution } = createSessionLoaders(HOOK_DIR);
 const OPTS = CODEX_OPTS;
 
+let rawInput = "";
 try {
-  const raw = await readStdin();
-  const input = parseStdin(raw);
+  rawInput = await readStdin();
+  const input = parseStdin(rawInput);
   const projectDir = getInputProjectDir(input, OPTS);
 
   const prompt = input.prompt ?? input.message ?? "";

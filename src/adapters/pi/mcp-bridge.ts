@@ -43,14 +43,14 @@ interface PendingRequest {
 //   1. resolveJsRuntimeForBridge() refuses pi-named binaries even when
 //      detectRuntimes() returns one, falling back to PATH-resolved
 //      node/bun.
-//   2. Spawn passes CONTEXT_MODE_BRIDGE_DEPTH=1 in child env so any
+//   2. Spawn passes QUIET_CONTEXT_BRIDGE_DEPTH=1 in child env so any
 //      transitive bridge load can detect the recursion via env counter.
-//   3. bootstrapMCPTools() aborts if CONTEXT_MODE_BRIDGE_DEPTH > 0 in
+//   3. bootstrapMCPTools() aborts if QUIET_CONTEXT_BRIDGE_DEPTH > 0 in
 //      its own env — catches recursion that bypasses the binary-name
 //      check (e.g. a `node` shim that re-execs Pi).
 
 const PI_BINARY_BASENAME = /^pi(\.exe)?$/i;
-const BRIDGE_DEPTH_ENV = "CONTEXT_MODE_BRIDGE_DEPTH";
+const BRIDGE_DEPTH_ENV = "QUIET_CONTEXT_BRIDGE_DEPTH";
 const isWindows = process.platform === "win32";
 
 function basename(p: string): string {
@@ -441,7 +441,7 @@ export class MCPStdioClient {
     // derived ALGORITHMICALLY from PLATFORM_ENV_VARS (every other adapter's
     // workspace-role vars), so adding adapter #16 grows the scrub
     // automatically — no edit to this file. Pi's own workspace vars and
-    // the universal escape hatch (CONTEXT_MODE_PROJECT_DIR) are NEVER
+    // the universal escape hatch (QUIET_CONTEXT_PROJECT_DIR) are NEVER
     // scrubbed.
     for (const banned of foreignWorkspaceEnv("pi")) {
       delete childEnv[banned];
@@ -875,7 +875,7 @@ export function isForegroundSession(ctx: unknown): boolean {
  * #868: derive the bridge child's spawn env for a session kind. The FOREGROUND
  * interactive session's child must never be idle-reaped — a multi-minute human
  * pause should not drop its ctx_* tools — so we disable the #854 reaper for it
- * via `CONTEXT_MODE_BRIDGE_IDLE_MS=0` (lifecycle.ts honors 0 → reaper not armed).
+ * via `QUIET_CONTEXT_BRIDGE_IDLE_MS=0` (lifecycle.ts honors 0 → reaper not armed).
  * Sub-context / non-interactive children keep the default reaper so abandoned
  * children still can't accumulate (#854). The foreground child is still reaped
  * on actual parent death by the ppid/​signal watchdog (#311/#388) — only the
@@ -886,7 +886,7 @@ export function foregroundBridgeEnv(
   foreground: boolean,
 ): NodeJS.ProcessEnv {
   if (!foreground) return baseEnv;
-  return { ...baseEnv, CONTEXT_MODE_BRIDGE_IDLE_MS: "0" };
+  return { ...baseEnv, QUIET_CONTEXT_BRIDGE_IDLE_MS: "0" };
 }
 
 /** Result of bootstrapping the bridge. */
@@ -973,7 +973,7 @@ export async function bootstrapMCPTools(
   }
 
   // #868: the foreground interactive session's child runs with the #854 idle
-  // reaper disabled (CONTEXT_MODE_BRIDGE_IDLE_MS=0) so a human pause never drops
+  // reaper disabled (QUIET_CONTEXT_BRIDGE_IDLE_MS=0) so a human pause never drops
   // its tools; sub-context / non-interactive children keep the reaper (#854).
   const spawnEnv = foregroundBridgeEnv(env, options.foreground ?? false);
   const client = new MCPStdioClient(serverScript, spawnEnv, runtime, diag);

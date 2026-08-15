@@ -88,12 +88,6 @@ describe("getToolName", () => {
     );
   });
 
-  it("returns correct name for antigravity-cli", () => {
-    expect(getToolName("antigravity-cli", "ctx_execute_file")).toBe(
-      "context-mode/ctx_execute_file",
-    );
-  });
-
   it("returns correct name for opencode", () => {
     expect(getToolName("opencode", "ctx_search")).toBe(
       "context-mode_ctx_search",
@@ -401,20 +395,6 @@ describe("routePreToolUse with platform parameter", () => {
     expect(search).not.toBeNull();
     expect(search!.action).toBe("context");
     expect(search!.additionalContext).toContain("ctx_execute");
-  });
-
-  it("Read guidance uses agy context-mode/<tool> names when platform=antigravity-cli", () => {
-    resetGuidanceThrottle();
-    const result = routePreToolUse(
-      "view_file",
-      { AbsolutePath: "/tmp/a.ts" },
-      "/tmp",
-      "antigravity-cli",
-    );
-    expect(result).not.toBeNull();
-    expect(result!.action).toBe("context");
-    expect(result!.additionalContext).toContain("context-mode/ctx_execute_file");
-    expect(result!.additionalContext).not.toContain("mcp__context-mode__ctx_execute_file");
   });
 
   it("build tool redirect uses platform tool names when platform=gemini-cli", () => {

@@ -6,7 +6,7 @@
  * - `for await (process.stdin)` hangs on macOS when piped via spawnSync
  * - `readFileSync(0)` throws EOF/EISDIR on Windows, EAGAIN on Linux
  *
- * Idle-timeout semantics (override via env `CONTEXT_MODE_HOOK_STDIN_IDLE_MS`,
+ * Idle-timeout semantics (override via env `QUIET_CONTEXT_HOOK_STDIN_IDLE_MS`,
  * default 1500 ms):
  * - EOF before any data → resolve("")  — the original well-behaved path.
  * - EOF after data       → resolve(buffer) with BOM strip (#139 — Cursor on
@@ -26,7 +26,7 @@
 export function readStdin() {
   return new Promise((resolve, reject) => {
     let data = "";
-    const idleMs = Number(process.env.CONTEXT_MODE_HOOK_STDIN_IDLE_MS || 1500);
+    const idleMs = Number(process.env.QUIET_CONTEXT_HOOK_STDIN_IDLE_MS || 1500);
     let done = false;
     let timer;
 

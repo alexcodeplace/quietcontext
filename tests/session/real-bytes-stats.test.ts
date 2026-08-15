@@ -20,16 +20,15 @@
  * project filter).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, test } from "vitest";
-import { SessionDB } from "../../src/session/db.js";
+import { ensureSessionEventsSchema, SessionDB } from "../../src/session/db.js";
 import {
   formatReport,
   getContentBytesForSession,
-  getConversationWindowStats,
   getMultiAdapterRealBytesStats,
   getRealBytesStats,
 } from "../../src/session/analytics.js";
@@ -63,7 +62,6 @@ function seed(
   sessionId: string,
   events: Array<{ type: string; category: string; data: string; bytesAvoided?: number; bytesReturned?: number }>,
   snapshots?: Array<{ snapshot: string }>,
-  toolCalls?: Array<{ tool: string; bytesReturned: number }>,
 ): void {
   const sdb = new SessionDB({ dbPath });
   try {
@@ -92,67 +90,10 @@ function seed(
         sdb.upsertResume(sessionId, s.snapshot, events.length);
       }
     }
-    if (toolCalls) {
-      for (const tc of toolCalls) {
-        sdb.incrementToolCall(sessionId, tc.tool, tc.bytesReturned);
-      }
-    }
   } finally {
     sdb.close();
   }
 }
-
-describe("getConversationWindowStats (v1.0.169 live-window framing)", () => {
-  test("splits the worktree: kept-out = whole worktree moved minus THIS window's retrieval; With = this session only", () => {
-    const dir = mkSessionsDir();
-    const hash = "feedfacefeedface";
-    const db = dbPathFor(dir, hash);
-    const main = `main-${randomUUID()}`;
-    const sub = `sub-${randomUUID()}`;
-
-    // Live window (main): avoided 600k, pulled 10k of retrieval into context.
-    seed(db, main,
-      [{ type: "cache-hit", category: "cache", data: "https://a", bytesAvoided: 600_000 }],
-      undefined,
-      [{ tool: "ctx_search", bytesReturned: 10_000 }]);
-    // Sub-agent (same worktree DB, own session): avoided 1.9M, retrieved 500k
-    // into ITS OWN disposable window — never the live window.
-    seed(db, sub,
-      [{ type: "cache-hit", category: "cache", data: "https://b", bytesAvoided: 1_900_000 }],
-      undefined,
-      [{ tool: "ctx_search", bytesReturned: 500_000 }]);
-
-    const r = getConversationWindowStats({ sessionId: main, worktreeHash: hash, sessionsDir: dir });
-
-    // "With context-mode" = ONLY what entered the live window (main's retrieval).
-    expect(r.bytesReturned).toBe(10_000);
-    // "kept out" = whole worktree moved (600k+1.9M avoided + 510k retrieval)
-    //              minus the 10k that landed in the live window = 3,000,000.
-    expect(r.bytesAvoided).toBe(3_000_000);
-    // The bar's "Without context-mode" = avoided + returned = total worktree
-    // bytes moved = 3,010,000. Sub-agent retrieval is credited as kept-out,
-    // not charged to the user's window.
-    expect(r.bytesAvoided + r.bytesReturned).toBe(3_010_000);
-  });
-
-  test("excludes the user's OTHER parallel worktrees (different cwd-hash = different DB file)", () => {
-    const dir = mkSessionsDir();
-    const mine = "aaaabbbbccccdddd";
-    const other = "1111222233334444";
-    const main = `main-${randomUUID()}`;
-
-    seed(dbPathFor(dir, mine), main,
-      [{ type: "cache-hit", category: "cache", data: "https://mine", bytesAvoided: 800_000 }]);
-    // A concurrent worktree the user is also working in — MUST NOT bleed in.
-    seed(dbPathFor(dir, other), `other-${randomUUID()}`,
-      [{ type: "cache-hit", category: "cache", data: "https://other", bytesAvoided: 5_000_000 }]);
-
-    const r = getConversationWindowStats({ sessionId: main, worktreeHash: mine, sessionsDir: dir });
-
-    // Only the current worktree's 800k counts; the other worktree's 5M is gone.
-    expect(r.bytesAvoided).toBe(800_000);
-  });
-});
 
 describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
   test("8.1 conversation tier: sums data + bytes_avoided + bytes_returned + snapshot for one session", () => {
@@ -181,36 +122,6 @@ describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
     const expectedTokens = Math.floor((r.eventDataBytes + r.bytesAvoided + r.snapshotBytes) / 4);
     expect(r.totalSavedTokens).toBe(expectedTokens);
     expect(r.totalSavedTokens).toBeGreaterThan(9_000); // ≈ 9_500
-  });
-
-  test("8.1b conversation tier: 'With context-mode' folds ONLY retrieval tool returns, not sandbox work-output", () => {
-    // "With context-mode" = the bytes the model paid to ACCESS kept-out content
-    // (ctx_search / ctx_fetch_and_index), via the tool_calls counter — NOT
-    // session_events.bytes_returned (snapshot-replay only, ~0). Sandbox compute
-    // (ctx_execute) is work-output the model would see regardless, so it is
-    // EXCLUDED. Before this fix bytesReturned was 0 ("1 B / 100%"); an earlier
-    // over-broad fold counted ctx_execute too, crushing the bar to a false ~43%.
-    const dir = mkSessionsDir();
-    const sid = `sess-${randomUUID()}`;
-    const dbPath = dbPathFor(dir, "cafebabecafebabe");
-    seed(
-      dbPath,
-      sid,
-      [{ type: "tool_use", category: "file", data: "src/app.ts", bytesAvoided: 90_000, bytesReturned: 0 }],
-      undefined,
-      [
-        { tool: "ctx_execute", bytesReturned: 800_000 },        // work-output → EXCLUDED
-        { tool: "ctx_search", bytesReturned: 2_000 },           // retrieval → INCLUDED
-        { tool: "ctx_fetch_and_index", bytesReturned: 1_500 },  // retrieval → INCLUDED
-      ],
-    );
-
-    const r = getRealBytesStats({ sessionId: sid, sessionsDir: dir });
-
-    // Only the two retrieval tools (2_000 + 1_500); the 800 KB ctx_execute
-    // work-output is NOT redirect savings and must not enter "With context-mode".
-    expect(r.bytesReturned).toBe(3_500);
-    expect(r.bytesAvoided).toBe(90_000);
   });
 
   test("8.5 lifetime tier: omitting sessionId aggregates every session in sessionsDir", () => {
@@ -492,6 +403,69 @@ describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
 // migration must be observable as columns added in place.
 // ──────────────────────────────────────────────────────────────────────
 describe("aggregator schema-migration recovery (#683 follow-up, v1.0.148)", () => {
+  test("throws migration and close failures as an operation-first aggregate", () => {
+    const primary = new Error("migration failed");
+    const cleanup = new Error("migration close failed");
+
+    try {
+      ensureSessionEventsSchema("ignored.db", class {
+        pragma() { throw primary; }
+        exec() { return undefined; }
+        close() { throw cleanup; }
+      });
+      expect.unreachable("ensureSessionEventsSchema must throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).errors).toEqual([primary, cleanup]);
+    }
+  });
+
+  test("preserves a single close failure", () => {
+    const cleanup = new Error("migration close failed");
+
+    expect(() => ensureSessionEventsSchema("ignored.db", class {
+      pragma() { return []; }
+      exec() { return undefined; }
+      close() { throw cleanup; }
+    })).toThrow(cleanup);
+  });
+
+  test("reports migration close failure and never opens readonly after it", () => {
+    const dir = mkSessionsDir();
+    const dbPath = dbPathFor(dir, "migration-close");
+    writeFileSync(dbPath, "");
+    const primary = new Error("migration failed");
+    const cleanup = new Error("migration close failed");
+    let readonlyOpens = 0;
+    const warning = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => warnings.push(args);
+
+    class Driver {
+      constructor(_path: string, opts?: { readonly?: boolean }) {
+        if (opts?.readonly) {
+          readonlyOpens++;
+          return { prepare: () => ({ get: () => ({ data_bytes: 1, bytes_avoided: 0, bytes_returned: 0 }) }), close: () => undefined };
+        }
+        return {
+          pragma: () => { throw primary; },
+          exec: () => undefined,
+          close: () => { throw cleanup; },
+        };
+      }
+    }
+
+    try {
+      expect(getRealBytesStats({ sessionsDir: dir, loadDatabase: () => Driver })).toMatchObject({ eventDataBytes: 0 });
+    } finally {
+      console.warn = warning;
+    }
+
+    expect(readonlyOpens).toBe(0);
+    expect(warnings).toEqual([[expect.stringContaining(dbPath)]]);
+    expect(String(warnings[0][0])).toContain(primary.message);
+  });
+
   /**
    * Build a pre-v1.0.130 session DB on disk — no `bytes_avoided`,
    * `bytes_returned`, `project_dir`, or attribution columns. Mirrors

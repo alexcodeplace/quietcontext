@@ -21,7 +21,7 @@
  * in `src/session/db.ts`. Adapters expose only `getSessionDir()` for
  * storage-related path concerns.
  *
- * Issue #649 — `CONTEXT_MODE_DATA_DIR` universal storage override. Many
+ * Issue #649 — `QUIET_CONTEXT_DATA_DIR` universal storage override. Many
  * adapters (Pi, OMP, Gemini CLI, Codex, Cursor, …) had storage hardcoded to
  * `~/.<platform>/context-mode/sessions/` with no env-var escape hatch. CI
  * runners on NFS homes, dev containers, and shared-workspace setups need to
@@ -42,7 +42,7 @@ import { hashProjectDirCanonical } from "../session/db.js";
 
 /**
  * Universal storage-root override. Returns the resolved absolute path when
- * `CONTEXT_MODE_DATA_DIR` is set to a non-blank value, otherwise `null` so
+ * `QUIET_CONTEXT_DATA_DIR` is set to a non-blank value, otherwise `null` so
  * callers fall back to their platform-native default.
  *
  * Mirrors the `resolveClaudeConfigDir` contract for env-var handling
@@ -52,7 +52,7 @@ import { hashProjectDirCanonical } from "../session/db.js";
 export function resolveContextModeDataRoot(
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  const raw = env.CONTEXT_MODE_DATA_DIR;
+  const raw = env.QUIET_CONTEXT_DATA_DIR;
   if (!raw || raw.trim() === "") return null;
   if (raw.startsWith("~")) {
     return resolve(homedir(), raw.replace(/^~[/\\]?/, ""));
@@ -80,11 +80,11 @@ export abstract class BaseAdapter {
    * openclaw, opencode) override this and resolve their segments against
    * `projectDir` (or `process.cwd()` when omitted).
    *
-   * NOT relocated by `CONTEXT_MODE_DATA_DIR` (#649). The platform owns its
+   * NOT relocated by `QUIET_CONTEXT_DATA_DIR` (#649). The platform owns its
    * settings.json / hooks.json / config.toml location — relocating that
    * would silently fork platform behaviour from the platform's own tooling.
    * Use `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`, etc. to move
-   * platform-native config; use `CONTEXT_MODE_DATA_DIR` to move context-mode
+   * platform-native config; use `QUIET_CONTEXT_DATA_DIR` to move context-mode
    * storage independently.
    *
    * @param _projectDir Unused by the home-rooted default — accepted so
@@ -107,7 +107,7 @@ export abstract class BaseAdapter {
    * absolute by contract). Adapters with a different memory dir name (e.g.,
    * codex uses "memories" plural) override this.
    *
-   * Issue #649: when `CONTEXT_MODE_DATA_DIR` is set, memory follows storage
+   * Issue #649: when `QUIET_CONTEXT_DATA_DIR` is set, memory follows storage
    * to `<DATA_DIR>/context-mode/memory/` since persistent memory is
    * context-mode-owned state, not platform-native config.
    *

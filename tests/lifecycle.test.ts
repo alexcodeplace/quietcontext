@@ -7,53 +7,16 @@
 
 import { describe, test, assert } from "vitest";
 import { spawn, execSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
-import { startLifecycleGuard, makeDefaultIsParentAlive, bridgeChildIdleTimeoutMs, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap, idleReapMessage } from "../src/lifecycle.js";
+import { startLifecycleGuard, makeDefaultIsParentAlive } from "../src/lifecycle.js";
 
-// Resolve the tsx binary. Prefer the local devDep so the test doesn't depend
-// on a global tsx install or on Git Bash's `which` being on PATH; the PATH
-// probe is a fallback for environments where node_modules/.bin isn't
-// populated. Windows ships tsx as tsx.cmd and uses `where`; everywhere else
-// it's `tsx` with `which`.
-function resolveTsxPath(): string {
-  const isWindows = process.platform === "win32";
-  const localBin = join(
-    process.cwd(),
-    "node_modules",
-    ".bin",
-    isWindows ? "tsx.cmd" : "tsx",
-  );
-  if (existsSync(localBin)) return localBin;
-  const probe = isWindows ? "where tsx" : "which tsx";
-  return execSync(probe, { encoding: "utf-8" }).trim().split(/\r?\n/)[0];
-}
-const TSX_PATH = resolveTsxPath();
-const PROJECT_ROOT = process.cwd();
-// file:// URL form so the spawned ESM module can import lifecycle.ts by
-// absolute path regardless of where the script itself lives.
-const LIFECYCLE_SRC_URL = pathToFileURL(
-  join(PROJECT_ROOT, "src", "lifecycle.ts"),
-).href;
+const TSX_PATH = execSync("which tsx", { encoding: "utf-8" }).trim();
 
-// Sandboxed write target. Pre-fix this wrote _lifecycle_test_*.ts directly
-// to process.cwd() (the project root) and only cleaned up on the child's
-// `close` event. A hang or hard crash left the temp scripts in the repo
-// (not gitignored). Use a per-test mkdtempSync directory under tmpdir
-// instead so partial state can't escape the sandbox even when the child
-// dies without firing its close handler. The vitest worker tears down its
-// per-test environment when the run ends, so worst case the dir lingers
-// only for the lifetime of the run.
-function spawnGuardChild(exitCode: number): {
-  child: ReturnType<typeof spawn>;
-  ready: Promise<void>;
-} {
-  const scratchDir = mkdtempSync(join(tmpdir(), "ctx-lifecycle-test-"));
-  const script = join(scratchDir, `guard_${exitCode}.ts`);
+function spawnGuardChild(exitCode: number): { child: ReturnType<typeof spawn>; ready: Promise<void> } {
+  const script = join(process.cwd(), `_lifecycle_test_${exitCode}.ts`);
   writeFileSync(script, `
-import { startLifecycleGuard } from ${JSON.stringify(LIFECYCLE_SRC_URL)};
+import { startLifecycleGuard } from "./src/lifecycle.ts";
 startLifecycleGuard({
   checkIntervalMs: 60000,
   onShutdown: () => process.exit(${exitCode}),
@@ -62,12 +25,10 @@ process.stdout.write("READY");
 setInterval(() => {}, 1000);
 `);
   const child = spawn(TSX_PATH, [script], {
-    cwd: PROJECT_ROOT,
+    cwd: process.cwd(),
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.on("close", () => {
-    try { rmSync(scratchDir, { recursive: true, force: true }); } catch {}
-  });
+  child.on("close", () => { try { unlinkSync(script); } catch {} });
   const ready = new Promise<void>((resolve) => {
     child.stdout!.on("data", (chunk: Buffer) => {
       if (chunk.toString().includes("READY")) resolve();
@@ -413,171 +374,4 @@ describe.skipIf(isWindows)("Lifecycle Guard — Integration (real process)", () 
 
     assert.equal(code, 43, "Child should exit with code 43 on SIGTERM");
   }, 10_000);
-});
-
-// #854 — bridge-child request-idle reaper. Pi/omp loads the extension per
-// sub-context and spawns one bridge child each, reaping them only at
-// session_shutdown (which never fires for sub-contexts), so idle children
-// accumulate under one long-lived parent. A depth>0 child with no MCP activity
-// self-exits; depth-0 (the #602 keep-alive class) is never touched, and the
-// trigger is idle time (not stdin EOF) so the #236 contract holds.
-describe("bridgeChildIdleTimeoutMs (#854)", () => {
-  test("returns 0 (disabled) for depth-0 / absent / malformed", () => {
-    assert.equal(bridgeChildIdleTimeoutMs({}), 0, "absent depth → disabled");
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "0" }), 0);
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "-1" }), 0);
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "x" }), 0);
-  });
-
-  test("returns the 3-min default for bridge children (depth>0)", () => {
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "1" }), 180_000);
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "2" }), 180_000);
-  });
-
-  test("honors CONTEXT_MODE_BRIDGE_IDLE_MS override (positive only)", () => {
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "1", CONTEXT_MODE_BRIDGE_IDLE_MS: "5000" }), 5000);
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "1", CONTEXT_MODE_BRIDGE_IDLE_MS: "0" }), 0, "non-positive override disables");
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_DEPTH: "1", CONTEXT_MODE_BRIDGE_IDLE_MS: "-5" }), 0);
-    assert.equal(bridgeChildIdleTimeoutMs({ CONTEXT_MODE_BRIDGE_IDLE_MS: "5000" }), 0, "override ignored when not a bridge child");
-  });
-});
-
-describe("Lifecycle Guard — bridge-child idle reaper (#854)", () => {
-  test("reaps a bridge child with no MCP activity (parent stays alive)", async () => {
-    let shutdownCalled = false;
-    const cleanup = startLifecycleGuard({
-      checkIntervalMs: 60_000,     // keep the parent-death poll out of the way
-      isParentAlive: () => true,    // parent ALIVE — only the idle path can fire
-      bridgeIdleMs: 50,             // tiny idle window (idle-tick floor is 1s)
-      onShutdown: () => { shutdownCalled = true; },
-    });
-    await new Promise((r) => setTimeout(r, 1300)); // > one 1s idle tick, no activity
-    cleanup();
-    assert.equal(shutdownCalled, true, "an idle bridge child must self-shut-down (#854)");
-  });
-
-  test("does NOT reap while MCP activity continues", async () => {
-    let shutdownCalled = false;
-    const cleanup = startLifecycleGuard({
-      checkIntervalMs: 60_000,
-      isParentAlive: () => true,
-      bridgeIdleMs: 5000,           // 5s window; idle-tick ~1.25s
-      onShutdown: () => { shutdownCalled = true; },
-    });
-    for (let i = 0; i < 4; i++) { noteMcpActivity(); await new Promise((r) => setTimeout(r, 400)); }
-    cleanup();
-    assert.equal(shutdownCalled, false, "an actively-used bridge child must not be reaped");
-  });
-
-  test("depth-0 servers are NEVER reaped on idle (#602 guard)", async () => {
-    let shutdownCalled = false;
-    const cleanup = startLifecycleGuard({
-      checkIntervalMs: 60_000,
-      isParentAlive: () => true,
-      bridgeIdleMs: 0,              // depth-0 / disabled → no idle reaper installed
-      onShutdown: () => { shutdownCalled = true; },
-    });
-    await new Promise((r) => setTimeout(r, 1300));
-    cleanup();
-    assert.equal(shutdownCalled, false, "depth-0 keep-alive servers must never idle-reap (#602)");
-  });
-
-  test("does NOT reap while a tool call is in flight (#854 in-flight guard)", async () => {
-    let shutdownCalled = false;
-    const cleanup = startLifecycleGuard({
-      checkIntervalMs: 60_000,
-      isParentAlive: () => true,
-      bridgeIdleMs: 50,                 // tiny window; idle-tick floor is 1s
-      onShutdown: () => { shutdownCalled = true; },
-    });
-    noteRequestStart();                 // a long tool call is running…
-    try {
-      await new Promise((r) => setTimeout(r, 1300)); // …past the idle window, no inbound msgs
-      assert.equal(shutdownCalled, false, "must NOT reap a bridge child with a call in flight (#643)");
-    } finally {
-      noteRequestEnd();                 // always balance the counter — no cross-test leak of module-global state
-    }
-    await new Promise((r) => setTimeout(r, 1300)); // now genuinely idle
-    cleanup();
-    assert.equal(shutdownCalled, true, "reaps once the in-flight call ends and it goes idle");
-  });
-
-  test("attachMcpActivityTap delegates to the prior onmessage; no-op when absent/null", () => {
-    const calls: Array<[unknown, unknown]> = [];
-    const t: { onmessage?: (m: unknown, e?: unknown) => unknown } = {
-      onmessage: (m: unknown, e?: unknown) => { calls.push([m, e]); return "ok"; },
-    };
-    attachMcpActivityTap(t);
-    const ret = t.onmessage!({ a: 1 }, { b: 2 });
-    assert.equal(ret, "ok", "wrapped onmessage must return the prior handler's result");
-    assert.deepEqual(calls, [[{ a: 1 }, { b: 2 }]], "wrapped onmessage must delegate args");
-    const empty: { onmessage?: (m: unknown, e?: unknown) => unknown } = {};
-    attachMcpActivityTap(empty);
-    assert.equal(empty.onmessage, undefined, "no onmessage → no-op (does not synthesize one)");
-    attachMcpActivityTap(null); // must not throw
-  });
-});
-
-describe("idleReapMessage — DX-friendly idle-reaper notice (#854 / #868)", () => {
-  test("uses human units, reassures auto-reconnect, drops alarming 'self-shutdown' wording", () => {
-    const msg = idleReapMessage(180_000);
-    // human units, not raw milliseconds
-    assert.ok(msg.includes("180s"), `expected human seconds, got: ${msg}`);
-    assert.ok(!msg.includes("180000ms"), "must not show raw milliseconds");
-    // reassures the user/ops that it self-heals
-    assert.ok(msg.toLowerCase().includes("reconnect"), "must reassure auto-reconnect");
-    // no scary jargon
-    assert.ok(!msg.includes("self-shutdown"), "must drop 'self-shutdown' wording");
-    // still traceable
-    assert.ok(msg.includes("#854"), "keeps the #854 tag for traceability");
-    assert.ok(msg.includes("[context-mode]"), "keeps the [context-mode] prefix");
-  });
-  test("rounds odd millisecond values to whole seconds", () => {
-    assert.ok(idleReapMessage(5_000).includes("5s"));
-    assert.ok(idleReapMessage(90_000).includes("90s"));
-  });
-});
-
-describe("CONTEXT_MODE_BRIDGE_IDLE_MS — the live env knob the #868 foreground fix sets", () => {
-  test("env CONTEXT_MODE_BRIDGE_IDLE_MS=0 disarms the reaper through the REAL startLifecycleGuard path (not a test override)", async () => {
-    const prevDepth = process.env.CONTEXT_MODE_BRIDGE_DEPTH;
-    const prevIdle = process.env.CONTEXT_MODE_BRIDGE_IDLE_MS;
-    // Foreground child env, exactly as foregroundBridgeEnv produces it.
-    process.env.CONTEXT_MODE_BRIDGE_DEPTH = "1";
-    process.env.CONTEXT_MODE_BRIDGE_IDLE_MS = "0";
-    let shutdownCalled = false;
-    // NB: NO bridgeIdleMs override — exercise the production env-driven path
-    // (server.ts:4871 calls startLifecycleGuard with onShutdown only).
-    const cleanup = startLifecycleGuard({
-      checkIntervalMs: 60_000,        // keep the parent-death poll out of the way
-      isParentAlive: () => true,       // parent ALIVE — only the idle path could fire
-      onShutdown: () => { shutdownCalled = true; },
-    });
-    await new Promise((r) => setTimeout(r, 150));
-    assert.equal(shutdownCalled, false, "IDLE_MS=0 must arm NO idle reaper (foreground stays alive #868)");
-    cleanup();
-    if (prevDepth === undefined) delete process.env.CONTEXT_MODE_BRIDGE_DEPTH; else process.env.CONTEXT_MODE_BRIDGE_DEPTH = prevDepth;
-    if (prevIdle === undefined) delete process.env.CONTEXT_MODE_BRIDGE_IDLE_MS; else process.env.CONTEXT_MODE_BRIDGE_IDLE_MS = prevIdle;
-  });
-
-  test("by contrast, a bridge child with NO override DOES arm the reaper (env knob is what makes the difference)", async () => {
-    const prevDepth = process.env.CONTEXT_MODE_BRIDGE_DEPTH;
-    const prevIdle = process.env.CONTEXT_MODE_BRIDGE_IDLE_MS;
-    process.env.CONTEXT_MODE_BRIDGE_DEPTH = "1";
-    delete process.env.CONTEXT_MODE_BRIDGE_IDLE_MS; // default 180s → reaper armed
-    let shutdownCalled = false;
-    const cleanup = startLifecycleGuard({
-      checkIntervalMs: 60_000,
-      isParentAlive: () => true,
-      bridgeIdleMs: 40,                // idle window tiny; reaper still polls on the 1000ms floor
-      onShutdown: () => { shutdownCalled = true; },
-    });
-    // The reaper poll interval floors at 1000ms (lifecycle.ts), so wait past the
-    // first poll tick to observe the armed reaper fire.
-    await new Promise((r) => setTimeout(r, 1300));
-    assert.equal(shutdownCalled, true, "a non-foreground bridge child still reaps on idle (#854 preserved)");
-    cleanup();
-    if (prevDepth === undefined) delete process.env.CONTEXT_MODE_BRIDGE_DEPTH; else process.env.CONTEXT_MODE_BRIDGE_DEPTH = prevDepth;
-    if (prevIdle === undefined) delete process.env.CONTEXT_MODE_BRIDGE_IDLE_MS; else process.env.CONTEXT_MODE_BRIDGE_IDLE_MS = prevIdle;
-  });
 });

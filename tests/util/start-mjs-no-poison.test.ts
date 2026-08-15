@@ -14,22 +14,22 @@ import { join, resolve } from "node:path";
 
 function runStartMjsBootstrap(opts: {
   cwd: string;
-  preExisting?: { CLAUDE_PROJECT_DIR?: string; CONTEXT_MODE_PROJECT_DIR?: string };
-}): { CLAUDE_PROJECT_DIR: string | undefined; CONTEXT_MODE_PROJECT_DIR: string | undefined } {
+  preExisting?: { CLAUDE_PROJECT_DIR?: string; QUIET_CONTEXT_PROJECT_DIR?: string };
+}): { CLAUDE_PROJECT_DIR: string | undefined; QUIET_CONTEXT_PROJECT_DIR: string | undefined } {
   const code = `
     const isPluginInstallPath = (p) =>
-      /[/\\\\]\\.(claude|codex)[/\\\\]plugins[/\\\\](cache|marketplaces)[/\\\\]/.test(p);
+      /[/\\\\]\\.claude[/\\\\]plugins[/\\\\](cache|marketplaces)[/\\\\]/.test(p);
     const originalCwd = process.cwd();
     const safeOriginalCwd = isPluginInstallPath(originalCwd) ? null : originalCwd;
     if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
       process.env.CLAUDE_PROJECT_DIR = safeOriginalCwd;
     }
-    if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
-      process.env.CONTEXT_MODE_PROJECT_DIR = safeOriginalCwd;
+    if (!process.env.QUIET_CONTEXT_PROJECT_DIR && safeOriginalCwd) {
+      process.env.QUIET_CONTEXT_PROJECT_DIR = safeOriginalCwd;
     }
     process.stdout.write(JSON.stringify({
       CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR,
-      CONTEXT_MODE_PROJECT_DIR: process.env.CONTEXT_MODE_PROJECT_DIR,
+      QUIET_CONTEXT_PROJECT_DIR: process.env.QUIET_CONTEXT_PROJECT_DIR,
     }));
   `;
   const env: Record<string, string> = {
@@ -37,7 +37,7 @@ function runStartMjsBootstrap(opts: {
     HOME: process.env.HOME ?? "",
   };
   if (opts.preExisting?.CLAUDE_PROJECT_DIR) env.CLAUDE_PROJECT_DIR = opts.preExisting.CLAUDE_PROJECT_DIR;
-  if (opts.preExisting?.CONTEXT_MODE_PROJECT_DIR) env.CONTEXT_MODE_PROJECT_DIR = opts.preExisting.CONTEXT_MODE_PROJECT_DIR;
+  if (opts.preExisting?.QUIET_CONTEXT_PROJECT_DIR) env.QUIET_CONTEXT_PROJECT_DIR = opts.preExisting.QUIET_CONTEXT_PROJECT_DIR;
   const out = execFileSync(process.execPath, ["-e", code], { cwd: opts.cwd, env, encoding: "utf8" });
   return JSON.parse(out);
 }
@@ -48,13 +48,6 @@ describe("start.mjs env bootstrap — plugin path no-poison", () => {
     const root = mkdtempSync(join(tmpdir(), "ctx-fake-plugin-"));
     cleanup.push(root);
     const pluginPath = join(root, ".claude", "plugins", "cache", "context-mode", "context-mode", "1.0.113");
-    mkdirSync(pluginPath, { recursive: true });
-    return pluginPath;
-  };
-  const makeCodexPluginDir = () => {
-    const root = mkdtempSync(join(tmpdir(), "ctx-fake-plugin-"));
-    cleanup.push(root);
-    const pluginPath = join(root, ".codex", "plugins", "cache", "context-mode", "context-mode", "1.0.151");
     mkdirSync(pluginPath, { recursive: true });
     return pluginPath;
   };
@@ -73,18 +66,11 @@ describe("start.mjs env bootstrap — plugin path no-poison", () => {
     }
   });
 
-  it("does NOT set CLAUDE_PROJECT_DIR or CONTEXT_MODE_PROJECT_DIR when cwd is plugin install path", () => {
+  it("does NOT set CLAUDE_PROJECT_DIR or QUIET_CONTEXT_PROJECT_DIR when cwd is plugin install path", () => {
     const pluginPath = makePluginDir();
     const result = runStartMjsBootstrap({ cwd: pluginPath });
     expect(result.CLAUDE_PROJECT_DIR).toBeUndefined();
-    expect(result.CONTEXT_MODE_PROJECT_DIR).toBeUndefined();
-  });
-
-  it("does NOT set CLAUDE_PROJECT_DIR or CONTEXT_MODE_PROJECT_DIR when cwd is Codex plugin install path", () => {
-    const pluginPath = makeCodexPluginDir();
-    const result = runStartMjsBootstrap({ cwd: pluginPath });
-    expect(result.CLAUDE_PROJECT_DIR).toBeUndefined();
-    expect(result.CONTEXT_MODE_PROJECT_DIR).toBeUndefined();
+    expect(result.QUIET_CONTEXT_PROJECT_DIR).toBeUndefined();
   });
 
   it("DOES set both env vars to cwd when cwd is a normal project path", () => {
@@ -93,7 +79,7 @@ describe("start.mjs env bootstrap — plugin path no-poison", () => {
     const expected = realpathSync(projectPath);
     const result = runStartMjsBootstrap({ cwd: projectPath });
     expect(result.CLAUDE_PROJECT_DIR).toBe(expected);
-    expect(result.CONTEXT_MODE_PROJECT_DIR).toBe(expected);
+    expect(result.QUIET_CONTEXT_PROJECT_DIR).toBe(expected);
   });
 
   it("preserves a pre-set CLAUDE_PROJECT_DIR even when cwd is plugin path", () => {
@@ -105,3 +91,4 @@ describe("start.mjs env bootstrap — plugin path no-poison", () => {
     expect(result.CLAUDE_PROJECT_DIR).toBe("/Users/x/preset/proj");
   });
 });
+

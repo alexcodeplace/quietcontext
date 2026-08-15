@@ -28,13 +28,13 @@ describe("getWorktreeSuffix", () => {
     expect(suffix).toMatch(/^(__[a-f0-9]{8})?$/);
   });
 
-  it("returns empty string when CONTEXT_MODE_SESSION_SUFFIX is empty", () => {
-    vi.stubEnv("CONTEXT_MODE_SESSION_SUFFIX", "");
+  it("returns empty string when QUIET_CONTEXT_SESSION_SUFFIX is empty", () => {
+    vi.stubEnv("QUIET_CONTEXT_SESSION_SUFFIX", "");
     expect(getWorktreeSuffix()).toBe("");
   });
 
-  it("returns __<value> when CONTEXT_MODE_SESSION_SUFFIX is set", () => {
-    vi.stubEnv("CONTEXT_MODE_SESSION_SUFFIX", "my-worktree");
+  it("returns __<value> when QUIET_CONTEXT_SESSION_SUFFIX is set", () => {
+    vi.stubEnv("QUIET_CONTEXT_SESSION_SUFFIX", "my-worktree");
     expect(getWorktreeSuffix()).toBe("__my-worktree");
   });
 

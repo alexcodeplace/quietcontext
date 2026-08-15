@@ -386,7 +386,7 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
   }
 
   // ── Explicit platform override ────────────────────────
-  const platformOverride = process.env.CONTEXT_MODE_PLATFORM;
+  const platformOverride = process.env.QUIET_CONTEXT_PLATFORM;
   if (platformOverride) {
     const validPlatforms: PlatformId[] = [
       "claude-code", "gemini-cli", "kilo", "opencode", "codex",
@@ -396,7 +396,7 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
       return {
         platform: platformOverride as PlatformId,
         confidence: "high",
-        reason: `CONTEXT_MODE_PLATFORM=${platformOverride} override`,
+        reason: `QUIET_CONTEXT_PLATFORM=${platformOverride} override`,
       };
     }
   }

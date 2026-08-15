@@ -38,15 +38,6 @@ function makeForeignLeakEnv(): Record<string, string> {
 }
 
 describe("server getProjectDir wiring — strictPlatform for all adapters (issue #545)", () => {
-  const cleanup: string[] = [];
-
-  afterEach(() => {
-    while (cleanup.length) {
-      const p = cleanup.pop();
-      if (p) try { rmSync(p, { recursive: true, force: true }); } catch {}
-    }
-  });
-
   // Adapters with at least one workspace var.
   const platformsWithOwnVar: ReadonlyArray<PlatformId> = [
     "claude-code",
@@ -67,8 +58,6 @@ describe("server getProjectDir wiring — strictPlatform for all adapters (issue
     "kiro",
     "zed",
     "antigravity",
-    "antigravity-cli",
-    "copilot-cli",
     "openclaw",
   ];
 
@@ -94,11 +83,11 @@ describe("server getProjectDir wiring — strictPlatform for all adapters (issue
   }
 
   for (const platform of platformsNoOwnVar) {
-    it(`platform=${platform} (no workspace var): strict mode falls back to CONTEXT_MODE_PROJECT_DIR`, () => {
+    it(`platform=${platform} (no workspace var): strict mode falls back to QUIET_CONTEXT_PROJECT_DIR`, () => {
       // Even with every foreign leak set, the universal escape hatch wins.
       const env = {
         ...makeForeignLeakEnv(),
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       };
       const result = resolveProjectDir({
         env,
@@ -111,12 +100,6 @@ describe("server getProjectDir wiring — strictPlatform for all adapters (issue
   }
 
   it("every platform: with no own var set and no escape hatch, falls through to PWD", () => {
-    // Keep the pure resolver matrix independent from the developer's live
-    // Codex session logs. The production Codex branch intentionally checks
-    // session logs before PWD, so this fixture must provide an empty home.
-    const emptyCodexHome = mkdtempSync(join(tmpdir(), "ctx-empty-codex-home-"));
-    cleanup.push(emptyCodexHome);
-
     const allPlatforms: ReadonlyArray<PlatformId> = [
       ...platformsWithOwnVar,
       ...platformsNoOwnVar,
@@ -127,7 +110,6 @@ describe("server getProjectDir wiring — strictPlatform for all adapters (issue
         cwd: "/anchor/cwd",
         pwd: "/Users/x/from-shell",
         strictPlatform: platform,
-        codexHome: platform === "codex" ? emptyCodexHome : undefined,
       });
       // No own workspace var matches (we set leaks, not the platform's own
       // value). PWD is the next tier. PI / OMP have own vars set in the
@@ -179,9 +161,9 @@ describe("getProjectDir() under Codex platform detection (issue #45)", () => {
       "CLAUDE_PROJECT_DIR", "GEMINI_PROJECT_DIR", "VSCODE_CWD",
       "OPENCODE_PROJECT_DIR", "PI_PROJECT_DIR", "PI_WORKSPACE_DIR",
       "IDEA_INITIAL_DIRECTORY", "CURSOR_CWD", "QWEN_PROJECT_DIR",
-      "CONTEXT_MODE_PROJECT_DIR", "PI_CODING_AGENT_DIR",
+      "QUIET_CONTEXT_PROJECT_DIR", "PI_CODING_AGENT_DIR",
       "CODEX_THREAD_ID", "CODEX_CI", "CODEX_HOME",
-      "CONTEXT_MODE_PLATFORM",
+      "QUIET_CONTEXT_PLATFORM",
     ]) {
       savedEnv[k] = process.env[k];
       delete process.env[k];
@@ -218,7 +200,7 @@ describe("getProjectDir() under Codex platform detection (issue #45)", () => {
     // Force the detector to "codex" deterministically — clearer than
     // relying on CODEX_THREAD_ID alone (the detector also reads
     // ~/.claude existence which is true on dev machines).
-    process.env.CONTEXT_MODE_PLATFORM = "codex";
+    process.env.QUIET_CONTEXT_PLATFORM = "codex";
 
     // server.ts captures `detectPlatform()` + env vars at call time
     // inside getProjectDir(), so a single static import + per-test env

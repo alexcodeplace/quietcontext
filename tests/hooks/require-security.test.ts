@@ -1,10 +1,10 @@
 /**
- * CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed mode tests (#468 follow-up)
+ * QUIET_CONTEXT_REQUIRE_SECURITY=1 fail-closed mode tests (#468 follow-up)
  *
  * When the security module fails to load (e.g. build/security.js missing or
  * corrupt), the default behavior is fail-OPEN — a stderr warning is emitted
  * but routing continues. Security-conscious users can opt in to fail-CLOSED
- * by setting CONTEXT_MODE_REQUIRE_SECURITY=1, in which case every PreToolUse
+ * by setting QUIET_CONTEXT_REQUIRE_SECURITY=1, in which case every PreToolUse
  * event is denied with a clear reason until the security module loads cleanly.
  *
  * These tests exercise routePreToolUse() directly via a subprocess so the
@@ -67,25 +67,25 @@ function snippet(buildDir: string, toolName: string, toolInput: Record<string, u
 //
 // Bundle-first resolution (#558) means simulating "security can't load"
 // now requires BOTH the bundle path and the build path to point at
-// non-existent files. CONTEXT_MODE_SECURITY_BUNDLE_PATH is the test seam.
+// non-existent files. QUIET_CONTEXT_SECURITY_BUNDLE_PATH is the test seam.
 // All fail-closed tests below opt-in via this helper.
 // ─────────────────────────────────────────────────────────
 function missingBundlePath(label: string): string {
   return join(tmpdir(), `ctx-${label}-missing-bundle-${Date.now()}.bundle.mjs`);
 }
 
-describe("CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
+describe("QUIET_CONTEXT_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
   test("env unset + security init fails → routing passes through (default fail-OPEN preserved)", () => {
     const missingBuildDir = join(tmpdir(), `ctx-require-sec-unset-${Date.now()}`);
     const r = runChild(
       snippet(missingBuildDir, "Bash", { command: "ls" }),
       // Suppress the loud stderr warning — orthogonal to this test.
       {
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-        CONTEXT_MODE_REQUIRE_SECURITY: "",
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_REQUIRE_SECURITY: "",
         // #558 — neutralize the real hooks/security.bundle.mjs so the test
         // observes the "no security artifact present" path deterministically.
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundlePath("require-sec-unset"),
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: missingBundlePath("require-sec-unset"),
       },
     );
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -106,9 +106,9 @@ describe("CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
     const r = runChild(
       snippet(missingBuildDir, "Bash", { command: "ls" }),
       {
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-        CONTEXT_MODE_REQUIRE_SECURITY: "1",
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundlePath("require-sec-on"),
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_REQUIRE_SECURITY: "1",
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: missingBundlePath("require-sec-on"),
       },
     );
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -128,7 +128,7 @@ describe("CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
     );
     // Reason must include a bypass hint so users aren't stuck.
     assert.ok(
-      parsed.decision.reason.includes("CONTEXT_MODE_REQUIRE_SECURITY"),
+      parsed.decision.reason.includes("QUIET_CONTEXT_REQUIRE_SECURITY"),
       `reason should mention the env var to disable: ${parsed.decision.reason}`,
     );
   });
@@ -147,7 +147,7 @@ describe("CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
       const r = runChild(
         // `ls` is structurally bounded → routePreToolUse returns null (passthrough).
         snippet(buildDir, "Bash", { command: "ls" }),
-        { CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1", CONTEXT_MODE_REQUIRE_SECURITY: "1" },
+        { QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1", QUIET_CONTEXT_REQUIRE_SECURITY: "1" },
       );
       assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
       const parsed = JSON.parse(r.stdout);
@@ -171,9 +171,9 @@ describe("CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
     const r = runChild(
       snippet(missingBuildDir, "Read", { file_path: "/etc/passwd" }),
       {
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-        CONTEXT_MODE_REQUIRE_SECURITY: "1",
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundlePath("require-sec-read"),
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_REQUIRE_SECURITY: "1",
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: missingBundlePath("require-sec-read"),
       },
     );
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -195,13 +195,13 @@ describe("CONTEXT_MODE_REQUIRE_SECURITY=1 fail-closed (#468 follow-up)", () => {
 // `initSecurity()` try the bundle FIRST, falling back to `build/security.js`
 // only when the bundle is absent.
 //
-// The CONTEXT_MODE_SECURITY_BUNDLE_PATH env var is the test seam — it lets
+// The QUIET_CONTEXT_SECURITY_BUNDLE_PATH env var is the test seam — it lets
 // the subprocess point initSecurity() at a staged bundle in a temp dir
 // instead of the real `hooks/security.bundle.mjs` (which would pollute the
 // repo and create a chicken-and-egg with the bundle generation step).
 
 describe("initSecurity — bundle-first resolution (#558)", () => {
-  test("loads security from CONTEXT_MODE_SECURITY_BUNDLE_PATH when build/security.js is missing (marketplace scenario)", () => {
+  test("loads security from QUIET_CONTEXT_SECURITY_BUNDLE_PATH when build/security.js is missing (marketplace scenario)", () => {
     // Stage a valid security bundle in tmpdir. Build dir does NOT exist
     // (mirroring marketplace installs where .gitignore excludes build/).
     const bundleDir = mkdtempSync(join(tmpdir(), "ctx-sec-bundle-"));
@@ -217,9 +217,9 @@ describe("initSecurity — bundle-first resolution (#558)", () => {
       const r = runChild(
         snippet(missingBuildDir, "Bash", { command: "ls" }),
         {
-          CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-          CONTEXT_MODE_REQUIRE_SECURITY: "",
-          CONTEXT_MODE_SECURITY_BUNDLE_PATH: bundlePath,
+          QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+          QUIET_CONTEXT_REQUIRE_SECURITY: "",
+          QUIET_CONTEXT_SECURITY_BUNDLE_PATH: bundlePath,
         },
       );
       assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -243,9 +243,9 @@ describe("initSecurity — bundle-first resolution (#558)", () => {
         // Do NOT suppress — we want to assert the warning string contains
         // bundle-aware fix guidance (so users on marketplace installs are
         // pointed at the right remediation, not just `npm run build`).
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "",
-        CONTEXT_MODE_REQUIRE_SECURITY: "",
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundlePath,
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "",
+        QUIET_CONTEXT_REQUIRE_SECURITY: "",
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: missingBundlePath,
       },
     );
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -290,9 +290,9 @@ describe("initSecurity — bundle-first resolution (#558)", () => {
       const r = runChild(
         snippet(buildDir, "Bash", { command: "ls" }),
         {
-          CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-          CONTEXT_MODE_REQUIRE_SECURITY: "",
-          CONTEXT_MODE_SECURITY_BUNDLE_PATH: bundlePath,
+          QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+          QUIET_CONTEXT_REQUIRE_SECURITY: "",
+          QUIET_CONTEXT_SECURITY_BUNDLE_PATH: bundlePath,
         },
       );
       assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);

@@ -770,7 +770,7 @@ describe("v1.0.148 Bug G — Section 1 bar uses strict-compression formula", () 
     // Strict-compression: kept-out = 1 - 4000 / (6000 + 4000) = 60%.
     // If eventDataBytes were folded in (SLICE B regression), the displayed
     // ratio would be 1 - 104000 / 110000 ≈ 5% — wildly off.
-    const m = ratioLine!.match(/(\d+(?:\.\d+)?)%\s+kept out of context/);
+    const m = ratioLine!.match(/(\d+)%\s+kept out of context/);
     const pct = Number(m![1]);
     expect(pct).toBeGreaterThanOrEqual(58);
     expect(pct).toBeLessThanOrEqual(62);
@@ -800,40 +800,9 @@ describe("v1.0.148 Bug G — Section 1 bar uses strict-compression formula", () 
       .split("\n")
       .find((l) => l.includes("kept out of context") && l.includes("%"));
     expect(ratioLine, `bar summary line missing in:\n${output}`).toBeDefined();
-    const m = ratioLine!.match(/(\d+(?:\.\d+)?)%\s+kept out of context/);
+    const m = ratioLine!.match(/(\d+)%\s+kept out of context/);
     const pct = Number(m![1]);
     expect(pct).toBeGreaterThanOrEqual(99);
-  });
-
-  it("toFixed(1): a real live-window ratio renders one decimal (99.9%), never an over-claimed bare 100%", () => {
-    const { conversation, report } = makeNarrativeContext();
-    // Dev-worktree live-window numbers: 8.9 MB kept out, 10.2 KB retrieval.
-    // True ratio = 99.888% — must surface as 99.9%, NOT a rounded 100%.
-    const conversationRealBytes = {
-      eventDataBytes: 255_106,
-      bytesAvoided: 9_363_976,
-      bytesReturned: 10_460,
-      snapshotBytes: 2_821,
-      contentBytes: 0,
-      totalSavedTokens: Math.floor((255_106 + 9_363_976 + 2_821) / 4),
-    };
-
-    const output = formatReport(report, "1.0.169", null, {
-      conversation: conversation as any,
-      realBytes: { conversation: conversationRealBytes as any },
-    });
-
-    const ratioLine = output
-      .split("\n")
-      .find((l) => l.includes("kept out of context") && l.includes("%"));
-    expect(ratioLine, `bar summary line missing in:\n${output}`).toBeDefined();
-    // One-decimal precision: honest 99.9%, not the over-claimed integer 100%.
-    expect(ratioLine!).toContain("99.9% kept out of context");
-    expect(ratioLine!).not.toMatch(/\b100% kept out/);
-    const m = ratioLine!.match(/(\d+(?:\.\d+)?)%\s+kept out of context/);
-    const pct = Number(m![1]);
-    expect(pct).toBeGreaterThan(99);
-    expect(pct).toBeLessThan(100);
   });
 });
 

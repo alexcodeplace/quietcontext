@@ -21,7 +21,12 @@ import { ContentStore } from "../../src/store.js";
 import { SessionDB, hashProjectDirCanonical } from "../../src/session/db.js";
 import { searchAllSources, type UnifiedSearchResult } from "../../src/search/unified.js";
 import { searchAutoMemory } from "../../src/search/auto-memory.js";
-import { extractSnippet, formatBatchQueryResults, positionsFromHighlight } from "../../src/server.js";
+import {
+  extractSnippet,
+  formatBatchQueryResults,
+  formatBatchResponse,
+  positionsFromHighlight,
+} from "../../src/server.js";
 
 // ─────────────────────────────────────────────────────────
 // Shared helpers
@@ -764,6 +769,42 @@ describe("Multi-source isolation (batch_execute path)", () => {
     assert.ok(!output.includes("24 hours"), "Should not leak older source content when current batch matches");
 
     store.close();
+  });
+
+  test("batch_execute formatter omits markdown and boilerplate", () => {
+    const store = createStore();
+    store.index({
+      content: "# Current Batch\n\nJWT tokens expire after 12 hours.",
+      source: "batch: current",
+    });
+
+    const output = formatBatchQueryResults(store, ["JWT tokens"], "batch: current").join("\n");
+    assert.ok(output.includes("query: JWT tokens"));
+    assert.ok(output.includes("Current Batch"));
+    assert.ok(!output.startsWith("#"));
+    assert.ok(!output.includes("**Tip:**"));
+
+    store.close();
+  });
+
+  test("batch response contains summary and matches only", () => {
+    const output = formatBatchResponse({
+      commandCount: 2,
+      totalLines: 12,
+      totalBytes: 2048,
+      indexedSections: 3,
+      queryCount: 1,
+      queryResults: ["query: tests\nCurrent Tests\n12 passing."],
+      timedOut: false,
+    });
+
+    assert.equal(
+      output,
+      "2 commands; 12 lines; 2.0KB; 3 sections indexed; 1 query.\n\nquery: tests\nCurrent Tests\n12 passing.",
+    );
+    assert.ok(!output.includes("## Commands"));
+    assert.ok(!output.includes("## Indexed Sections"));
+    assert.ok(!output.includes("Searchable terms"));
   });
 });
 

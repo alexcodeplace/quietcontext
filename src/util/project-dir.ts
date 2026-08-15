@@ -11,7 +11,7 @@ import { workspaceEnvVarsFor } from "../adapters/detect.js";
  * mode and bridge env scrubs. Documented as the cross-strict user override
  * for every adapter (set in `~/.<host>/mcp.json` env when nothing else works).
  */
-const UNIVERSAL_WORKSPACE_ENV = ["CONTEXT_MODE_PROJECT_DIR"] as const;
+const UNIVERSAL_WORKSPACE_ENV = ["QUIET_CONTEXT_PROJECT_DIR"] as const;
 
 /**
  * Frozen legacy candidate list — preserves bit-for-bit behavior of every
@@ -30,7 +30,7 @@ const LEGACY_NON_STRICT_CANDIDATES: readonly string[] = [
   "PI_PROJECT_DIR",
   "IDEA_INITIAL_DIRECTORY",
   "CURSOR_CWD",
-  "CONTEXT_MODE_PROJECT_DIR",
+  "QUIET_CONTEXT_PROJECT_DIR",
 ];
 
 /**
@@ -269,7 +269,7 @@ export function resolveCodexSessionCwd(opts?: {
  *
  * Resolution order:
  *   1. Adapter-priority env vars (CLAUDE / GEMINI / VSCODE / OPENCODE / PI /
- *      IDEA / CONTEXT_MODE) — first non-empty AND non-plugin-path wins.
+ *      IDEA / QUIET_CONTEXT) — first non-empty AND non-plugin-path wins.
  *   2. Claude Code transcript heuristic — read `cwd` from the most-recently-
  *      modified `~/.claude/projects/<encoded>/<session>.jsonl`. This is the
  *      most reliable signal when Claude Code launched MCP from a non-project

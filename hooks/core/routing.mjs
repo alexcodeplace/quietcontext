@@ -64,7 +64,7 @@ const _guidanceCounters = new Map();
 const EXTERNAL_MCP_NUDGE_DEFAULT = 10;
 const EXTERNAL_MCP_NUDGE_MIN = 1;
 const EXTERNAL_MCP_NUDGE_MAX = 100;
-const EXTERNAL_MCP_NUDGE_ENV = "CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY";
+const EXTERNAL_MCP_NUDGE_ENV = "QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY";
 
 function getExternalMcpNudgeEvery() {
   const raw = process.env[EXTERNAL_MCP_NUDGE_ENV];
@@ -83,7 +83,7 @@ function getExternalMcpNudgeEvery() {
 // string itself. The Gemini CLI adapter solves the same over-interception
 // problem with a matcher that only fires on large-output tools — "avoids
 // unnecessary hook overhead on lightweight tools" (README). We mirror that at
-// the routing layer: when CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES is set to
+// the routing layer: when QUIET_CONTEXT_BASH_NUDGE_MIN_COMMAND_BYTES is set to
 // N>0, an unbounded Bash command whose UTF-8 byte length is below N is treated
 // as expected-lightweight and the generic routing nudge is suppressed.
 //
@@ -94,7 +94,7 @@ function getExternalMcpNudgeEvery() {
 // nudge — curl/wget, inline-HTTP, and build-tool redirects run earlier and are
 // never relaxed, because those are deterministic floods regardless of command
 // length.
-const BASH_NUDGE_MIN_BYTES_ENV = "CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES";
+const BASH_NUDGE_MIN_BYTES_ENV = "QUIET_CONTEXT_BASH_NUDGE_MIN_COMMAND_BYTES";
 const BASH_NUDGE_MIN_BYTES_MAX = 100_000;
 
 function getBashNudgeMinCommandBytes() {
@@ -378,7 +378,7 @@ let securityInitFailed = false;
  *
  * Bundle path is computed from `import.meta.url` (sibling layout:
  * `hooks/core/routing.mjs` → `hooks/security.bundle.mjs`).
- * `CONTEXT_MODE_SECURITY_BUNDLE_PATH` is a test seam — it lets
+ * `QUIET_CONTEXT_SECURITY_BUNDLE_PATH` is a test seam — it lets
  * subprocess-based tests stage a bundle in tmpdir without polluting the
  * repo's hooks/ directory.
  */
@@ -393,7 +393,7 @@ export async function initSecurity(buildDir) {
     "..",
     "security.bundle.mjs",
   );
-  const bundlePath = process.env.CONTEXT_MODE_SECURITY_BUNDLE_PATH || defaultBundlePath;
+  const bundlePath = process.env.QUIET_CONTEXT_SECURITY_BUNDLE_PATH || defaultBundlePath;
   const secPath = resolve(buildDir, "security.js");
 
   // Bundle-first: marketplace installs ship the bundle, never the build/ dir.
@@ -402,7 +402,7 @@ export async function initSecurity(buildDir) {
       security = await import(pathToFileURL(bundlePath).href);
       return true;
     } catch (err) {
-      if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
+      if (!securityInitFailed && !process.env.QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING) {
         process.stderr.write(
           `[context-mode] WARNING: failed to load security bundle (${bundlePath}) — deny patterns NOT enforced: ${err?.message ?? err}\n`,
         );
@@ -418,7 +418,7 @@ export async function initSecurity(buildDir) {
       security = await import(pathToFileURL(secPath).href);
       return true;
     } catch (err) {
-      if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
+      if (!securityInitFailed && !process.env.QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING) {
         process.stderr.write(
           `[context-mode] WARNING: failed to load security module — deny patterns NOT enforced: ${err?.message ?? err}\n`,
         );
@@ -430,12 +430,12 @@ export async function initSecurity(buildDir) {
 
   // Neither artifact present — preserve fail-open with an actionable warning
   // that mentions BOTH paths so users on either install model can self-diagnose.
-  if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
+  if (!securityInitFailed && !process.env.QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING) {
     process.stderr.write(
       `[context-mode] WARNING: security module not found — security deny patterns will NOT be enforced.\n` +
         `  Searched: ${bundlePath} (bundle) and ${secPath} (build).\n` +
         `  Marketplace installs ship hooks/security.bundle.mjs via CI; for source checkouts run \`npm run bundle\` (or \`npm run build\`).\n` +
-        `  Set CONTEXT_MODE_SUPPRESS_SECURITY_WARNING=1 to silence.\n`,
+        `  Set QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING=1 to silence.\n`,
     );
   }
   securityInitFailed = true;
@@ -483,8 +483,8 @@ export function buildSecurityWarningContext() {
     "  <fix>",
     "    Run `npm run bundle` from the context-mode source checkout, OR",
     "    upgrade context-mode to v1.0.127+ (which ships hooks/security.bundle.mjs",
-    "    via CI). To opt in to fail-CLOSED instead, set CONTEXT_MODE_REQUIRE_SECURITY=1.",
-    "    To silence this warning while you investigate, set CONTEXT_MODE_SUPPRESS_SECURITY_WARNING=1.",
+    "    via CI). To opt in to fail-CLOSED instead, set QUIET_CONTEXT_REQUIRE_SECURITY=1.",
+    "    To silence this warning while you investigate, set QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING=1.",
     "  </fix>",
     "</context_mode_security_warning>",
   ].join("\n");
@@ -587,7 +587,7 @@ const MCP_PREFIX = "mcp__";
 const CURSOR_MCP_PREFIX = "MCP:";
 const KIRO_MCP_PREFIX = "@";
 const CTX_TOOL_PREFIX = "ctx_";
-const CONTEXT_MODE_SUBSTRING = "context-mode";
+const QUIET_CONTEXT_SUBSTRING = "context-mode";
 
 function isExternalMcpTool(toolName) {
   const raw = String(toolName ?? "");
@@ -596,7 +596,7 @@ function isExternalMcpTool(toolName) {
   if (raw.startsWith(MCP_PREFIX)) {
     const server = raw.slice(MCP_PREFIX.length).split("__")[0];
     if (!server) return false;
-    return !server.includes(CONTEXT_MODE_SUBSTRING);
+    return !server.includes(QUIET_CONTEXT_SUBSTRING);
   }
 
   // Cursor wire shape: `MCP:<tool>` — own tools are `MCP:ctx_*`. There is no
@@ -610,7 +610,7 @@ function isExternalMcpTool(toolName) {
   if (raw.startsWith(KIRO_MCP_PREFIX) && raw.includes("/")) {
     const server = raw.slice(KIRO_MCP_PREFIX.length).split("/")[0];
     if (!server) return false;
-    return !server.includes(CONTEXT_MODE_SUBSTRING);
+    return !server.includes(QUIET_CONTEXT_SUBSTRING);
   }
 
   return false;
@@ -673,17 +673,17 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   // ─── Opt-in fail-closed gate (#468 follow-up) ───
   // Default behavior on security-module load failure is fail-OPEN (a stderr
   // warning is emitted but routing continues). Security-conscious users can
-  // opt in to fail-CLOSED via CONTEXT_MODE_REQUIRE_SECURITY=1 — every PreToolUse
+  // opt in to fail-CLOSED via QUIET_CONTEXT_REQUIRE_SECURITY=1 — every PreToolUse
   // event is denied with a clear reason until the security module loads cleanly.
   // Universal gate (applies to all tools, not just Bash) since user `permissions.deny`
   // patterns may target Read/Write paths that would otherwise leak before security loads.
-  if (process.env.CONTEXT_MODE_REQUIRE_SECURITY === "1" && securityInitFailed) {
+  if (process.env.QUIET_CONTEXT_REQUIRE_SECURITY === "1" && securityInitFailed) {
     return {
       action: "deny",
       reason:
-        "context-mode: security module unavailable and CONTEXT_MODE_REQUIRE_SECURITY=1 — fail-closed engaged. " +
+        "context-mode: security module unavailable and QUIET_CONTEXT_REQUIRE_SECURITY=1 — fail-closed engaged. " +
         "Run `npm run build` (or reinstall context-mode) to restore security enforcement. " +
-        "To bypass, unset or set CONTEXT_MODE_REQUIRE_SECURITY=0.",
+        "To bypass, unset or set QUIET_CONTEXT_REQUIRE_SECURITY=0.",
     };
   }
 
@@ -826,7 +826,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     }
 
     // #817: opt-in size threshold. When the operator configures
-    // CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES, a short unbounded command is
+    // QUIET_CONTEXT_BASH_NUDGE_MIN_COMMAND_BYTES, a short unbounded command is
     // treated as expected-lightweight and passes through untouched — reserving
     // the nudge for commands large/complex enough to plausibly flood context.
     // Default (0) preserves current behavior, so large-output savings are not
@@ -1002,7 +1002,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   // otherwise spill into context. We don't deny or modify — the agent still needs
   // the tool's output; we just nudge it to pipe large results through ctx_execute.
   //
-  // Cadence: every N calls (default 10, tunable via CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY).
+  // Cadence: every N calls (default 10, tunable via QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY).
   // The original one-shot nudge (#529) was lost after context compaction in
   // MCP-heavy sessions (e.g. 50+ Jira calls in #567 follow-up), letting later
   // payloads flood context unchecked. Re-firing periodically keeps the guidance

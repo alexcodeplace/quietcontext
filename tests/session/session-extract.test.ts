@@ -282,13 +282,9 @@ describe("Git Events", () => {
     };
 
     const events = extractEvents(input);
-    // v1.0.161: commits with a -m message surface as type='git_commit' so the
-    // rollup aggregator can distinguish actual commits from other git ops.
-    // category stays 'git' for downstream consumers that filter by category.
-    const gitCategoryEvents = events.filter(e => e.category === "git");
-    assert.equal(gitCategoryEvents.length, 1);
-    assert.equal(gitCategoryEvents[0].type, "git_commit");
-    assert.equal(gitCategoryEvents[0].data, "feat: add session continuity");
+    const gitEvents = events.filter(e => e.type === "git");
+    assert.equal(gitEvents.length, 1);
+    assert.equal(gitEvents[0].data, "commit");
   });
 
   test("extracts git event from push command", () => {
@@ -796,6 +792,8 @@ describe("Intent Events", () => {
   // intentionally dropped from the intent schema — the renderer now
   // surfaces the raw user message via <recent_user_messages> so the
   // next LLM can still distinguish review/discuss tone end-to-end.
+  // The pie-chart in insight/server.mjs degrades gracefully when these
+  // modes are absent.
 });
 
 // ════════════════════════════════════════════

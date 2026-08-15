@@ -42,7 +42,7 @@ import {
   buildHookCommand as buildCopilotHookCommand,
 } from "./hooks.js";
 
-const COPILOT_PLUGIN_ENV = "CONTEXT_MODE_COPILOT_PLUGIN";
+const COPILOT_PLUGIN_ENV = "QUIET_CONTEXT_COPILOT_PLUGIN";
 
 function isCopilotPluginRuntime(): boolean {
   return process.env[COPILOT_PLUGIN_ENV] === "1";
@@ -163,7 +163,7 @@ export class CopilotCliAdapter extends CopilotBaseAdapter {
   }
 
   getSessionDir(): string {
-    // Parity with codex/kimi: honor CONTEXT_MODE_DATA_DIR first, else root
+    // Parity with codex/kimi: honor QUIET_CONTEXT_DATA_DIR first, else root
     // session storage at getConfigDir() (= copilotCliHome(), COPILOT_HOME-aware)
     // so the TS server reads sessions from the SAME place the hook runtime
     // (COPILOT_OPTS configDirEnv: "COPILOT_HOME") writes them. Without this, a

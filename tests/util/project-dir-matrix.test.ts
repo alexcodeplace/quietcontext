@@ -3,16 +3,16 @@
  *
  * For every (host, foreign) pair of registered platforms with host ≠ foreign:
  *   1. With foreign's workspace vars set to "/leak", host's workspace var
- *      (if any) set to "/own", CONTEXT_MODE_PROJECT_DIR set to "/escape":
+ *      (if any) set to "/own", QUIET_CONTEXT_PROJECT_DIR set to "/escape":
  *      - resolveProjectDir({ env, strictPlatform: host }) returns "/own"
  *        if host has a workspace var, else "/escape".
  *   2. Result is NEVER "/leak".
- *   3. With ONLY CONTEXT_MODE_PROJECT_DIR="/escape" set, result is "/escape"
+ *   3. With ONLY QUIET_CONTEXT_PROJECT_DIR="/escape" set, result is "/escape"
  *      for every host (universal escape hatch invariant).
  *
- * Generates 17 × 16 × 3 = 816 assertions from one parameterized test. Adding
- * adapter #18 to PLATFORM_ENV_VARS grows the matrix automatically — no edit
- * to this file. This is the structural test for MUST-3 (17 adapters equal).
+ * Generates 15 × 14 × 3 = 630 assertions from one parameterized test. Adding
+ * adapter #16 to PLATFORM_ENV_VARS grows the matrix automatically — no edit
+ * to this file. This is the structural test for MUST-3 (15 adapters equal).
  */
 
 import { describe, it, expect } from "vitest";
@@ -26,10 +26,9 @@ import {
 import type { PlatformId } from "../../src/adapters/types.js";
 
 // Hard-coded list of all registered platforms — kept in sync with detect.ts
-// CLIENT_NAME_TO_PLATFORM. If an 18th adapter is added, append it here.
+// CLIENT_NAME_TO_PLATFORM. If a 16th adapter is added, append it here.
 // (We can't reflect it from PLATFORM_ENV_VARS alone because some adapters
-// have no env vars — kiro, openclaw, antigravity-via-mcp-only, zed,
-// copilot-cli, antigravity-cli.)
+// have no env vars — kiro, openclaw, antigravity-via-mcp-only, zed.)
 const ALL_PLATFORMS: ReadonlyArray<PlatformId> = [
   "claude-code",
   "gemini-cli",
@@ -46,8 +45,6 @@ const ALL_PLATFORMS: ReadonlyArray<PlatformId> = [
   "zed",
   "pi",
   "omp",
-  "copilot-cli",
-  "antigravity-cli",
 ];
 
 describe("resolveProjectDir matrix — MUST-3 invariant (issue #545)", () => {
@@ -72,7 +69,7 @@ describe("resolveProjectDir matrix — MUST-3 invariant (issue #545)", () => {
         // Build adversarial env: every foreign workspace var = /leak/<name>,
         // host's own first workspace var (if any) = /own, escape = /escape.
         const env: Record<string, string> = {
-          CONTEXT_MODE_PROJECT_DIR: "/escape",
+          QUIET_CONTEXT_PROJECT_DIR: "/escape",
         };
         for (const fv of foreignVars) env[fv] = `/leak/${fv}`;
         if (ownVars.length > 0) env[ownVars[0]] = "/own";
@@ -106,9 +103,9 @@ describe("resolveProjectDir matrix — MUST-3 invariant (issue #545)", () => {
         assertions++;
 
         // Assert 3 (per-pair flavor of the universal escape hatch): with
-        // ONLY CONTEXT_MODE_PROJECT_DIR set, every host returns /escape.
+        // ONLY QUIET_CONTEXT_PROJECT_DIR set, every host returns /escape.
         // Voiding the foreign env to confirm escape hatch is universal.
-        const escapeOnlyEnv: Record<string, string> = { CONTEXT_MODE_PROJECT_DIR: "/escape-only" };
+        const escapeOnlyEnv: Record<string, string> = { QUIET_CONTEXT_PROJECT_DIR: "/escape-only" };
         // To keep the assertion strict per-pair, also confirm foreign's
         // workspace vars don't slip through when escape hatch is the only
         // candidate beyond noise (set foreign's first workspace var as a
@@ -127,7 +124,7 @@ describe("resolveProjectDir matrix — MUST-3 invariant (issue #545)", () => {
         assertions++;
       }
     }
-    // Sanity: with N=17 platforms, we expect 17 * 16 * 3 = 816 assertions.
+    // Sanity: with N=15 platforms, we expect 15 * 14 * 3 = 630 assertions.
     // Looser bound here to avoid the test itself becoming brittle if a
     // future adapter is added — just assert "many" and the per-iteration
     // expects above carry the real signal.

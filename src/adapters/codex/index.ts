@@ -443,7 +443,7 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDir(): string {
-    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // Issue #649: honor QUIET_CONTEXT_DATA_DIR universal storage override
     // before falling back to the $CODEX_HOME-rooted default. Settings.toml
     // and hooks.json continue to live under getConfigDir() so the Codex CLI
     // sees its own config in the expected place.
@@ -469,7 +469,7 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
 
   getMemoryDir(projectDir?: string): string {
     // Codex uses "memories" (plural), not the default "memory".
-    // Issue #649: honor CONTEXT_MODE_DATA_DIR for context-mode-owned
+    // Issue #649: honor QUIET_CONTEXT_DATA_DIR for context-mode-owned
     // persistent memory while preserving the platform-native plural folder
     // name so legacy Codex tooling continues to find it when DATA_DIR is
     // unset. Under the override, layout is `<DATA_DIR>/context-mode/memories`.

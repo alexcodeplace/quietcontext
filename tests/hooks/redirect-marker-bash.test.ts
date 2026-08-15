@@ -76,7 +76,7 @@ describe("D2 Phase 3 — bash-redirected marker pattern", () => {
       CLAUDE_CONFIG_DIR: join(fakeHome, ".claude"),
       CLAUDE_PROJECT_DIR: fakeProject,
       CLAUDE_SESSION_ID: sessionId,
-      CONTEXT_MODE_SESSION_SUFFIX: "",
+      QUIET_CONTEXT_SESSION_SUFFIX: "",
     };
     // Hooks hash the path AFTER normalizeWorktreePath() (\ → /), so the test
     // must apply the same normalization before SHA — otherwise on Windows the

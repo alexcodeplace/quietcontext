@@ -100,7 +100,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   }
 
   getSessionDir(): string {
-    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // Issue #649: honor QUIET_CONTEXT_DATA_DIR universal storage override
     // before falling back to the Claude-rooted default. The override moves
     // ONLY context-mode-owned state; settings.json + CLAUDE_CONFIG_DIR stay
     // intact below.

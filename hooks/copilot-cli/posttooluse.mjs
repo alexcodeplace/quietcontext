@@ -19,11 +19,11 @@ import { fileURLToPath } from "node:url";
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
 const { loadSessionDB, loadExtract, loadProjectAttribution } = createSessionLoaders(HOOK_DIR);
 const OPTS = COPILOT_OPTS;
-// Diagnostic log is opt-in via CONTEXT_MODE_DEBUG. PostToolUse fires on every
+// Diagnostic log is opt-in via QUIET_CONTEXT_DEBUG. PostToolUse fires on every
 // tool call, so an unconditional append-only log grows without bound under the
 // user's config dir. Gate it behind the env flag — same pattern as the kimi
 // hooks — so contributors can still capture it on demand. See #787 review.
-const DEBUG_LOG = process.env.CONTEXT_MODE_DEBUG
+const DEBUG_LOG = process.env.QUIET_CONTEXT_DEBUG
   ? join(resolveConfigDir(OPTS), "context-mode", "posttooluse-debug.log")
   : null;
 

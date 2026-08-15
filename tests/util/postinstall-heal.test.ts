@@ -47,12 +47,8 @@ function stagePostinstallPackage(): {
   scriptPath: string;
   packageDir: string;
 } {
-  const base = mkdtempSync(join(tmpdir(), "ctx-postinstall-global-root-"));
-  cleanups.push(base);
-  // Keep the fake package several levels below tmpdir. isGlobalInstall() only
-  // scans four ancestors; this prevents ambient markers like /tmp/.git from
-  // making the staged global-install fixture look like a contributor checkout.
-  const root = join(base, "npm", "lib", "node_modules", "context-mode");
+  const root = mkdtempSync(join(tmpdir(), "ctx-postinstall-pkg-"));
+  cleanups.push(root);
   const scriptsDir = join(root, "scripts");
   const hooksDir = join(root, "hooks");
   mkdirSync(scriptsDir, { recursive: true });

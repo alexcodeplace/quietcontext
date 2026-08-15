@@ -30,17 +30,11 @@ context-mode-guidance-*/
 # helps contributors during local dev. Untracked → can't regress.
 # Copy .mcp.json.example to .mcp.json for local dev.
 .mcp.json
-# Exception: the GitHub Copilot CLI plugin bundle ships its OWN .mcp.json (a
-# Copilot plugin discovers MCP from a `.mcp.json` in its root — real marketplace
-# plugins do the same). It is the plugin's config, NOT the repo-root dev file the
-# rule above guards, so un-ignore exactly this one path. It pins
-# CONTEXT_MODE_PLATFORM=copilot-cli so the server self-identifies as Copilot.
-!configs/copilot-cli/.mcp.json
 .claude-worktrees/
 .vibetree/
 .cw/
-# Dev-only pricing source: the full litellm catalog (~1.5MB) is the manual
-# refresh base for src/session/model-prices.json — never bundled into the plugin.
-tools/pricing/litellm-catalog.json
 /.cocoindex_code/
 /.kilo/
+.throwaway-codex/
+.throwaway-codex-data/
+test-workspace/

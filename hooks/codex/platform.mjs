@@ -1,1 +1,1 @@
-process.env.CONTEXT_MODE_PLATFORM = "codex";
+process.env.QUIET_CONTEXT_PLATFORM = "codex";

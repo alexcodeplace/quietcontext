@@ -1,8 +1,5 @@
-# Codex CLI — context-mode MCP server configuration
+# Codex CLI — QuietContext MCP server configuration
 # Add this to ~/.codex/config.toml
 
-[features]
-hooks = true
-
-[mcp_servers.context-mode]
-command = "context-mode"
+[mcp_servers.quietcontext]
+command = "quietcontext"

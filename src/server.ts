@@ -7,12 +7,12 @@ import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:ch
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
-import { request as httpsRequest } from "node:https";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -55,12 +55,7 @@ import {
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { appendRetrievalBytes } from "./session/retrieval-marker.js";
-import { searchAllSources } from "./search/unified.js";
-import {
-  buildCtxSearchInputSchema,
-  CTX_SEARCH_SHARED_MODE,
-  resolveProjectScope,
-} from "./search/ctx-search-schema.js";
+import { buildCtxSearchInputSchema } from "./search/ctx-search-schema.js";
 import { FloodGuard } from "./search/flood-guard.js";
 import { buildNodeCommand, type HookAdapter, type PlatformId, isInProcessPluginPlatform } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
@@ -72,7 +67,7 @@ import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
-const VERSION: string = (() => {
+export const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
     const p = resolve(__pkg_dir, rel);
     if (existsSync(p)) {
@@ -125,7 +120,7 @@ function getRuntimeAwarePackageRoot(platformId?: PlatformId): string {
 // process-wide OpenCode/Kilo host handlers. In Node, adding an
 // `uncaughtException` listener changes default crash behavior, so only the
 // standalone MCP process may install them.
-if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+if (process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS !== "1") {
   process.on("unhandledRejection", (err) => {
     process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
   });
@@ -141,7 +136,7 @@ if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
 const runtimes = detectRuntimes();
 const available = getAvailableLanguages(runtimes);
 export const server = new McpServer({
-  name: "context-mode",
+  name: "quietcontext",
   version: VERSION,
 });
 
@@ -156,7 +151,7 @@ export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
 export function shouldSuppressMcpToolsForNativePluginHost(
   opts: { embedded?: string; platform?: PlatformId; settings?: Record<string, unknown> | null } = {},
 ): boolean {
-  const embedded = opts.embedded ?? process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+  const embedded = opts.embedded ?? process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS;
   if (embedded === "1") return false;
   const platform = opts.platform ?? detectPlatform().platform;
   if (platform !== "opencode" && platform !== "kilo") return false;
@@ -274,22 +269,221 @@ export function registerEmptyToolsListHandler(target: McpServer = server): void 
   target.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
 }
 
-const originalRegisterTool = server.registerTool.bind(server);
-(server as unknown as { registerTool: (...args: unknown[]) => unknown }).registerTool = (...args: unknown[]) => {
-  const [name, config, handler] = args as [
-    string,
-    Record<string, unknown>,
-    (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-  ];
-  if (suppressMcpToolsForNativePluginHost) {
-    emitSuppressionDiagnostic();
-    return undefined;
-  }
-  const wrappedHandler = wrapToolHandler(name, handler);
-  REGISTERED_CTX_TOOLS.push({ name, config, handler: wrappedHandler });
-  args[2] = wrappedHandler;
-  return (originalRegisterTool as unknown as (...callArgs: unknown[]) => unknown)(...args);
+const nativeRegisterTool = server.registerTool.bind(server);
+const QUIET_TOOL_DESCRIPTIONS: Record<string, string> = {
+  execute: "Run sandboxed code; long programs return reusable refs.",
+  "exec-file": "Process one file; reuse cached programs across paths.",
+  index: "Index content, files, or directories into FTS5.",
+  search: "Search titles+refs; opt into previews or retrieve refs.",
+  "fetch-index": "Fetch and index URLs; return metadata only.",
+  batch: "Run commands, index output, return bounded matches.",
 };
+const quietLanguage = z.enum([
+  "javascript",
+  "typescript",
+  "python",
+  "shell",
+  "ruby",
+  "go",
+  "rust",
+  "php",
+  "perl",
+  "r",
+  "elixir",
+  "csharp",
+]);
+const QUIET_TOOL_SCHEMAS: Record<string, z.ZodType> = {
+  execute: z.object({
+    language: quietLanguage.optional(),
+    code: z.string().optional(),
+    script_ref: z.string().optional(),
+    max_bytes: z.number().optional(),
+    timeout: z.number().optional(),
+    background: z.boolean().optional(),
+    cwd: z.string().optional(),
+    intent: z.string().optional(),
+  }),
+  "exec-file": z.object({
+    path: z.string(),
+    language: quietLanguage.optional(),
+    code: z.string().optional(),
+    script_ref: z.string().optional(),
+    max_bytes: z.number().optional(),
+    timeout: z.number().optional(),
+    intent: z.string().optional(),
+  }),
+  index: z.object({
+    content: z.string().optional(),
+    path: z.string().optional(),
+    source: z.string().optional(),
+    include: z.array(z.string()).optional(),
+    exclude: z.array(z.string()).optional(),
+    maxDepth: z.number().optional(),
+    maxFiles: z.number().optional(),
+    extensions: z.array(z.string()).optional(),
+    respectGitignore: z.boolean().optional(),
+    followSymlinks: z.boolean().optional(),
+  }),
+  search: z.object({
+    queries: z.array(z.string()).optional(),
+    refs: z.array(z.string()).optional(),
+    preview: z.boolean().optional(),
+    max_bytes: z.number().optional(),
+    limit: z.number().optional(),
+    source: z.string().optional(),
+    contentType: z.enum(["code", "prose"]).optional(),
+  }),
+  "fetch-index": z.object({
+    url: z.string().optional(),
+    source: z.string().optional(),
+    requests: z.array(z.object({ url: z.string(), source: z.string().optional() })).optional(),
+    concurrency: z.number().optional(),
+    force: z.boolean().optional(),
+    ttl: z.number().optional(),
+  }),
+  batch: z.object({
+    commands: z.array(z.object({ label: z.string(), command: z.string() })),
+    queries: z.array(z.string()),
+    timeout: z.number().optional(),
+    concurrency: z.number().optional(),
+    cwd: z.string().optional(),
+    query_scope: z.enum(["batch", "global"]).optional(),
+    max_bytes: z.number().optional(),
+  }),
+};
+
+interface CachedScript {
+  digest: string;
+  language: string;
+  code: string;
+}
+
+const SCRIPT_CACHE_MIN_BYTES = 256;
+const SCRIPT_CACHE_MAX_ENTRIES = 64;
+const scriptCache = new Map<string, CachedScript>();
+
+function normalizeScriptRef(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.match(/^\[?s:([a-f0-9]{16,64})\]?$/i)?.[1] ?? trimmed;
+}
+
+function prepareQuietToolArgs(
+  name: string,
+  args: Record<string, unknown>,
+): { args: Record<string, unknown>; scriptRef?: string } {
+  if (name !== "execute" && name !== "exec-file") return { args };
+  const code = args.code;
+  const scriptRef = args.script_ref;
+  if (code !== undefined && scriptRef !== undefined) {
+    throw new Error("Provide code or script_ref, not both.");
+  }
+  if (scriptRef !== undefined) {
+    if (typeof scriptRef !== "string") throw new Error("script_ref must be a string.");
+    const cached = scriptCache.get(normalizeScriptRef(scriptRef));
+    if (!cached) throw new Error(`Unknown script_ref: ${scriptRef}`);
+    return {
+      args: { ...args, language: cached.language, code: cached.code },
+    };
+  }
+  if (typeof code !== "string" || Buffer.byteLength(code) < SCRIPT_CACHE_MIN_BYTES) {
+    return { args };
+  }
+  if (typeof args.language !== "string") return { args };
+  const digest = createHash("sha256")
+    .update(args.language)
+    .update("\0")
+    .update(code)
+    .digest("hex");
+  const shortRef = digest.slice(0, 16);
+  const collision = scriptCache.get(shortRef);
+  const ref = collision && collision.digest !== digest ? digest : shortRef;
+  if (!scriptCache.has(ref)) {
+    if (scriptCache.size >= SCRIPT_CACHE_MAX_ENTRIES) {
+      const oldest = scriptCache.keys().next().value;
+      if (oldest) scriptCache.delete(oldest);
+    }
+    scriptCache.set(ref, { digest, language: args.language, code });
+  }
+  return { args, scriptRef: ref };
+}
+
+const QUIET_RESPONSE_LIMITS: Record<string, number> = {
+  execute: 8 * 1024,
+  "exec-file": 8 * 1024,
+  search: 8 * 1024,
+  batch: 12 * 1024,
+};
+
+function quietResponseBudget(name: string, requested: unknown): number | undefined {
+  const hardLimit = QUIET_RESPONSE_LIMITS[name];
+  if (!hardLimit) return undefined;
+  if (requested === undefined) return hardLimit;
+  if (typeof requested !== "number" || !Number.isInteger(requested) || requested < 256 || requested > hardLimit) {
+    throw new Error(`max_bytes must be an integer from 256 through ${hardLimit}.`);
+  }
+  return requested;
+}
+
+function applyQuietResponsePolicy(
+  name: string,
+  result: unknown,
+  requestedBudget: unknown,
+  scriptRef?: string,
+): unknown {
+  const budget = quietResponseBudget(name, requestedBudget);
+  if (!budget || !result || typeof result !== "object") return result;
+  const candidate = result as { content?: unknown[] };
+  if (!Array.isArray(candidate.content)) return result;
+  let remaining = budget;
+  let refPending = scriptRef;
+  return {
+    ...candidate,
+    content: candidate.content.map((item) => {
+      if (!item || typeof item !== "object") return item;
+      const contentItem = item as { text?: unknown };
+      if (typeof contentItem.text !== "string") return item;
+      const suffix = refPending ? `\n[s:${refPending}]` : "";
+      let text = contentItem.text;
+      if (
+        (name === "execute" || name === "exec-file") &&
+        Buffer.byteLength(text + suffix) > remaining &&
+        !text.startsWith("Indexed ")
+      ) {
+        text = indexStdout(text, `${name}:response`).content[0].text;
+      }
+      text = capUtf8(text, Math.max(0, remaining - Buffer.byteLength(suffix))) + suffix;
+      remaining = Math.max(0, remaining - Buffer.byteLength(text));
+      refPending = undefined;
+      return { ...contentItem, text };
+    }),
+  };
+}
+
+function shortenToolReferences(value: string): string {
+  return value
+    .replaceAll("ctx_execute_file", "exec-file")
+    .replaceAll("ctx_fetch_and_index", "fetch-index")
+    .replaceAll("ctx_batch_execute", "batch")
+    .replaceAll("ctx_execute", "execute")
+    .replaceAll("ctx_search", "search")
+    .replaceAll("ctx_index", "index");
+}
+
+function shortenToolResult(result: unknown): unknown {
+  if (!result || typeof result !== "object") return result;
+  const candidate = result as { content?: unknown[] };
+  if (!Array.isArray(candidate.content)) return result;
+  return {
+    ...candidate,
+    content: candidate.content.map((item) => {
+      if (!item || typeof item !== "object") return item;
+      const contentItem = item as { text?: unknown };
+      return typeof contentItem.text === "string"
+        ? { ...contentItem, text: shortenToolReferences(contentItem.text) }
+        : item;
+    }),
+  };
+}
 
 function wrapToolHandler(
   name: string,
@@ -301,14 +495,14 @@ function wrapToolHandler(
     // emits no further inbound messages. Symmetric end in finally (success+error).
     noteRequestStart();
     try {
-      return await handler(toolArgs);
+      return shortenToolResult(await handler(toolArgs));
     } catch (err) {
       const result = storageErrorResult(err);
       if (result) {
         try {
-          return trackResponse(name, result);
+          return shortenToolResult(trackResponse(name, result));
         } catch (trackErr) {
-          if (trackErr instanceof StorageDirectoryError) return result;
+           if (trackErr instanceof StorageDirectoryError) return shortenToolResult(result);
           throw trackErr;
         }
       }
@@ -319,6 +513,33 @@ function wrapToolHandler(
   };
 }
 
+function registerQuietTool(
+  name: keyof typeof QUIET_TOOL_DESCRIPTIONS,
+  config: Record<string, unknown>,
+  handler: (toolArgs: any) => Promise<unknown> | unknown,
+): unknown {
+  if (suppressMcpToolsForNativePluginHost) return undefined;
+  const sourceSchema = config.inputSchema as z.ZodType;
+  const publicConfig = {
+    description: QUIET_TOOL_DESCRIPTIONS[name],
+    inputSchema: QUIET_TOOL_SCHEMAS[name],
+    annotations: config.annotations,
+  };
+  const validatingHandler = async (args: Record<string, unknown>) => {
+    const prepared = prepareQuietToolArgs(name, args);
+    const parsed = await sourceSchema.parseAsync(prepared.args);
+    const result = await handler(parsed);
+    return applyQuietResponsePolicy(name, result, args.max_bytes, prepared.scriptRef);
+  };
+  const wrappedHandler = wrapToolHandler(name, validatingHandler);
+  REGISTERED_CTX_TOOLS.push({ name, config: publicConfig, handler: wrappedHandler });
+  return (nativeRegisterTool as unknown as (...args: unknown[]) => unknown)(
+    name,
+    publicConfig,
+    wrappedHandler,
+  );
+}
+
 // Issue #637 — when suppression is active, install the empty tools/list handler
 // once at module-init time so the suppressed MCP child responds with
 // `{tools: []}` instead of JSON-RPC `-32601 Method not found`. Pair with the
@@ -326,7 +547,7 @@ function wrapToolHandler(
 // embedded plugin-import path because the embedded process is not the stdio
 // MCP child an operator would inspect — it lives inside the OpenCode/Kilo
 // host and never speaks JSON-RPC over stdio.
-if (suppressMcpToolsForNativePluginHost && process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+if (suppressMcpToolsForNativePluginHost && process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS !== "1") {
   registerEmptyToolsListHandler(server);
 }
 
@@ -434,8 +655,10 @@ writeFileSync(
 // snippets under /tmp when the host process exits.
 process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
+// Lazy per-working-root stores — no DB overhead unless index/search is used.
+// Keyed by the resolved project dir: a shared HTTP daemon serves many
+// concurrent roots; the stdio child resolves one root, so it keeps one entry.
+const _stores = new Map<string, ContentStore>();
 
 /**
  * Build the FK-attribution object passed to every ContentStore.index*() call
@@ -475,7 +698,7 @@ export function resolveSessionIdFromSessionDB(opts?: {
   try {
     const projectDir = opts?.projectDir
       ?? process.env.CLAUDE_PROJECT_DIR
-      ?? process.env.CONTEXT_MODE_PROJECT_DIR;
+      ?? process.env.QUIET_CONTEXT_PROJECT_DIR;
     if (!projectDir) return undefined;
     const sessionsDir = opts?.sessionsDir ?? getSessionDir();
     const dbPath = resolveSessionDbPath({ projectDir, sessionsDir });
@@ -495,29 +718,6 @@ export function resolveSessionIdFromSessionDB(opts?: {
   } catch {
     return undefined;
   }
-}
-
-/**
- * Auto-index session events files written by SessionStart hook.
- * Scans ~/.claude/context-mode/sessions/ for *-events.md files.
- * CLAUDE_PROJECT_DIR is NOT available to MCP servers — only to hooks —
- * so we glob-scan instead of computing a specific hash.
- * Files are consumed (deleted) after indexing to prevent double-indexing.
- * Called on every getStore() — readdirSync is sub-millisecond when no files match.
- */
-function maybeIndexSessionEvents(store: ContentStore): void {
-  try {
-    const sessionsDir = getSessionDir();
-    if (!existsSync(sessionsDir)) return;
-    const files = readdirSync(sessionsDir).filter(f => f.endsWith("-events.md"));
-    for (const file of files) {
-      const filePath = join(sessionsDir, file);
-      try {
-        store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
-        unlinkSync(filePath);
-      } catch { /* best-effort per file */ }
-    }
-  } catch { /* best-effort — session continuity never blocks tools */ }
 }
 
 // ── Platform-aware paths ──────────────────────────────────────────────────
@@ -588,10 +788,10 @@ function getSessionDir(): string {
  *
  * Priority:
  *   1. Platform-specific env var (set by host IDE before MCP server spawn)
- *   2. CONTEXT_MODE_PROJECT_DIR (set by start.mjs for ALL platforms — universal)
+ *   2. QUIET_CONTEXT_PROJECT_DIR (set by start.mjs for ALL platforms — universal)
  *   3. process.cwd() (last resort)
  *
- * CONTEXT_MODE_PROJECT_DIR guarantees correct projectDir even for platforms
+ * QUIET_CONTEXT_PROJECT_DIR guarantees correct projectDir even for platforms
  * that don't set their own env var (Cursor, OpenClaw, Codex, Kiro, Zed).
  */
 export function getProjectDir(): string {
@@ -697,11 +897,12 @@ function getStorePath(): string {
 }
 
 function getStore(): ContentStore {
-  if (!_store) {
-    // Content DB cleanup on fresh start is handled by SessionStart hook.
-    // Server just opens whatever DB exists (or creates new if hook deleted it).
-    const dbPath = getStorePath();
-    _store = new ContentStore(dbPath);
+  const storeRoot = getProjectDir();
+  const existing = _stores.get(storeRoot);
+  if (existing) return existing;
+  {
+    const _store = new ContentStore();
+    _stores.set(storeRoot, _store);
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
@@ -723,21 +924,21 @@ function getStore(): ContentStore {
       }
     });
 
-    // One-time startup cleanup: remove stale content DBs (>14 days)
     try {
-      const contentDir = dirname(getStorePath());
-      cleanupStaleContentDBs(contentDir, 14);
       _store.cleanupStaleSources(14);
-      // Also clean legacy shared dir from before platform isolation
-      const legacyDir = join(homedir(), ".context-mode", "content");
-      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
     } catch { /* best-effort */ }
-
-    // Also clean old PID-based DBs from migration
-    cleanupStaleDBs();
+    return _store;
   }
-  maybeIndexSessionEvents(_store);
-  return _store;
+}
+
+/** Shared shutdown path for the stdio child and the HTTP daemon. */
+export function releaseProcessResources(): void {
+  executor.cleanupBackgrounded();
+  for (const store of _stores.values()) {
+    try { store.cleanup(); } catch { /* best effort */ }
+  }
+  _stores.clear();
+  try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -767,74 +968,6 @@ function storageErrorResult(err: unknown): ToolResult | null {
     isError: true,
   };
 }
-// ── Version outdated warning ──────────────────────────────────────────────
-// Non-blocking npm check at startup. trackResponse prepends warning
-// using a burst cadence: 3 warnings → 1h silent → 3 warnings → repeat.
-
-let _latestVersion: string | null = null;
-let _warningBurstCount = 0;
-let _lastBurstStart = 0;
-const VERSION_BURST_SIZE = 3;
-const VERSION_SILENT_MS = 60 * 60 * 1000; // 1 hour
-
-async function fetchLatestVersion(): Promise<string> {
-  return new Promise((res) => {
-    const req = httpsRequest(
-      "https://registry.npmjs.org/context-mode/latest",
-      { headers: { Connection: "close" } },
-      (resp) => {
-        let raw = "";
-        resp.on("data", (chunk: Buffer) => { raw += chunk; });
-        resp.on("end", () => {
-          try {
-            const data = JSON.parse(raw) as { version?: string };
-            res(data.version ?? "unknown");
-          } catch { res("unknown"); }
-        });
-      },
-    );
-    req.on("error", () => res("unknown"));
-    req.setTimeout(5000, () => { req.destroy(); res("unknown"); });
-    req.end();
-  });
-}
-
-function getUpgradeHint(): string {
-  const name = _detectedAdapter?.name;
-  if (name === "Claude Code") return "/ctx-upgrade";
-  if (name === "OpenClaw") return "npm run install:openclaw";
-  if (name === "Pi") return "npm run build";
-  return "npm update -g context-mode";
-}
-
-function semverNewer(a: string, b: string): boolean {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true;
-    if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false;
-  }
-  return false;
-}
-
-function isOutdated(): boolean {
-  if (!_latestVersion || _latestVersion === "unknown") return false;
-  return semverNewer(_latestVersion, VERSION);
-}
-
-function shouldShowVersionWarning(): boolean {
-  if (!isOutdated()) return false;
-  const now = Date.now();
-  // Start of a new burst?
-  if (_warningBurstCount >= VERSION_BURST_SIZE) {
-    if (now - _lastBurstStart < VERSION_SILENT_MS) return false; // still silent
-    _warningBurstCount = 0; // silence over, reset burst
-  }
-  if (_warningBurstCount === 0) _lastBurstStart = now;
-  _warningBurstCount++;
-  return true;
-}
-
 // ── Self-heal Layer 2: Mid-session registry heal (anthropics/claude-code#46915) ──
 // Runs once on first tool call. If Claude Code auto-updated the registry mid-session,
 // hooks break because CLAUDE_PLUGIN_ROOT points to a deleted directory. We create a
@@ -888,14 +1021,6 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   noteMcpActivity();
   // Mid-session cache heal — one-shot, first tool call
   healCacheMidSession();
-  // Prepend version outdated warning if needed
-  if (shouldShowVersionWarning() && response.content.length > 0) {
-    const hint = getUpgradeHint();
-    response.content[0].text =
-      `⚠️ context-mode v${VERSION} outdated → v${_latestVersion} available. Upgrade: ${hint}\n\n` +
-      response.content[0].text;
-  }
-
   const bytes = response.content.reduce(
     (sum, c) => sum + Buffer.byteLength(c.text),
     0,
@@ -1072,7 +1197,7 @@ function persistStats(): void {
       reduction_pct: reductionPct,
       tokens_saved: tokensSaved,
       // statusline-facing $ values — pre-computed at the current per-token
-      // rate (dynamic when PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN is set by a
+      // rate (dynamic when QUIET_CONTEXT_PI_PRICE_OUTPUT_PER_TOKEN is set by a
       // Pi host; Opus $15/1M otherwise). Resolved on every persist via
       // pricePerToken() so the env override picks up without an MCP restart.
       dollars_saved_session: +(tokensSaved * pricePerToken()).toFixed(2),
@@ -1372,11 +1497,12 @@ export function formatBatchQueryResults(
   store: ContentStore,
   queries: string[],
   source: string,
-  maxOutput = 80 * 1024,
+  maxOutput = 12 * 1024,
   scope: BatchQueryScope = "batch",
 ): string[] {
   const sections: string[] = [];
   let outputSize = 0;
+  const emitted = new Set<string>();
 
   // When scope is "global", searchWithFallback receives `undefined` for the
   // source filter, which makes it query the entire persistent index instead
@@ -1384,34 +1510,34 @@ export function formatBatchQueryResults(
   // remains "batch" to preserve the historical behavior.
   const searchSource = scope === "global" ? undefined : source;
 
-  for (const query of queries) {
-    if (outputSize > maxOutput) {
-      sections.push(`## ${query}\n(output cap reached — use ctx_search(queries: ["${query}"]) for details)\n`);
+  for (const query of new Set(queries)) {
+    if (outputSize >= maxOutput) {
+      sections.push(`query: ${query}\n(output cap reached — use ctx_search(queries: ["${query}"]) for details)`);
       continue;
     }
 
-    const results = store.searchWithFallback(query, 3, searchSource, undefined, "exact");
-    sections.push(`## ${query}`);
-    sections.push("");
+    const results = store.searchWithFallback(query, 2, searchSource, undefined, "exact");
+    sections.push(`query: ${query}`);
+    outputSize += Buffer.byteLength(`query: ${query}`);
     if (results.length > 0) {
       for (const result of results) {
-        const snippet = extractSnippet(result.content, query, 3000, result.highlighted);
-        sections.push(`### ${result.title}`);
-        sections.push(snippet);
-        sections.push("");
-        outputSize += snippet.length + result.title.length;
+        const key = `${result.source}\u0000${result.title}\u0000${result.content}`;
+        if (emitted.has(key)) continue;
+        emitted.add(key);
+        const snippet = extractSnippet(result.content, query, 600, result.highlighted);
+        const section = `${result.title}\n${snippet}`;
+        if (outputSize + Buffer.byteLength(section) > maxOutput) break;
+        sections.push(section);
+        outputSize += Buffer.byteLength(section);
       }
       continue;
     }
 
     sections.push("No matching sections found.");
-    sections.push("");
   }
 
   if (scope === "global") {
-    sections.push(`\n> **Scope:** Queries searched the entire persistent index (query_scope: "global").`);
-  } else {
-    sections.push(`\n> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use \`ctx_search(queries: [...])\` or call ctx_batch_execute with \`query_scope: "global"\`.`);
+    sections.push("scope: global index");
   }
 
   return sections;
@@ -1426,6 +1552,25 @@ export interface BatchCommand { label: string; command: string; }
 export interface BatchRunResult {
   outputs: string[];
   timedOut: boolean;
+}
+
+export interface BatchResponseSummary {
+  commandCount: number;
+  totalLines: number;
+  totalBytes: number;
+  indexedSections: number;
+  queryCount: number;
+  queryResults: string[];
+  timedOut: boolean;
+}
+
+export function formatBatchResponse(summary: BatchResponseSummary): string {
+  const commandWord = summary.commandCount === 1 ? "command" : "commands";
+  const queryWord = summary.queryCount === 1 ? "query" : "queries";
+  const timeout = summary.timedOut ? "; timed out" : "";
+  const headline = `${summary.commandCount} ${commandWord}; ${summary.totalLines} lines; ${(summary.totalBytes / 1024).toFixed(1)}KB; ${summary.indexedSections} sections indexed; ${summary.queryCount} ${queryWord}${timeout}.`;
+  const matches = summary.queryResults.filter((result) => result.trim().length > 0);
+  return [headline, ...matches].join("\n\n");
 }
 
 export interface BatchRunOptions {
@@ -1495,35 +1640,14 @@ export function resolveExecTimeout(timeout: number | undefined): number | undefi
   if (timeout !== undefined) return timeout;
   // Only agy gets a default — every other host enforces its own RPC timeout, so
   // keep the unbounded behavior there. Detected via the env the agy bundle pins
-  // (CONTEXT_MODE_PLATFORM=antigravity-cli). Tunable via CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS.
+  // (QUIET_CONTEXT_PLATFORM=antigravity-cli). Tunable via QUIET_CONTEXT_AGY_EXEC_TIMEOUT_MS.
   if (detectPlatform().platform !== "antigravity-cli") return undefined;
-  const override = Number(process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS);
+  const override = Number(process.env.QUIET_CONTEXT_AGY_EXEC_TIMEOUT_MS);
   return Number.isFinite(override) && override > 0 ? override : AGY_DEFAULT_EXEC_TIMEOUT_MS;
 }
 
-/**
- * Per-call budget for the source-code echo prepended by `ctx_execute` and
- * `ctx_execute_file` (Issues #717 + #736). The full code always reaches the
- * sandbox — only the echo is clipped so massive payloads don't dominate
- * the response. Multi-line preserved (unlike command echo) so the user
- * sees the actual program shape.
- */
-const CODE_ECHO_MAX = 2000;
-
-function truncateCodeForEcho(code: string): string {
-  if (code.length <= CODE_ECHO_MAX) return code;
-  return code.slice(0, CODE_ECHO_MAX) + "\n… (truncated)";
-}
-
-/**
- * Build the source-code preamble surfaced before tool stdout. Provenance
- * survives in indexed chunks (FTS5 sees the fenced block) so later
- * ctx_search hits remember what ran.
- */
-function buildExecuteEcho(language: string, code: string, path?: string): string {
-  const header = path ? `path=${path}\n` : "";
-  const fenced = `\`\`\`${language}\n${truncateCodeForEcho(code)}\n\`\`\``;
-  return `${header}${fenced}\n\n`;
+function buildExecuteEcho(_language: string, _code: string, _path?: string): string {
+  return "";
 }
 
 function formatCommandOutput(label: string, command: string, raw: string, onFsBytes?: (bytes: number) => void): string {
@@ -1548,6 +1672,16 @@ function combineExecOutput(result: { stdout?: string; stderr?: string }): string
   if (!stderr) return stdout;
   if (!stdout) return stderr;
   return `${stdout}${stdout.endsWith("\n") ? "" : "\n"}${stderr}`;
+}
+
+function capUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const bytes = Buffer.from(value);
+  if (bytes.length <= maxBytes) return value;
+  if (maxBytes < Buffer.byteLength("…")) return "";
+  let end = Math.max(0, maxBytes - Buffer.byteLength("…"));
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8") + "…";
 }
 
 /**
@@ -1644,8 +1778,8 @@ export async function runBatchCommands(
 // Tool: execute
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
-  "ctx_execute",
+registerQuietTool(
+  "execute",
   {
     // #852: surface code execution in the host approval prompt's title (the
     // only server-controlled field the MCP permission UI renders besides args).
@@ -1977,7 +2111,7 @@ function indexStdout(
 // ─────────────────────────────────────────────────────────
 
 const INTENT_SEARCH_THRESHOLD = 5_000; // bytes — ~80-100 lines
-const LARGE_OUTPUT_THRESHOLD = 102_400; // 100KB — auto-index into FTS5, return pointer
+const LARGE_OUTPUT_THRESHOLD = 8 * 1024;
 
 function intentSearch(
   stdout: string,
@@ -2039,8 +2173,8 @@ function intentSearch(
 // Tool: execute_file
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
-  "ctx_execute_file",
+registerQuietTool(
+  "exec-file",
   {
     // #852: the host's MCP approval prompt renders only the tool name/title +
     // raw args — the title is the one server-controlled signal, so make it
@@ -2233,8 +2367,8 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
 // Tool: index
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
-  "ctx_index",
+registerQuietTool(
+  "index",
   {
     title: "Index Content",
     // #846: writes content into the local FTS5 store (additive, not destructive;
@@ -2410,8 +2544,7 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
       if (content) trackIndexed(Buffer.byteLength(content));
       else if (resolvedPath) {
         try {
-          const fs = await import("fs");
-          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
+          trackIndexed(statSync(resolvedPath).size);
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
@@ -2454,9 +2587,9 @@ function readPositiveEnv(name: string, defaultValue: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
 }
 
-const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
-const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
-const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
+const SEARCH_WINDOW_MS = readPositiveEnv("QUIET_CONTEXT_SEARCH_WINDOW_MS", 60_000);
+const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("QUIET_CONTEXT_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
+const SEARCH_BLOCK_AFTER = readPositiveEnv("QUIET_CONTEXT_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
 
 // #769: progressive throttle bucketed PER agent-context, not machine-global.
 // Concurrent subagents share ONE MCP server process; a single global counter
@@ -2550,8 +2683,28 @@ function coerceCommandsArray(val: unknown): unknown {
   return arr;
 }
 
-server.registerTool(
-  "ctx_search",
+interface SearchReference {
+  title: string;
+  source: string;
+  content: string;
+}
+
+const searchReferences = new Map<string, SearchReference>();
+const searchReferenceIds = new Map<string, string>();
+let nextSearchReference = 1;
+
+function rememberSearchReference(result: SearchReference): string {
+  const key = `${result.source}\u0000${result.title}\u0000${result.content}`;
+  const existing = searchReferenceIds.get(key);
+  if (existing) return existing;
+  const id = (nextSearchReference++).toString(36);
+  searchReferenceIds.set(key, id);
+  searchReferences.set(id, result);
+  return id;
+}
+
+registerQuietTool(
+  "search",
   {
     title: "Search Indexed Content",
     // #846: read-only query over the local FTS5 store. No mutation, no network.
@@ -2561,42 +2714,20 @@ server.registerTool(
       idempotentHint: true,
       openWorldHint: false,
     },
-    description: `Search a unified knowledge base with a multi-strategy ranking pipeline. Two parallel matchers run on every query: a Porter-stemming matcher ("caching" finds "cached", "caches", "cach") and a trigram-substring matcher ("useEff" finds "useEffect"). Their ranked lists are merged via Reciprocal Rank Fusion, so a document that ranks well in both surfaces above one that wins only on a single strategy. Multi-term queries get an additional proximity-rerank pass that boosts passages where the query terms appear close together. Typos are corrected via Levenshtein distance and re-searched. Result snippets are window-extracted around the matched terms, not blindly truncated.
+    description: `Search content previously stored by ctx_index, ctx_fetch_and_index, or ctx_batch_execute. Results are ranked and returned as compact snippets.
 
-The knowledge base is unified: queries reach indexed content you stored (ctx_index, ctx_fetch_and_index, ctx_batch_execute output) AND auto-captured session memory written by hooks (decisions, errors, blockers, plans, user prompts, rejected approaches, tool failures, compaction guides — 26 event categories). File-backed sources carry a content hash and auto-flag staleness when the source file changes.
-
-WHEN:
-  - You want to recall something that exists in storage (recently indexed content, prior session events, auto-memory) instead of re-reading raw sources
-  - You have multiple related questions about the same body of knowledge — batch every question into one call (the ranking pipeline runs per-query but the round-trip cost is paid once)
-  - You want to scope the query to one labelled source (pass \`source\` — partial match is fine)
-  - You want a chronological view across current session + prior sessions + persistent auto-memory (pass \`sort: "timeline"\` — the default \`relevance\` mode only ranks within the current session)
-  - You want to filter ranked results by content shape (pass \`contentType: "code"\` to surface implementation snippets or \`contentType: "prose"\` to surface explanations)
-
-WHEN NOT:
-  - The data you want to query has never been stored in the knowledge base AND no session memory has accumulated around it — capture first (run a gather-and-index call), then come back here to query
-  - You have one ad-hoc question against data that is not in the knowledge base — answer it inline by running code in the sandbox tool; one round-trip instead of capture-then-query
-
-RETURNS:
-  Per-query ranked sections with window-extracted snippets. Use 2-4 specific technical terms per query. Common session-memory source labels: \`decision\` (user corrections / preferences), \`error\` and \`error-resolution\` (past failures + their fixes), \`blocker\`, \`plan\`, \`user-prompt\`, \`rejected-approach\`, \`compaction\` (post-compact session guide). See ctx_stats for live category counts. Each response carries a throttle counter (call #N/M in the rolling time window); results taper toward the soft cap and calls block after the hard cap. Tune via CONTEXT_MODE_SEARCH_WINDOW_MS, CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER, CONTEXT_MODE_SEARCH_BLOCK_AFTER.
-
-EXAMPLE: ctx_search(queries: ["root cause", "proposed fix", "test coverage"], source: "issue-#683")
-EXAMPLE: ctx_search(queries: ["what did we decide about caching"], source: "decision", sort: "timeline")
-EXAMPLE: ctx_search(queries: ["useEffect cleanup pattern"], source: "react-docs", contentType: "code", limit: 5)
-EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blockers"], sort: "timeline")`,
+Use \`source\` to scope results and pass multiple queries in one call.`,
     // Schema construction is centralised in `src/search/ctx-search-schema.ts`
     // so the conditional `project` field (only registered when the host runs
-    // in shared-DB mode, `CONTEXT_MODE_PROJECT_DIR` set at module load) is a
+    // in shared-DB mode, `QUIET_CONTEXT_PROJECT_DIR` set at module load) is a
     // hard property of the tool surface — not a runtime hint. Fixes #737.
-    inputSchema: buildCtxSearchInputSchema(CTX_SEARCH_SHARED_MODE),
+    inputSchema: buildCtxSearchInputSchema(),
   },
   async (params) => {
     try {
       const store = getStore();
-      const sort = (params as Record<string, unknown>).sort as string || "relevance";
-
-      // Guard: redirect when the index is empty — ctx_search is a follow-up
-      // tool that requires prior indexing. Skip for timeline mode (SessionDB/auto-memory may have data).
-      if (sort !== "timeline" && store.getStats().chunks === 0) {
+      // Guard: ctx_search requires prior indexed content.
+      if (store.getStats().chunks === 0) {
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
@@ -2613,6 +2744,22 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
       }
 
       const raw = params as Record<string, unknown>;
+      const responseLimit = typeof raw.max_bytes === "number" ? raw.max_bytes : 8 * 1024;
+
+      const requestedRefs = Array.isArray(raw.refs)
+        ? raw.refs.filter((value): value is string => typeof value === "string")
+        : [];
+      if (requestedRefs.length > 0) {
+        const exact = requestedRefs.map((id) => {
+          const result = searchReferences.get(id);
+          return result
+            ? `[r:${id}] ${result.title} (${result.source})\n${result.content}`
+            : `[r:${id}] not found`;
+        }).join("\n\n");
+        return trackResponse("ctx_search", {
+          content: [{ type: "text" as const, text: capUtf8(exact, responseLimit) }],
+        });
+      }
 
       // Normalize: accept both query (string) and queries (array)
       const queryList: string[] = [];
@@ -2629,22 +2776,12 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         });
       }
 
-      const { limit = 3, source, contentType, project } = params as {
+      const { limit = 3, source, contentType, preview = false } = params as {
         limit?: number;
         source?: string;
         contentType?: "code" | "prose";
-        project?: string;
+        preview?: boolean;
       };
-
-      // Resolve the per-project scope (#737). When shared-DB mode is off the
-      // resolver returns `undefined` and `project` is silently ignored — the
-      // per-project DB is naturally isolated by directory hash, so there is
-      // nothing for an in-process filter to do.
-      const projectScope = resolveProjectScope(
-        project,
-        CTX_SEARCH_SHARED_MODE,
-        () => getProjectDir(),
-      );
 
       // Progressive throttling: track calls per agent-context window (#769).
       const now = Date.now();
@@ -2669,118 +2806,57 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         ? 1 // after soft cap: only 1 result per query
         : Math.min(limit, 2); // normal: max 2
 
-      const MAX_TOTAL = 40 * 1024; // 40KB total cap
+      const MAX_TOTAL = responseLimit;
       let totalSize = 0;
       const sections: string[] = [];
+      const emitted = new Set<string>();
 
-      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query).
-      // Issue #737: also open in relevance mode when a string `projectScope`
-      // is in play — the 2-step IN-clause needs SessionDB to translate
-      // `project_dir` → allow-set of session ids for the ContentStore filter.
-      let timelineDB: InstanceType<typeof SessionDB> | null = null;
-      const needsSessionDB = sort === "timeline" || typeof projectScope === "string";
-      if (needsSessionDB) {
-        try {
-          const sessionsDir = getSessionDir();
-          const projectDir = getProjectDir();
-          const dbFile = resolveSessionDbPath({ projectDir, sessionsDir });
-          if (existsSync(dbFile)) {
-            timelineDB = new SessionDB({ dbPath: dbFile });
-          }
-        } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
-      }
-
-      // Resolve the session-id allow-set once for the relevance-mode path —
-      // searchAllSources resolves its own copy for timeline mode. Empty set
-      // is preserved (means "no events for this project"), which surfaces
-      // only legacy `session_id=''` chunks via the post-filter.
-      let relevanceAllowSet: Set<string> | undefined;
-      if (typeof projectScope === "string" && timelineDB) {
-        try {
-          relevanceAllowSet = new Set(timelineDB.getSessionIdsForProject(projectScope));
-        } catch { /* best-effort */ }
-      }
-
-      const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigDir();
-
-      try {
       for (const q of queryList) {
         if (totalSize > MAX_TOTAL) {
           sections.push(`## ${q}\n(output cap reached)\n`);
           continue;
         }
 
-        let results;
-        if (sort === "timeline") {
-          results = searchAllSources({
-            query: q,
-            limit: effectiveLimit,
-            store,
-            sort,
-            source,
-            contentType,
-            sessionDB: timelineDB,
-            projectDir: getProjectDir(),
-            configDir,
-            adapter: _detectedAdapter ?? undefined,
-            projectScope,
-          });
-        } else {
-          results = store.searchWithFallback(
-            q,
-            effectiveLimit,
-            source,
-            contentType,
-            "like",
-            relevanceAllowSet,
-          );
-        }
+        const results = store.searchWithFallback(
+          q,
+          effectiveLimit,
+          source,
+          contentType,
+          "like",
+        );
 
         if (results.length === 0) {
-          sections.push(`## ${q}\nNo results found.`);
+          sections.push(`query: ${q}\nNo results found.`);
           continue;
         }
 
         const formatted = results
-          .map((r, i) => {
-            const origin = (r as any).origin || "current-session";
-            const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
-            const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
-            const heading = `### ${r.title}`;
-            const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
-            return `${header}\n${heading}\n\n${snippet}`;
+          .filter((r) => {
+            const key = `${r.source}\u0000${r.title}\u0000${r.content}`;
+            if (emitted.has(key)) return false;
+            emitted.add(key);
+            return true;
+          })
+          .map((r) => {
+            const ref = rememberSearchReference({
+              title: r.title,
+              source: r.source,
+              content: r.content,
+            });
+            const label = `[r:${ref}] ${r.title} (${r.source})`;
+            if (!preview) return label;
+            const snippet = extractSnippet(r.content, q, 600, r.highlighted);
+            return `${label}\n${snippet}`;
           })
           .join("\n\n");
 
-        sections.push(`## ${q}\n\n${formatted}`);
-        totalSize += formatted.length;
-      }
-      } finally {
-        try { timelineDB?.close(); } catch {}
-      }
-
-      let output = sections.join("\n\n---\n\n");
-
-      // Report auto-refreshed stale sources
-      if (store.lastRefreshCount > 0) {
-        output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""} (file changed since indexing).\n\n` + output;
+        if (formatted.length > 0) {
+          sections.push(`query: ${q}\n${formatted}`);
+          totalSize += Buffer.byteLength(formatted);
+        }
       }
 
-      // Throttle counter — always surfaced so agents can pace themselves
-      // proactively instead of discovering the limit only after results are
-      // already truncated. Soft warning after SEARCH_MAX_RESULTS_AFTER calls;
-      // gentle informational line before that.
-      const throttleRemaining = Math.max(0, SEARCH_BLOCK_AFTER - searchCallCount);
-      const softCapRemaining = Math.max(0, SEARCH_MAX_RESULTS_AFTER - searchCallCount);
-      if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
-        output += `\n\n⚠ search call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
-          `Results limited to ${effectiveLimit}/query. ${throttleRemaining} call(s) remaining before block. ` +
-          `Batch queries: ctx_search(queries: ["q1","q2","q3"]) or use ctx_batch_execute.`;
-      } else {
-        output += `\n\n> Throttle: call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
-          `${softCapRemaining} call(s) before soft cap. ` +
-          `Prefer ctx_search(queries: [...]) array form for multi-query workloads — it counts as a single call.`;
-      }
+      const output = sections.join("\n\n");
 
       if (output.trim().length === 0) {
         const sources = store.listSources();
@@ -2793,7 +2869,7 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
       }
 
       return trackResponse("ctx_search", {
-        content: [{ type: "text" as const, text: output }],
+        content: [{ type: "text" as const, text: capUtf8(output, MAX_TOTAL) }],
       });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -3116,7 +3192,6 @@ main();
 // ─────────────────────────────────────────────────────────
 
 const FETCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const FETCH_PREVIEW_LIMIT = 3072;
 
 function formatFetchTtl(ttlMs: number): string {
   if (ttlMs === 0) return "0ms";
@@ -3373,7 +3448,6 @@ interface IndexedFetchResult {
   label: string;
   totalChunks: number;
   totalBytes: number;
-  preview: string;
 }
 
 /**
@@ -3398,19 +3472,15 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
   }
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
   trackIndexed(Buffer.byteLength(f.markdown));
-  const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
-    ? charSafePrefix(f.markdown, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
-    : f.markdown;
   return {
     label: indexed.label,
     totalChunks: indexed.totalChunks,
     totalBytes: Buffer.byteLength(f.markdown),
-    preview,
   };
 }
 
-server.registerTool(
-  "ctx_fetch_and_index",
+registerQuietTool(
+  "fetch-index",
   {
     title: "Fetch & Index URL(s)",
     // #846: fetches external URLs (open world) and writes them into the store.
@@ -3584,10 +3654,6 @@ EXAMPLE: ctx_fetch_and_index(
         const text = [
           `Fetched and indexed **${r.indexed.totalChunks} sections** (${totalKB}KB) from: ${r.indexed.label}`,
           `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
-          "",
-          "---",
-          "",
-          r.indexed.preview,
         ].join("\n");
         return trackResponse("ctx_fetch_and_index", {
           content: [{ type: "text" as const, text }],
@@ -3612,17 +3678,13 @@ EXAMPLE: ctx_fetch_and_index(
       });
     }
 
-    // Batch response — aggregated summary; isError only when EVERY URL failed.
-    // Per-URL preview capped tightly so a 8-URL batch doesn't undo the
-    // context-savings the tool exists to deliver (PRD review finding G1).
-    const FETCH_BATCH_PREVIEW_LIMIT = 384; // ~3KB total for 8-URL batches
+    // Batch response — metadata only; fetched page bodies remain indexed.
     const lines: string[] = [];
     let totalSections = 0;
     let totalBytes = 0;
     let cachedCount = 0;
     let fetchedCount = 0;
     let errorCount = 0;
-    const snippets: string[] = [];
     for (const r of finalized) {
       if (r.kind === "cached") {
         cachedCount++;
@@ -3633,10 +3695,6 @@ EXAMPLE: ctx_fetch_and_index(
         totalBytes += r.indexed.totalBytes;
         const kb = (r.indexed.totalBytes / 1024).toFixed(1);
         lines.push(`- [new]   ${r.indexed.label} — ${r.indexed.totalChunks} sections (${kb}KB)`);
-        const snippet = r.indexed.preview.length > FETCH_BATCH_PREVIEW_LIMIT
-          ? r.indexed.preview.slice(0, FETCH_BATCH_PREVIEW_LIMIT).trimEnd() + "…"
-          : r.indexed.preview;
-        snippets.push(`### ${r.indexed.label}\n\n${snippet}`);
       } else {
         errorCount++;
         lines.push(`- [err]   ${r.url}: ${r.error}`);
@@ -3661,7 +3719,6 @@ EXAMPLE: ctx_fetch_and_index(
       ...lines,
       "",
       `ctx_search(queries: [...], source: "<label>") for full content.`,
-      ...(snippets.length > 0 ? ["", "---", "", ...snippets] : []),
     ].join("\n");
 
     return trackResponse("ctx_fetch_and_index", {
@@ -3675,8 +3732,8 @@ EXAMPLE: ctx_fetch_and_index(
 // Tool: batch_execute
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
-  "ctx_batch_execute",
+registerQuietTool(
+  "batch",
   {
     title: "Batch Execute & Search",
     // #846: runs arbitrary shell commands (with network) and indexes output.
@@ -3686,32 +3743,9 @@ server.registerTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: `Run multiple commands in ONE call. Every command's output is auto-indexed into the knowledge base; if you also pass \`queries\`, the matching sections come back in the same round trip so a follow-up search call is not needed.
+    description: `Run related commands, index their output, and return only matches for the supplied \`queries\`. Use \`ctx_execute\` for one command or short output.
 
-Concurrency parallelizes the FETCH phase (run-the-commands). The DERIVATION phase — turning raw output into an answer — still belongs in code: add a processing command that consumes the indexed output and prints only the answer, so the raw bytes never enter your conversation (Think-in-Code, same principle as the sandbox tool).
-
-WHEN:
-  - You have 3+ related commands you would otherwise run sequentially (multi-issue lookups, git log + git diff + git blame, multi-file reads, multi-region cloud queries)
-  - You want to gather AND query in one round trip — pass \`queries\` so the matching sections come back inline
-  - You want to parallelize I/O-bound work — pass \`concurrency\` 2-8 (network calls, gh CLI, cloud APIs, multi-repo git reads)
-  - The combined output is large enough that piping it through ctx_search later would itself be expensive — let auto-index + inline queries do both in one shot
-
-WHEN NOT:
-  - Single command with no follow-up query — run it in the sandbox tool directly
-  - CPU-bound or stateful commands — keep concurrency at 1 (npm test, build, lint, port-binding servers, lock-file holders, anything that races on the same resource)
-
-RETURNS:
-  Auto-indexed section list per command label, plus top matches per query (when \`queries\` is passed). Raw output is NOT echoed in full — only the matched windows. Concurrency>1 switches each command to its own per-command timeout (no shared budget); concurrency=1 preserves the legacy shared-budget cascading-skip-on-timeout path. Use 4-8 for I/O-bound batches; keep at 1 for CPU work or shared-state commands; lower the value when target hosts enforce per-IP rate limits.
-
-EXAMPLE: ctx_batch_execute(
-  commands: [
-    {label: "issue 1", command: "gh issue view 1"},
-    {label: "issue 2", command: "gh issue view 2"},
-    {label: "summarize", command: "echo done"}
-  ],
-  queries: ["root cause", "proposed fix"],
-  concurrency: 2
-)`,
+Supports sequential or parallel execution; keep concurrency at 1 for stateful commands. Raw output remains indexed; only matching snippets are returned.`,
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -3719,7 +3753,7 @@ EXAMPLE: ctx_batch_execute(
             label: z
               .string()
               .describe(
-                "Section header for this command's output (e.g., 'README', 'Package.json', 'Source Tree')",
+                "Label for indexed command output",
               ),
             command: z
               .string()
@@ -3728,16 +3762,13 @@ EXAMPLE: ctx_batch_execute(
         )
         .min(1)
         .describe(
-          "Commands to execute as a batch. Output is labeled with the section header. " +
-          "Default order is sequential; pass concurrency>1 to run in parallel (output stays in input order).",
+          "Commands to execute; output stays indexed and is returned only through query matches.",
         )),
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
         .min(1)
         .describe(
-          "Search queries to extract information from indexed output. Use 5-8 comprehensive queries. " +
-          "Each returns top 5 matching sections with full content. " +
-          "This is your ONLY chance — put ALL your questions here. No follow-up calls needed.",
+          "Queries used to select matching sections from indexed output.",
         )),
       timeout: z
         .coerce.number()
@@ -3825,29 +3856,10 @@ EXAMPLE: ctx_batch_execute(
       // Index into knowledge base — markdown heading chunking splits by # labels
       const store = getStore();
       const source = `batch:${commands
-        .map((c) => c.label)
+        .map((c: { label: string }) => c.label)
         .join(",")
         .slice(0, 80)}`;
       const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
-
-      // Commands inventory — list what the agent actually ran so the
-      // response itself documents intent, not just per-section echoes.
-      // Placed before "## Indexed Sections" so it scans top-down with
-      // the human asking "what just happened" (Issues #717 + #736).
-      const commandsInventory: string[] = ["## Commands", ""];
-      for (const c of commands) {
-        commandsInventory.push(`- ${c.label}: \`${truncateCommandForEcho(c.command)}\``);
-      }
-
-      // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
-      const allSections = store.getChunksBySource(indexed.sourceId);
-      const inventory: string[] = ["## Indexed Sections", ""];
-      const sectionTitles: string[] = [];
-      for (const s of allSections) {
-        const bytes = Buffer.byteLength(s.content);
-        inventory.push(`- ${s.title} (${(bytes / 1024).toFixed(1)}KB)`);
-        sectionTitles.push(s.title);
-      }
 
       // Run all search queries — default scope is batch-local (legacy behavior).
       // When the caller passes query_scope: "global", searches reach the entire
@@ -3855,24 +3867,15 @@ EXAMPLE: ctx_batch_execute(
       // available via explicit ctx_search() as well.
       const queryResults = formatBatchQueryResults(store, queries, source, undefined, query_scope);
 
-      // Get searchable terms for edge cases where follow-up is needed
-      const distinctiveTerms = store.getDistinctiveTerms
-        ? store.getDistinctiveTerms(indexed.sourceId)
-        : [];
-
-      const output = [
-        `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
-          `Indexed ${indexed.totalChunks} sections. Searched ${queries.length} queries.`,
-        "",
-        ...commandsInventory,
-        "",
-        ...inventory,
-        "",
-        ...queryResults,
-        distinctiveTerms.length > 0
-          ? `\nSearchable terms for follow-up: ${distinctiveTerms.join(", ")}`
-          : "",
-      ].join("\n");
+      const output = capUtf8(formatBatchResponse({
+        commandCount: commands.length,
+        totalLines,
+        totalBytes,
+        indexedSections: indexed.totalChunks,
+        queryCount: queries.length,
+        queryResults,
+        timedOut,
+      }), 12 * 1024);
 
       return trackResponse("ctx_batch_execute", {
         content: [{ type: "text" as const, text: output }],
@@ -3914,6 +3917,11 @@ function patchPiLifetimeFromStatsFiles(lifetime: ReturnType<typeof getLifetimeSt
     lifetime.totalEvents = Math.round((sandboxedBytes / 4 + rescueTokens) / 256);
   }
 }
+
+// Retained upstream maintenance tools are intentionally unreachable from the
+// quiet runtime. Keeping them in one dormant boundary eases upstream rebases
+// without polluting tools/list.
+function registerLegacyTools(): void {
 
 // ─────────────────────────────────────────────────────────
 // Tool: stats
@@ -4096,7 +4104,7 @@ server.registerTool(
           // be unavailable on cold paths; failures are absorbed.
           let indexState;
           try { indexState = getStore().getIndexState(); } catch { /* never block ctx_stats */ }
-          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, indexState, cwd: projectDir });
+          text = formatReport(report, VERSION, null, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, indexState, cwd: projectDir });
         } finally {
           sdb.close();
         }
@@ -4113,7 +4121,7 @@ server.registerTool(
         try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
         let indexState;
         try { indexState = getStore().getIndexState(); } catch { /* never block ctx_stats */ }
-        text = formatReport(report, VERSION, _latestVersion, { lifetime, multiAdapter, indexState });
+        text = formatReport(report, VERSION, null, { lifetime, multiAdapter, indexState });
       }
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
@@ -4126,7 +4134,7 @@ server.registerTool(
       }
       let multiAdapter;
       try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
-      text = formatReport(report, VERSION, _latestVersion, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
+      text = formatReport(report, VERSION, null, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
     }
 
     return trackResponse("ctx_stats", {
@@ -4549,9 +4557,13 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     try {
       storePathForPurge = getStorePath();
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
-    if (_store) {
-      try { _store.cleanup(); } catch { /* best effort */ }
-      _store = null;
+    {
+      const purgeRoot = getProjectDir();
+      const purgeStore = _stores.get(purgeRoot);
+      if (purgeStore) {
+        try { purgeStore.cleanup(); } catch { /* best effort */ }
+        _stores.delete(purgeRoot);
+      }
     }
 
     // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
@@ -4609,6 +4621,8 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     });
   },
 );
+
+}
 
 // ── ctx_insight process helpers ──────────────────────────────────────────────
 // Cross-platform process helpers used by ctx_insight (below) and the dashboard
@@ -4811,6 +4825,7 @@ export function killProcessOnPort(
 // context-mode.com/insight (the landing page is the single source of truth).
 // The tool now simply opens that URL in the user default browser via the same
 // cross-platform helper (openBrowserSync) used elsewhere.
+function registerLegacyInsightTool(): void {
 const INSIGHT_URL = "https://context-mode.com/insight";
 
 server.registerTool(
@@ -4844,17 +4859,13 @@ server.registerTool(
   },
 );
 
+}
+
 // ─────────────────────────────────────────────────────────
 // Server startup
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  // Clean up stale DB files from previous sessions
-  const cleaned = cleanupStaleDBs();
-  if (cleaned > 0) {
-    console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
-  }
-
   // MCP readiness sentinel path (#230, #347)
   // Uses process.pid (not ppid) — hooks use directory-scan to find any live sentinel.
   // Hardcoded /tmp on Unix to avoid TMPDIR mismatch (#347).
@@ -4865,9 +4876,7 @@ async function main() {
 
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
-    executor.cleanupBackgrounded();
-    if (_store) _store.close(); // persist DB for --continue sessions
-    try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
+    releaseProcessResources();
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
     // #844: stop refreshing the sentinel mtime on shutdown.
@@ -4896,7 +4905,7 @@ async function main() {
   await server.connect(transport);
 
   // #854: refresh the bridge-child idle clock on each inbound MCP message so an
-  // abandoned bridge child (CONTEXT_MODE_BRIDGE_DEPTH>0) self-terminates instead
+  // abandoned bridge child (QUIET_CONTEXT_BRIDGE_DEPTH>0) self-terminates instead
   // of accumulating under a long-lived Pi/omp parent. Best-effort; no stdin touch.
   attachMcpActivityTap(
     transport as unknown as { onmessage?: (message: unknown, extra?: unknown) => unknown },
@@ -4948,16 +4957,6 @@ async function main() {
     }
   } catch { /* best effort — never block startup on a stats restore failure */ }
 
-  // Non-blocking version check — result stored for trackResponse warnings.
-  // First fetch at startup, then refresh every hour so long-running sessions
-  // (some users keep the MCP server alive 24h+) catch new releases without a
-  // restart. `.unref()` lets the process exit normally on SIGTERM regardless
-  // of pending intervals.
-  fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
-  setInterval(() => {
-    fetchLatestVersion().then(v => { if (v !== "unknown") _latestVersion = v; });
-  }, 60 * 60 * 1000).unref();
-
   // Stats heartbeat — keep the statusline truthful while the user works in
   // tools other than MCP (Bash/Read/Edit during long sessions or post-/compact
   // pauses). Without this, stats.updated_at only advances on MCP tool calls,
@@ -4983,7 +4982,7 @@ async function main() {
 // function-calling) clients like Antigravity CLI (`agy`) / Gemini CLI.
 installStrictClientSchemaCompat();
 
-if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+if (process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS !== "1") {
   main().catch((err) => {
     console.error("Fatal:", err);
     process.exit(1);

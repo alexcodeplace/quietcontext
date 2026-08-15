@@ -1,32 +1,20 @@
 {
-  "name": "context-mode",
+  "name": "quietcontext",
   "version": "1.0.169",
   "type": "module",
-  "description": "MCP plugin that saves 98% of your context window. Works with Claude Code, Gemini CLI, VS Code Copilot, OpenCode, and Codex CLI. Sandboxed code execution, FTS5 knowledge base, and intent-driven search.",
-  "author": "Mert Koseoğlu",
+  "description": "Quiet MCP tools for sandboxed execution, indexing, and search.",
+  "author": "Mert Koseo\u011flu",
   "license": "Elastic-2.0",
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "claude",
-    "claude-code",
-    "gemini-cli",
-    "vscode-copilot",
-    "opencode",
-    "openclaw",
     "codex-cli",
     "context-window",
     "sandbox",
     "code-execution",
     "fts5",
-    "bm25",
-    "pi-package"
+    "bm25"
   ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/mksglu/context-mode"
-  },
-  "homepage": "https://github.com/mksglu/context-mode#readme",
   "pi": {
     "extensions": [
       "./build/adapters/pi/extension.js"
@@ -41,13 +29,12 @@
     ]
   },
   "omp": {
-    "name": "context-mode",
-    "description": "Save 98% of your context window in OMP — sandboxed code execution, FTS5 search, hard-block curl/wget, session continuity across compaction.",
+    "name": "quietcontext",
+    "description": "Sandboxed code execution, indexing, and search.",
     "extensions": [
       "./build/adapters/omp/plugin.js"
     ]
   },
-  "bugs": "https://github.com/mksglu/context-mode/issues",
   "main": "./build/adapters/opencode/plugin.js",
   "exports": {
     ".": "./build/adapters/opencode/plugin.js",
@@ -56,7 +43,7 @@
     "./cli": "./cli.bundle.mjs"
   },
   "bin": {
-    "context-mode": "./cli.bundle.mjs"
+    "quietcontext": "./cli.bundle.mjs"
   },
   "files": [
     "build",
@@ -71,6 +58,10 @@
     ".openclaw-plugin",
     "openclaw.plugin.json",
     "start.mjs",
+    "start-http.mjs",
+    "daemon-headers.mjs",
+    "http-server.bundle.mjs",
+    "systemd",
     "scripts/postinstall.mjs",
     "scripts/heal-better-sqlite3.mjs",
     "scripts/heal-installed-plugins.mjs",
@@ -80,9 +71,9 @@
   ],
   "scripts": {
     "build": "tsc && node -e \"if(process.platform!=='win32'){require('fs').chmodSync('build/cli.js',0o755)}\" && npm run bundle && npm run assert-bundle && npm run assert-asymmetric-drift",
-    "assert-bundle": "node scripts/assert-bundle.mjs server.bundle.mjs cli.bundle.mjs hooks/session-extract.bundle.mjs hooks/session-snapshot.bundle.mjs hooks/session-db.bundle.mjs hooks/security.bundle.mjs",
+    "assert-bundle": "node scripts/assert-bundle.mjs server.bundle.mjs cli.bundle.mjs http-server.bundle.mjs hooks/session-extract.bundle.mjs hooks/session-snapshot.bundle.mjs hooks/session-db.bundle.mjs hooks/security.bundle.mjs",
     "assert-asymmetric-drift": "node scripts/assert-asymmetric-drift.mjs",
-    "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --external:@mixmark-io/domino --minify && esbuild src/cli.ts --bundle --platform=node --target=node18 --format=esm --outfile=cli.bundle.mjs --external:better-sqlite3 --minify && esbuild src/session/extract.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-extract.bundle.mjs --minify && esbuild src/session/snapshot.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-snapshot.bundle.mjs --minify && esbuild src/session/db.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-db.bundle.mjs --external:better-sqlite3 --minify && esbuild src/security.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/security.bundle.mjs --minify",
+    "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --external:@mixmark-io/domino --minify && esbuild src/cli.ts --bundle --platform=node --target=node18 --format=esm --outfile=cli.bundle.mjs --external:better-sqlite3 --minify && esbuild src/session/extract.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-extract.bundle.mjs --minify && esbuild src/session/snapshot.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-snapshot.bundle.mjs --minify && esbuild src/session/db.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-db.bundle.mjs --external:better-sqlite3 --minify && esbuild src/security.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/security.bundle.mjs --minify && esbuild src/http-server.ts --bundle --platform=node --target=node18 --format=esm --outfile=http-server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --external:@mixmark-io/domino --minify",
     "version-sync": "node scripts/version-sync.mjs",
     "version": "node scripts/version-sync.mjs && git add package.json .claude-plugin/plugin.json .claude-plugin/marketplace.json .cursor-plugin/plugin.json .codex-plugin/plugin.json .openclaw-plugin/openclaw.plugin.json .openclaw-plugin/package.json openclaw.plugin.json .pi/extensions/context-mode/package.json configs/antigravity-cli/plugin.json configs/copilot-cli/.github/plugin/plugin.json",
     "prepublishOnly": "npm run build",
@@ -91,9 +82,12 @@
     "doctor": "npx tsx src/cli.ts doctor",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
-    "test": "vitest run",
+    "test": "vitest run tests/quietcontext-runtime.test.ts tests/quietcontext-surface.test.ts tests/quietcontext-token-budget.test.ts tests/quietcontext-http.test.ts",
+    "test:legacy": "vitest run",
     "test:watch": "vitest",
+    "lint": "node scripts/lint-quiet.mjs",
     "benchmark": "npx tsx tests/benchmark.ts",
+    "benchmark:quiet": "npx tsx tests/quietcontext-economics.ts",
     "test:use-cases": "npx tsx tests/use-cases.ts",
     "test:compare": "npx tsx tests/context-comparison.ts",
     "test:ecosystem": "npx tsx tests/ecosystem-benchmark.ts",

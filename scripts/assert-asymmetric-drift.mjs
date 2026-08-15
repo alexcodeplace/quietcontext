@@ -26,7 +26,7 @@
 //
 // Contract:
 //   - Read `.mcp.json.example` and `.claude-plugin/plugin.json` from --root.
-//   - Extract mcpServers["context-mode"].args[0] from each.
+//   - Extract mcpServers[the plugin name].args[0] from each.
 //   - Assert both equal the literal `${CLAUDE_PLUGIN_ROOT}/start.mjs`.
 //   - Assert the two values are equal (the explicit drift check).
 //   - If a `.mcp.json` exists (contributor's local copy), check it too —
@@ -41,12 +41,23 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}/start.mjs";
-const PLUGIN_KEY = "context-mode";
+// Canonical shape since the shared-daemon cutover: one localhost HTTP daemon
+// serves every session; manifests point at it instead of spawning start.mjs.
+// start.mjs + server.bundle.mjs stay required — they are the rollback path.
+const CANONICAL_SERVER_ENTRY = {
+  type: "http",
+  url: "http://127.0.0.1:48619/mcp",
+  headers: { "X-QuietContext-Root": "${PWD}" },
+  headersHelper: "node ${CLAUDE_PLUGIN_ROOT}/daemon-headers.mjs",
+};
+const DEFAULT_PLUGIN_KEY = "context-mode";
 const SKILLS_PATH = "./skills/";
 const REQUIRED_PLUGIN_RUNTIME_FILES = [
   "start.mjs",
+  "start-http.mjs",
+  "daemon-headers.mjs",
   "server.bundle.mjs",
+  "http-server.bundle.mjs",
   "cli.bundle.mjs",
 ];
 
@@ -61,7 +72,7 @@ function parseArgs(argv) {
   return out;
 }
 
-function readArgs0(filePath) {
+function readServerEntry(filePath, pluginKey = DEFAULT_PLUGIN_KEY) {
   if (!existsSync(filePath)) return { ok: false, error: `missing: ${filePath}` };
   let parsed;
   try {
@@ -73,16 +84,22 @@ function readArgs0(filePath) {
   if (!servers || typeof servers !== "object") {
     return { ok: false, error: `no mcpServers in ${filePath}` };
   }
-  const ours = servers[PLUGIN_KEY];
-  if (!ours || typeof ours !== "object" || !Array.isArray(ours.args) || ours.args.length === 0) {
-    return { ok: false, error: `no args[] for ${PLUGIN_KEY} in ${filePath}` };
+  const ours = servers[pluginKey];
+  if (!ours || typeof ours !== "object") {
+    return { ok: false, error: `no mcpServers entry for ${pluginKey} in ${filePath}` };
   }
-  const a0 = ours.args[0];
-  if (typeof a0 !== "string") {
-    return { ok: false, error: `args[0] not a string in ${filePath}` };
-  }
-  return { ok: true, value: a0 };
+  return { ok: true, value: ours };
 }
+
+const stable = (v) => {
+  const sort = (x) =>
+    Array.isArray(x)
+      ? x.map(sort)
+      : x && typeof x === "object"
+        ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, sort(x[k])]))
+        : x;
+  return JSON.stringify(sort(v));
+};
 
 function readJson(filePath) {
   if (!existsSync(filePath)) return { ok: false, error: `missing: ${filePath}` };
@@ -107,27 +124,31 @@ function main() {
   /** @type {string[]} */
   const violations = [];
 
-  const example = readArgs0(exampleJsonPath);
-  const plg = readArgs0(pluginJsonPath);
   const pluginJson = readJson(pluginJsonPath);
+  const pluginKey = pluginJson.ok && typeof pluginJson.value?.name === "string"
+    ? pluginJson.value.name
+    : DEFAULT_PLUGIN_KEY;
+  const example = readServerEntry(exampleJsonPath, pluginKey);
+  const plg = readServerEntry(pluginJsonPath, pluginKey);
 
   if (!example.ok) violations.push(example.error);
   if (!plg.ok) violations.push(plg.error);
 
-  if (example.ok && example.value !== PLACEHOLDER) {
+  const canonical = stable(CANONICAL_SERVER_ENTRY);
+  if (example.ok && stable(example.value) !== canonical) {
     violations.push(
-      `.mcp.json.example args[0] is "${example.value}" but must equal "${PLACEHOLDER}". ` +
+      `.mcp.json.example mcpServers.${pluginKey} is ${stable(example.value)} but must equal ${canonical}. ` +
         `Contributors copy this template to .mcp.json for local dev, so the template MUST hold the canonical form. (Issue #531 / #253 class.)`,
     );
   }
-  if (plg.ok && plg.value !== PLACEHOLDER) {
+  if (plg.ok && stable(plg.value) !== canonical) {
     violations.push(
-      `.claude-plugin/plugin.json args[0] is "${plg.value}" but must equal "${PLACEHOLDER}". (Issue #523 class.)`,
+      `.claude-plugin/plugin.json mcpServers.${pluginKey} is ${stable(plg.value)} but must equal ${canonical}. (Issue #523 class.)`,
     );
   }
-  if (example.ok && plg.ok && example.value !== plg.value) {
+  if (example.ok && plg.ok && stable(example.value) !== stable(plg.value)) {
     violations.push(
-      `asymmetric drift: .mcp.json.example args[0]="${example.value}" vs .claude-plugin/plugin.json args[0]="${plg.value}". The two source-tracked manifests MUST agree so contributors copying the template and end-users via marketplace install resolve the same start.mjs.`,
+      `asymmetric drift: .mcp.json.example vs .claude-plugin/plugin.json mcpServers.${pluginKey} disagree. The two source-tracked manifests MUST agree so contributors copying the template and end-users via marketplace install reach the same daemon.`,
     );
   }
 
@@ -157,10 +178,10 @@ function main() {
   // Contributor's local .mcp.json (if present) — must match the template.
   // Absence is fine; the file is .gitignored after the #531 architectural untrack.
   if (existsSync(localMcpJsonPath)) {
-    const local = readArgs0(localMcpJsonPath);
-    if (local.ok && local.value !== PLACEHOLDER) {
+    const local = readServerEntry(localMcpJsonPath, pluginKey);
+    if (local.ok && stable(local.value) !== canonical) {
       violations.push(
-        `local .mcp.json args[0] is "${local.value}" but must equal "${PLACEHOLDER}". ` +
+        `local .mcp.json mcpServers.${pluginKey} does not match the canonical HTTP entry. ` +
           `If you intentionally use a relative dev path locally, ignore — but this file would ship the regression if it ever lands in package.json files[]. Consider \`cp .mcp.json.example .mcp.json\` to reset.`,
       );
     }
@@ -175,7 +196,7 @@ function main() {
   }
 
   process.stdout.write(
-    `asymmetric-drift: OK (.mcp.json.example + .claude-plugin/plugin.json both pin args[0] to ${PLACEHOLDER}; plugin skills path is ${SKILLS_PATH}; runtime files present)\n`,
+    `asymmetric-drift: OK (.mcp.json.example + .claude-plugin/plugin.json both pin the canonical HTTP daemon entry; plugin skills path is ${SKILLS_PATH}; runtime files present)\n`,
   );
 }
 

@@ -16,7 +16,7 @@
  *
  * Two consumers:
  *   1. start.mjs at boot — calls assertPluginCacheIntegrity, on !ok
- *      writes a structured CONTEXT_MODE_PARTIAL_INSTALL stderr block
+ *      writes a structured QUIET_CONTEXT_PARTIAL_INSTALL stderr block
  *      and exits 2. Fail-fast — the alternative is a downstream stack
  *      trace from `import("./server.bundle.mjs")` that hides the
  *      actual root cause.
@@ -231,13 +231,13 @@ export function assertPluginCacheIntegrity({ pluginRoot }) {
 
 /**
  * Format the structured stderr block start.mjs emits when integrity
- * fails. Marker line `CONTEXT_MODE_PARTIAL_INSTALL` lets external
+ * fails. Marker line `QUIET_CONTEXT_PARTIAL_INSTALL` lets external
  * monitoring grep for the exact failure mode without parsing free-form
  * text. Keep the format stable across versions.
  */
 export function formatPartialInstallReport({ pluginRoot, missing }) {
   const lines = [
-    "CONTEXT_MODE_PARTIAL_INSTALL",
+    "QUIET_CONTEXT_PARTIAL_INSTALL",
     `  pluginRoot: ${pluginRoot}`,
     "  missing:",
     ...missing.map((m) => `    - ${m}`),

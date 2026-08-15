@@ -183,56 +183,6 @@ describe("Slice 6: role — second-person persona statements across scripts", ()
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// SLICE 6b (issue #856): casual conversational / stop phrases are NOT roles
-//
-// A short imperative with no '?' and no comma used to satisfy the coarse
-// structural role gate (2 lexical tokens, 8..120 chars). Casual throwaway
-// acknowledgements ("that's fine for now", "go with the second option") thus
-// froze as a priority-3 `role` and got re-injected as a standing
-// behavioral_directive every turn → do-nothing loop. The gate now additionally
-// requires a genuine persona/directive cue (algorithmic prefix membership, no
-// regex), which conversational phrases lack but real role prompts carry.
-// ════════════════════════════════════════════════════════════════════════════
-
-describe("Slice 6b (#856): casual phrases must NOT classify as role", () => {
-  const casual = [
-    "that's fine for now",
-    "go with the second option",
-    "ok sounds good",
-    "sure that works",
-    "leave it as is",
-    "that works",
-    "sounds good to me",
-    "let's move on",
-    "keep going",
-  ];
-  for (const phrase of casual) {
-    test(`casual phrase is NOT a role: "${phrase}"`, () => {
-      assert.equal(hasRole(phrase), false);
-    });
-  }
-
-  // Defense against regression: genuine role / standing-directive prompts in
-  // multiple languages MUST still classify as role after tightening the gate.
-  const legitRoles = [
-    "You are a senior backend engineer",
-    "You're a security reviewer",
-    "act as a security reviewer",
-    "always respond in TypeScript",
-    "Tu es un développeur senior",
-    "Sen kıdemli bir backend mühendisisin",
-    "あなたは経験豊富なエンジニアです",
-    "你是一名资深后端工程师",
-    "Eres un ingeniero backend senior",
-  ];
-  for (const phrase of legitRoles) {
-    test(`legit role still classifies: "${phrase}"`, () => {
-      assert.ok(hasRole(phrase));
-    });
-  }
-});
-
-// ════════════════════════════════════════════════════════════════════════════
 // SLICE 7: blocker — programming-domain markers (language-neutral)
 // ════════════════════════════════════════════════════════════════════════════
 

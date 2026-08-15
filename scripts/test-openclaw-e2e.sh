@@ -187,7 +187,7 @@ pass("after_tool_call fired (read)");
 
 // 5e. after_tool_call — exec/bash
 await fireLifecycle("after_tool_call", {
-  toolName: "exec",
+      toolName: "execute",
   params: { command: "ls -la" },
   result: "total 8\ndrwxr-xr-x 2 pedro pedro",
   runId: randomUUID(), toolCallId: randomUUID(), durationMs: 45,
@@ -205,7 +205,7 @@ pass("after_tool_call fired (write)");
 
 // 5g. after_tool_call — error case
 await fireLifecycle("after_tool_call", {
-  toolName: "exec",
+      toolName: "execute",
   params: { command: "false" },
   error: "exit code 1",
   isError: true,

@@ -213,13 +213,10 @@ describe("CursorAdapter", () => {
 
     afterEach(() => {
       rmSync(tempDir, { recursive: true, force: true });
-      // Pre-fix this rmSync targeted resolve(".cursor", "mcp.json") in
-      // the contributor's real repo root (process.cwd()). Tests that
-      // write that path now chdir into tempDir for the write, so the
-      // file we need to remove also lives inside tempDir and is gone
-      // when the tempDir cleanup above fires. Nothing else to do.
-      void projectCursorDir;
-      void projectCursorDirExisted;
+      try { rmSync(resolve(".cursor", "mcp.json"), { force: true }); } catch { /* best effort */ }
+      if (!projectCursorDirExisted) {
+        try { rmSync(resolve(".cursor"), { recursive: true, force: true }); } catch { /* best effort */ }
+      }
     });
 
     it("generates native Cursor hook entries for v1 hooks only", () => {
@@ -275,32 +272,21 @@ describe("CursorAdapter", () => {
     });
 
     it("detects Cursor MCP registration from project config", () => {
-      // Pre-fix this test wrote .cursor/mcp.json to process.cwd() (the
-      // contributor's repo root). chdir into the per-test tempDir so the
-      // write lands in the sandbox. The adapter's checkPluginRegistration
-      // reads .cursor/mcp.json relative to cwd, so the same chdir lets
-      // the assertion see the test fixture.
-      const origCwd = process.cwd();
-      process.chdir(tempDir);
-      try {
-        mkdirSync(resolve(".cursor"), { recursive: true });
-        writeFileSync(
-          resolve(".cursor", "mcp.json"),
-          JSON.stringify({
-            mcpServers: {
-              "context-mode": {
-                command: "context-mode",
-              },
+      mkdirSync(resolve(".cursor"), { recursive: true });
+      writeFileSync(
+        resolve(".cursor", "mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            "context-mode": {
+              command: "context-mode",
             },
-          }, null, 2),
-        );
+          },
+        }, null, 2),
+      );
 
-        const result = adapter.checkPluginRegistration();
-        expect(result.status).toBe("pass");
-        expect(result.message).toContain(join(".cursor", "mcp.json"));
-      } finally {
-        process.chdir(origCwd);
-      }
+      const result = adapter.checkPluginRegistration();
+      expect(result.status).toBe("pass");
+      expect(result.message).toContain(join(".cursor", "mcp.json"));
     });
   });
 
@@ -399,27 +385,19 @@ describe("CursorAdapter", () => {
   // and resolves the self-contradiction where a plugin-only install could still
   // emit `MCP registration: warn` while `Plugin install: pass`.
   describe("cursor doctor — plugin install detection", () => {
-    let tempDir: string;
-    let origCwd: string;
+    let projectCursorDirExisted: boolean;
 
     beforeEach(() => {
       clearPluginRoots();
-      // Same sandboxing as the "hook config management" block above: tests
-      // here writeFileSync(resolve(".cursor", "mcp.json"), ...) and the
-      // afterEach rmSync(force:true) would otherwise clobber the
-      // contributor's real .cursor/mcp.json. chdir into a tmpdir for the
-      // duration of each test so every resolve(".cursor", ...) below
-      // lands inside the sandbox.
-      tempDir = mkdtempSync(join(tmpdir(), "cursor-doctor-test-"));
-      origCwd = process.cwd();
-      process.chdir(tempDir);
+      projectCursorDirExisted = existsSync(resolve(".cursor"));
     });
 
     afterEach(() => {
       clearPluginRoots();
-      // Restore cwd BEFORE removing tempDir.
-      process.chdir(origCwd);
-      rmSync(tempDir, { recursive: true, force: true });
+      try { rmSync(resolve(".cursor", "mcp.json"), { force: true }); } catch { /* best effort */ }
+      if (!projectCursorDirExisted) {
+        try { rmSync(resolve(".cursor"), { recursive: true, force: true }); } catch { /* best effort */ }
+      }
     });
 
     // Case A — clean machine. No plugin roots → empty array, no throw.

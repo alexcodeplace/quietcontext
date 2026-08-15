@@ -45,6 +45,7 @@ export interface PreparedStatement {
  */
 export class BunSQLiteAdapter {
   #raw: any;
+  #statements = new Set<() => void>();
 
   constructor(rawDb: any) {
     this.#raw = rawDb;
@@ -52,13 +53,15 @@ export class BunSQLiteAdapter {
 
   pragma(source: string): any {
     const stmt = this.#raw.prepare(`PRAGMA ${source}`);
-    const rows = stmt.all();
-    if (!rows || rows.length === 0) return undefined;
-    // Multi-row pragmas (table_xinfo, etc.) → return array
-    if (rows.length > 1) return rows;
-    // Single-row: extract scalar value (e.g. journal_mode = "wal")
-    const values = Object.values(rows[0] as Record<string, unknown>);
-    return values.length === 1 ? values[0] : rows[0];
+    return this.#withTransient(stmt, () => {
+      const rows = stmt.all();
+      if (!rows || rows.length === 0) return undefined;
+      // Multi-row pragmas (table_xinfo, etc.) → return array
+      if (rows.length > 1) return rows;
+      // Single-row: extract scalar value (e.g. journal_mode = "wal")
+      const values = Object.values(rows[0] as Record<string, unknown>);
+      return values.length === 1 ? values[0] : rows[0];
+    });
   }
 
   exec(sql: string): any {
@@ -76,19 +79,27 @@ export class BunSQLiteAdapter {
         inString = ch;
       } else if (ch === ";") {
         const trimmed = current.trim();
-        if (trimmed) this.#raw.prepare(trimmed).run();
+        if (trimmed) this.#runTransient(trimmed);
         current = "";
       } else {
         current += ch;
       }
     }
     const trimmed = current.trim();
-    if (trimmed) this.#raw.prepare(trimmed).run();
+    if (trimmed) this.#runTransient(trimmed);
     return this;
   }
 
   prepare(sql: string): any {
     const stmt = this.#raw.prepare(sql);
+    let finalized = false;
+    const finalize = () => {
+      if (finalized) return;
+      stmt.finalize?.();
+      finalized = true;
+      this.#statements.delete(finalize);
+    };
+    this.#statements.add(finalize);
     return {
       run: (...args: unknown[]) => stmt.run(...args),
       get: (...args: unknown[]) => {
@@ -97,6 +108,7 @@ export class BunSQLiteAdapter {
       },
       all: (...args: unknown[]) => stmt.all(...args),
       iterate: (...args: unknown[]) => stmt.iterate(...args),
+      finalize,
     };
   }
 
@@ -105,7 +117,46 @@ export class BunSQLiteAdapter {
   }
 
   close(): void {
-    this.#raw.close();
+    const errors: unknown[] = [];
+    for (const finalize of Array.from(this.#statements)) {
+      try {
+        finalize();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
+      this.#raw.close(true);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Failed to close Bun SQLite database");
+  }
+
+  #runTransient(sql: string): void {
+    const stmt = this.#raw.prepare(sql);
+    this.#withTransient(stmt, () => stmt.run());
+  }
+
+  #withTransient<T>(stmt: any, operation: () => T): T {
+    let result!: T;
+    let operationError: unknown;
+    let failed = false;
+    try {
+      result = operation();
+    } catch (error) {
+      failed = true;
+      operationError = error;
+    }
+    try {
+      stmt.finalize?.();
+    } catch (cleanupError) {
+      if (failed) throw new AggregateError([operationError, cleanupError], "SQLite operation and cleanup failed");
+      throw cleanupError;
+    }
+    if (failed) throw operationError;
+    return result;
   }
 }
 

@@ -44,15 +44,15 @@ describe(".codex-plugin/mcp.json", () => {
     expect(mcp).not.toHaveProperty("mcp_servers");
   });
 
-  it("declares the context-mode server entry", () => {
+  it("declares the quietcontext server entry", () => {
     const servers = mcp.mcpServers as Record<string, unknown>;
     expect(servers).toBeTypeOf("object");
-    expect(servers).toHaveProperty("context-mode");
+    expect(servers).toHaveProperty("quietcontext");
   });
 
   it("launches via `node` with relative `./start.mjs`", () => {
     const servers = mcp.mcpServers as Record<string, { command: string; args: string[] }>;
-    const entry = servers["context-mode"];
+    const entry = servers["quietcontext"];
     expect(entry.command).toBe("node");
     expect(entry.args).toEqual(["./start.mjs"]);
   });
@@ -62,17 +62,8 @@ describe(".codex-plugin/mcp.json", () => {
     // the spawned `node ./start.mjs` resolves correctly inside the
     // installed plugin directory.
     const servers = mcp.mcpServers as Record<string, { cwd?: string }>;
-    const entry = servers["context-mode"];
+    const entry = servers["quietcontext"];
     expect(entry.cwd).toBe(".");
-  });
-
-  it("sets CONTEXT_MODE_PLATFORM=codex for the MCP server process", () => {
-    // Codex hook wrappers already set this before loading shared hook code.
-    // The MCP server needs the same signal so storage and doctor output do
-    // not fall back to ~/.claude on machines that have both agents installed.
-    const servers = mcp.mcpServers as Record<string, { env?: Record<string, string> }>;
-    const entry = servers["context-mode"];
-    expect(entry.env?.CONTEXT_MODE_PLATFORM).toBe("codex");
   });
 
   it("does NOT use `${CODEX_PLUGIN_ROOT}` placeholders (no var expansion happens)", () => {
@@ -113,9 +104,9 @@ describe(".codex-plugin/hooks.json", () => {
     }
   });
 
-  it("sets CONTEXT_MODE_PLATFORM=codex in hook wrapper modules", () => {
+  it("sets QUIET_CONTEXT_PLATFORM=codex in hook wrapper modules", () => {
     const platformSource = readFileSync(resolve(REPO_ROOT, "hooks/codex/platform.mjs"), "utf8");
-    expect(platformSource).toContain('process.env.CONTEXT_MODE_PLATFORM = "codex";');
+    expect(platformSource).toContain('process.env.QUIET_CONTEXT_PLATFORM = "codex";');
 
     for (const groups of Object.values(hooks.hooks)) {
       const command = groups[0]?.hooks[0]?.command ?? "";

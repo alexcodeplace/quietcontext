@@ -46,8 +46,8 @@ if (!process.env.CLAUDE_PROJECT_DIR && safeOriginalCwd) {
 // Platform-agnostic project dir — guaranteed to be set for ALL platforms.
 // Adapters may set their own env var (GEMINI_PROJECT_DIR, etc.) but this
 // is the universal fallback so server.ts getProjectDir() never relies on cwd().
-if (!process.env.CONTEXT_MODE_PROJECT_DIR && safeOriginalCwd) {
-  process.env.CONTEXT_MODE_PROJECT_DIR = safeOriginalCwd;
+if (!process.env.QUIET_CONTEXT_PROJECT_DIR && safeOriginalCwd) {
+  process.env.QUIET_CONTEXT_PROJECT_DIR = safeOriginalCwd;
 }
 
 // Routing instructions file auto-write DISABLED for all platforms (#158, #164).
@@ -427,38 +427,9 @@ try{
 
 // ── Self-heal Layer 5: Windows hooks.json + plugin.json normalization (#378) ──
 // Static committed files use ${CLAUDE_PLUGIN_ROOT} placeholder + bare `node`.
-// On Windows + Claude Code this hits cjs/loader:1479 because:
-//   1. bare `node` may not resolve via PATH (Git Bash, see #369)
-//   2. ${CLAUDE_PLUGIN_ROOT} can hit MSYS path mangling (#372)
-//   3. backslash paths corrupt under shell quoting
-// Rewrites placeholders to absolute paths using process.execPath (Datadog
-// model). Idempotent — only writes when needed. Survives upgrades because
-// it runs at every MCP boot.
-//
-// Skip under vitest: server.test.ts spawns this script from the repo root,
-// and a mutated .claude-plugin/plugin.json poisons sibling tests that read
-// the file (cli.test.ts). VITEST is inherited by spawned subprocesses.
-if (!process.env.VITEST) {
-  try {
-    const { normalizeHooksOnStartup } = await import("./hooks/normalize-hooks.mjs");
-    // #738: probe for Bun ≥1.0 and pass the resolved path so the static
-    // hooks/hooks.json rewrite swaps `node` → `bun` (~40-60ms cold-start win
-    // per hook). Probe is wrapped in its own try so resolveHookRuntime
-    // failures (missing build, missing module) never block boot.
-    let jsRuntimePath;
-    try {
-      const { resolveHookRuntime } = await import("./build/runtime.js");
-      const r = resolveHookRuntime();
-      if (r.isBun) jsRuntimePath = r.path;
-    } catch { /* best effort — fall through to nodePath default */ }
-    normalizeHooksOnStartup({
-      pluginRoot: __dirname,
-      nodePath: process.execPath,
-      jsRuntimePath,
-      platform: process.platform,
-    });
-  } catch { /* best effort — never block server startup */ }
-}
+// Keep plugin manifests immutable at runtime. Codex launches the fork with
+// explicit paths, so rewriting hooks/plugin metadata on every MCP boot only
+// creates noisy filesystem mutations and can poison later tests or sessions.
 
 // Ensure native dependencies + ABI compatibility (shared with hooks via ensure-deps.mjs)
 // ensure-deps handles better-sqlite3 install + ABI cache/rebuild automatically (#148, #203)
@@ -563,7 +534,7 @@ if (!process.env.VITEST) {
 // Verify boot-critical siblings exist BEFORE importing server.bundle.mjs.
 // Without this, a partial install (#550) gives an opaque downstream
 // stack trace from `import("./server.bundle.mjs")`. With it, we emit a
-// structured CONTEXT_MODE_PARTIAL_INSTALL stderr block + exit 2 so
+// structured QUIET_CONTEXT_PARTIAL_INSTALL stderr block + exit 2 so
 // external monitoring grep + the user both see the actionable signal.
 //
 // Runs AFTER the heal layers above so missing files they can fix
@@ -591,7 +562,7 @@ if (!process.env.VITEST) {
     // The helper itself failing is unexpected — keep boot moving rather
     // than blocking on a check infrastructure bug. The downstream
     // import will still surface the actual missing-bundle error.
-    if (process.env.CONTEXT_MODE_DEBUG) {
+    if (process.env.QUIET_CONTEXT_DEBUG) {
       process.stderr.write(`[start.mjs] integrity check skipped: ${err}\n`);
     }
   }

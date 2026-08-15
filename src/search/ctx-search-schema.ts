@@ -2,7 +2,7 @@
  * ctx_search input-schema builder and project-scope resolver.
  *
  * Issue #737 introduces the optional `project:` parameter used by callers
- * running in the shared-DB mode (`CONTEXT_MODE_PROJECT_DIR` is set). The
+ * running in the shared-DB mode (`QUIET_CONTEXT_PROJECT_DIR` is set). The
  * field is registered conditionally so that in the default per-project DB
  * mode the LLM physically cannot pass it — the parameter does not exist
  * in the tool schema at all, which is a stronger guarantee than runtime
@@ -12,8 +12,7 @@
  *   - {@link buildCtxSearchInputSchema} composes the Zod object used at
  *     `registerTool` time, spreading the conditional `project` field only
  *     when `isSharedMode` is true.
- *   - {@link resolveProjectScope} normalises the raw param into the
- *     three-state contract consumed by `searchAllSources`:
+ *   - {@link resolveProjectScope} normalises the raw param for content search:
  *       undefined → no filter
  *       null      → explicit cross-project recall (no filter)
  *       string    → restrict to that project directory
@@ -52,14 +51,14 @@ function coerceJsonArray(val: unknown): unknown {
 /**
  * Build the Zod object passed to `server.registerTool("ctx_search", …)`.
  *
- * The base fields (`queries`, `limit`, `source`, `contentType`, `sort`)
+ * The base fields (`queries`, `limit`, `source`, `contentType`)
  * are always present and mirror today's contract exactly. The `project`
  * field is only spread in when `isSharedMode` is true. When the host runs
  * with the default per-project DB layout the schema does not expose the
  * field at all, which keeps the tool surface honest about what is
  * actionable in that mode.
  */
-export function buildCtxSearchInputSchema(isSharedMode: boolean) {
+export function buildCtxSearchInputSchema(isSharedMode = false) {
   const projectField = isSharedMode
     ? {
         project: z
@@ -79,6 +78,22 @@ export function buildCtxSearchInputSchema(isSharedMode: boolean) {
       .array(z.string())
       .optional()
       .describe("Array of search queries. Batch ALL questions in one call.")),
+    refs: z.preprocess(coerceJsonArray, z
+      .array(z.string())
+      .optional()
+      .describe("Exact result references returned by an earlier search call.")),
+    preview: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Include bounded content snippets; default returns titles and refs only."),
+    max_bytes: z
+      .coerce.number()
+      .int()
+      .min(256)
+      .max(8 * 1024)
+      .optional()
+      .describe("Lower response-byte budget; hard cap remains 8 KiB."),
     // limit: z.coerce.number() (not z.number()) — OpenCode's native
     // plugin path delivers tool args straight from the LLM provider's
     // tool-call JSON, where several providers stringify primitives
@@ -100,14 +115,6 @@ export function buildCtxSearchInputSchema(isSharedMode: boolean) {
       .enum(["code", "prose"])
       .optional()
       .describe("Filter results by content type: 'code' or 'prose'."),
-    sort: z
-      .enum(["relevance", "timeline"])
-      .optional()
-      .default("relevance")
-      .describe(
-        "Sort mode. 'relevance' (default): BM25 ranked, current session only. " +
-          "'timeline': chronological across current session, prior sessions, and auto-memory.",
-      ),
     ...projectField,
   });
 }
@@ -136,8 +143,8 @@ export function resolveProjectScope(
 }
 
 /**
- * Module-load snapshot of `CONTEXT_MODE_PROJECT_DIR`. Captured once so the
+ * Module-load snapshot of `QUIET_CONTEXT_PROJECT_DIR`. Captured once so the
  * tool schema registered with `server.registerTool` reflects the launch
  * environment — the LLM-visible surface should never flip mid-session.
  */
-export const CTX_SEARCH_SHARED_MODE = !!process.env.CONTEXT_MODE_PROJECT_DIR;
+export const CTX_SEARCH_SHARED_MODE = !!process.env.QUIET_CONTEXT_PROJECT_DIR;

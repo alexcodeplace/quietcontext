@@ -3,15 +3,15 @@ import { execFileSync } from "node:child_process";
 import { detectLocaleAndTz } from "../../src/session/analytics.js";
 
 describe("detectLocaleAndTz", () => {
-  it("CONTEXT_MODE_LOCALE env wins over everything", () => {
-    const orig = process.env.CONTEXT_MODE_LOCALE;
-    process.env.CONTEXT_MODE_LOCALE = "tr-TR";
+  it("QUIET_CONTEXT_LOCALE env wins over everything", () => {
+    const orig = process.env.QUIET_CONTEXT_LOCALE;
+    process.env.QUIET_CONTEXT_LOCALE = "tr-TR";
     try {
       const { locale } = detectLocaleAndTz();
       expect(locale).toBe("tr-TR");
     } finally {
-      if (orig === undefined) delete process.env.CONTEXT_MODE_LOCALE;
-      else process.env.CONTEXT_MODE_LOCALE = orig;
+      if (orig === undefined) delete process.env.QUIET_CONTEXT_LOCALE;
+      else process.env.QUIET_CONTEXT_LOCALE = orig;
     }
   });
 
@@ -33,8 +33,8 @@ describe("detectLocaleAndTz", () => {
     }
     if (!appleLocale) return;
 
-    const orig = { lang: process.env.LANG, override: process.env.CONTEXT_MODE_LOCALE };
-    delete process.env.CONTEXT_MODE_LOCALE;
+    const orig = { lang: process.env.LANG, override: process.env.QUIET_CONTEXT_LOCALE };
+    delete process.env.QUIET_CONTEXT_LOCALE;
     process.env.LANG = "xx_XX.UTF-8"; // a value that would lose if AppleLocale wins
     try {
       const { locale } = detectLocaleAndTz();
@@ -42,7 +42,7 @@ describe("detectLocaleAndTz", () => {
     } finally {
       if (orig.lang === undefined) delete process.env.LANG;
       else process.env.LANG = orig.lang;
-      if (orig.override !== undefined) process.env.CONTEXT_MODE_LOCALE = orig.override;
+      if (orig.override !== undefined) process.env.QUIET_CONTEXT_LOCALE = orig.override;
     }
   });
 
@@ -60,9 +60,9 @@ describe("detectLocaleAndTz", () => {
     const orig = {
       lang:       process.env.LANG,
       lcTime:     process.env.LC_TIME,
-      override:   process.env.CONTEXT_MODE_LOCALE,
+      override:   process.env.QUIET_CONTEXT_LOCALE,
     };
-    delete process.env.CONTEXT_MODE_LOCALE;
+    delete process.env.QUIET_CONTEXT_LOCALE;
     delete process.env.LC_TIME;
     try {
       for (const langValue of ["C.UTF-8", "POSIX", "C"]) {
@@ -81,25 +81,25 @@ describe("detectLocaleAndTz", () => {
       else process.env.LANG = orig.lang;
       if (orig.lcTime === undefined) delete process.env.LC_TIME;
       else process.env.LC_TIME = orig.lcTime;
-      if (orig.override !== undefined) process.env.CONTEXT_MODE_LOCALE = orig.override;
+      if (orig.override !== undefined) process.env.QUIET_CONTEXT_LOCALE = orig.override;
     }
   });
 
-  // Belt-and-suspenders: even if a contributor sets CONTEXT_MODE_LOCALE to a
+  // Belt-and-suspenders: even if a contributor sets QUIET_CONTEXT_LOCALE to a
   // garbage value (typo, copy-paste from a POSIX shell config), the env-wins
   // branch at the top of detectLocaleAndTz must NOT propagate that into the
   // return value — same risk as LANG=C.UTF-8, different entry point.
-  it("CONTEXT_MODE_LOCALE that is not a valid BCP 47 tag is ignored", () => {
-    const orig = process.env.CONTEXT_MODE_LOCALE;
-    process.env.CONTEXT_MODE_LOCALE = "C"; // POSIX, would throw
+  it("QUIET_CONTEXT_LOCALE that is not a valid BCP 47 tag is ignored", () => {
+    const orig = process.env.QUIET_CONTEXT_LOCALE;
+    process.env.QUIET_CONTEXT_LOCALE = "C"; // POSIX, would throw
     try {
       const { locale } = detectLocaleAndTz();
       expect(locale).not.toBe("C");
       expect(() => new Intl.DateTimeFormat(locale, { timeZone: "UTC" }))
         .not.toThrow();
     } finally {
-      if (orig === undefined) delete process.env.CONTEXT_MODE_LOCALE;
-      else process.env.CONTEXT_MODE_LOCALE = orig;
+      if (orig === undefined) delete process.env.QUIET_CONTEXT_LOCALE;
+      else process.env.QUIET_CONTEXT_LOCALE = orig;
     }
   });
 });

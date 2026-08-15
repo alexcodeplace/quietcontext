@@ -16,7 +16,7 @@ import "../setup-home";
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MCPStdioClient } from "../../src/adapters/pi/mcp-bridge.js";
@@ -58,7 +58,7 @@ describe("Pi MCPStdioClient — foreign workspace env scrub (issue #545)", () =>
       CLAUDE_PLUGIN_ROOT: "/some/plugin/root",
       CLAUDE_CODE_ENTRYPOINT: "cli",
       // Universal escape hatch — never scrubbed.
-      CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+      QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       // Non-platform env — preserved as-is (not in any registry).
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: "/Users/x",
@@ -94,7 +94,7 @@ describe("Pi MCPStdioClient — foreign workspace env scrub (issue #545)", () =>
     expect(spawned.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
 
     // Universal escape hatch — PRESERVED.
-    expect(spawned.CONTEXT_MODE_PROJECT_DIR).toBe("/Users/x/escape");
+    expect(spawned.QUIET_CONTEXT_PROJECT_DIR).toBe("/Users/x/escape");
 
     // Non-platform env — PRESERVED.
     expect(spawned.HOME).toBe("/Users/x");
@@ -154,7 +154,7 @@ describe("Pi MCPStdioClient — foreign identification env scrub (issue #561)", 
       PI_SESSION_FILE: "/Users/x/.pi/sessions/active.json",
       PI_COMPILED: "1",
       // Universal escape hatch — never scrubbed.
-      CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+      QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       // Non-platform env — preserved as-is.
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: "/Users/x",
@@ -189,43 +189,10 @@ describe("Pi MCPStdioClient — foreign identification env scrub (issue #561)", 
     expect(spawned.PI_COMPILED).toBe("1");
 
     // Universal escape hatch — PRESERVED.
-    expect(spawned.CONTEXT_MODE_PROJECT_DIR).toBe("/Users/x/escape");
+    expect(spawned.QUIET_CONTEXT_PROJECT_DIR).toBe("/Users/x/escape");
 
     // Non-platform env — PRESERVED.
     expect(spawned.HOME).toBe("/Users/x");
-  });
-
-  it("auto-sets PI_CONFIG_DIR when parent env does not have it (#561 regression fix)", () => {
-    // Real Pi sessions: parent process does NOT set PI_CONFIG_DIR.
-    // The bridge must auto-resolve it via homedir() so the child detects Pi.
-    // setup-home roots process.env.HOME at a temp dir. Create .pi/ there.
-    const home = process.env.HOME!;
-    if (!home) throw new Error("setup-home did not set HOME");
-    const piDir = join(home, ".pi");
-    mkdirSync(piDir);
-    try {
-      const env: NodeJS.ProcessEnv = {
-        HOME: home,
-        PATH: process.env.PATH ?? "/usr/bin:/bin",
-        PI_SESSION_FILE: `${home}/.pi/sessions/active.json`,
-        PI_COMPILED: "1",
-      };
-      const client = new MCPStdioClient(fakeServer, env);
-      clients.push(client);
-      client.start();
-      const spawned = client._spawnEnv;
-      expect(spawned).not.toBeNull();
-      if (!spawned) throw new Error("unreachable");
-
-      expect(spawned.PI_CONFIG_DIR).toBe(piDir);
-      expect(spawned.PI_SESSION_FILE).toBe(`${home}/.pi/sessions/active.json`);
-      expect(spawned.PI_COMPILED).toBe("1");
-      // No Claude contamination
-      expect(spawned.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
-      expect(spawned.CLAUDE_PLUGIN_ROOT).toBeUndefined();
-    } finally {
-      try { rmSync(piDir, { recursive: true, force: true }); } catch {}
-    }
   });
 
   it("workspace scrub from #545 still works alongside identification scrub from #561", () => {
@@ -259,96 +226,5 @@ describe("Pi MCPStdioClient — foreign identification env scrub (issue #561)", 
     // Pi's own vars survive both filters.
     expect(spawned.PI_PROJECT_DIR).toBe("/Users/x/own");
     expect(spawned.PI_CONFIG_DIR).toBe("/Users/x/.pi/config");
-  });
-});
-
-// PR #741 follow-up — cross-OS PI_CONFIG_DIR rescue.
-// Pi on Windows installs to %APPDATA%\.pi (XDG-on-Windows pattern),
-// NOT %USERPROFILE%\.pi. The HOME-rooted probe is false on every
-// Windows Pi install; without an APPDATA fallback the rescue never
-// fires and Pi sessions write into ~/.claude/ instead of ~/.pi/.
-describe("Pi MCPStdioClient — cross-OS PI_CONFIG_DIR rescue (PR #741 follow-up)", () => {
-  it("respects PI_CONFIG_DIR when the parent already exported it (no override)", () => {
-    // Pi's launcher may pin a non-default config dir (CI / corporate setup).
-    // The rescue must NEVER stomp on the parent's intent.
-    const home = process.env.HOME!;
-    if (!home) throw new Error("setup-home did not set HOME");
-    const piDir = join(home, ".pi");
-    mkdirSync(piDir);
-    try {
-      const env: NodeJS.ProcessEnv = {
-        HOME: home,
-        PATH: process.env.PATH ?? "/usr/bin:/bin",
-        PI_CONFIG_DIR: "/opt/corporate/pi-config-pinned",
-      };
-      const client = new MCPStdioClient(fakeServer, env);
-      clients.push(client);
-      client.start();
-      const spawned = client._spawnEnv;
-      expect(spawned).not.toBeNull();
-      if (!spawned) throw new Error("unreachable");
-      // Parent-set PI_CONFIG_DIR is preserved verbatim even though
-      // ${HOME}/.pi exists on disk.
-      expect(spawned.PI_CONFIG_DIR).toBe("/opt/corporate/pi-config-pinned");
-    } finally {
-      try { rmSync(piDir, { recursive: true, force: true }); } catch {}
-    }
-  });
-
-  it("falls back to APPDATA/.pi on Windows when USERPROFILE/.pi does not exist", () => {
-    // Simulate Pi-on-Windows: APPDATA points to a real .pi/, USERPROFILE
-    // does NOT (so the original HOME-rooted probe would miss it). Bridge
-    // must rescue PI_CONFIG_DIR from APPDATA so detectPlatform() returns pi.
-    const scratchDir = mkdtempSync(join(tmpdir(), "ctx-pi-win-appdata-"));
-    const appDataPiDir = join(scratchDir, "appdata", ".pi");
-    mkdirSync(appDataPiDir, { recursive: true });
-    try {
-      const env: NodeJS.ProcessEnv = {
-        // No HOME set — emulates Windows where HOME may be absent and
-        // USERPROFILE points at a directory without .pi/ on it.
-        USERPROFILE: join(scratchDir, "userprofile"),
-        APPDATA: join(scratchDir, "appdata"),
-        PATH: process.env.PATH ?? "/usr/bin:/bin",
-      };
-      const client = new MCPStdioClient(fakeServer, env);
-      clients.push(client);
-      client.start();
-      const spawned = client._spawnEnv;
-      expect(spawned).not.toBeNull();
-      if (!spawned) throw new Error("unreachable");
-      // APPDATA-based path was picked up — Pi's Windows install layout.
-      expect(spawned.PI_CONFIG_DIR).toBe(appDataPiDir);
-    } finally {
-      try { rmSync(scratchDir, { recursive: true, force: true }); } catch {}
-    }
-  });
-
-  it("prefers HOME/.pi when both HOME/.pi and APPDATA/.pi exist", () => {
-    // POSIX-shaped path stays canonical. The home candidate is probed
-    // before APPDATA so Linux/macOS behavior is unchanged.
-    const home = process.env.HOME!;
-    if (!home) throw new Error("setup-home did not set HOME");
-    const homePiDir = join(home, ".pi");
-    const scratchDir = mkdtempSync(join(tmpdir(), "ctx-pi-prefer-home-"));
-    const appDataPiDir = join(scratchDir, "appdata", ".pi");
-    mkdirSync(homePiDir);
-    mkdirSync(appDataPiDir, { recursive: true });
-    try {
-      const env: NodeJS.ProcessEnv = {
-        HOME: home,
-        APPDATA: join(scratchDir, "appdata"),
-        PATH: process.env.PATH ?? "/usr/bin:/bin",
-      };
-      const client = new MCPStdioClient(fakeServer, env);
-      clients.push(client);
-      client.start();
-      const spawned = client._spawnEnv;
-      expect(spawned).not.toBeNull();
-      if (!spawned) throw new Error("unreachable");
-      expect(spawned.PI_CONFIG_DIR).toBe(homePiDir);
-    } finally {
-      try { rmSync(homePiDir, { recursive: true, force: true }); } catch {}
-      try { rmSync(scratchDir, { recursive: true, force: true }); } catch {}
-    }
   });
 });

@@ -272,7 +272,7 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDir(): string {
-    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // Issue #649: honor QUIET_CONTEXT_DATA_DIR universal storage override
     // ahead of OpenCode/Kilo's XDG-rooted default. opencode.json + plugin
     // discovery stay under getConfigDir() so OpenCode itself sees its own
     // config in the expected location.

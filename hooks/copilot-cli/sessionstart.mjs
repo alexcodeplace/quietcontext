@@ -99,10 +99,10 @@ try {
     db.close();
   }
 } catch (err) {
-  // Error telemetry is opt-in via CONTEXT_MODE_DEBUG (same pattern as the kimi
+  // Error telemetry is opt-in via QUIET_CONTEXT_DEBUG (same pattern as the kimi
   // hooks) so we don't write an append-only log to every user's config dir on a
   // transient SessionStart error. See #787 review.
-  if (process.env.CONTEXT_MODE_DEBUG) {
+  if (process.env.QUIET_CONTEXT_DEBUG) {
     try {
       const { appendFileSync, mkdirSync } = await import("node:fs");
       const { join: pjoin, dirname: pdirname } = await import("node:path");

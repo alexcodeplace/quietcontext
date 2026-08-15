@@ -38,22 +38,41 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..", "..");
 
+// Canonical shape since the shared-daemon cutover: manifests point every
+// session at ONE localhost HTTP daemon instead of spawning a stdio child.
+// Mirrors CANONICAL_SERVER_ENTRY in scripts/assert-asymmetric-drift.mjs.
+const CANONICAL_SERVER_ENTRY = {
+  type: "http",
+  url: "http://127.0.0.1:48619/mcp",
+  headers: { "X-QuietContext-Root": "${PWD}" },
+  headersHelper: "node ${CLAUDE_PLUGIN_ROOT}/daemon-headers.mjs",
+};
+// Legacy stdio placeholder — still pinned by the postinstall no-mutation
+// guard below (postinstall must never rewrite a contributor manifest).
 const PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}/start.mjs";
 const SKILLS_PATH = "./skills/";
 const REQUIRED_PLUGIN_RUNTIME_FILES = [
   "start.mjs",
+  "start-http.mjs",
+  "daemon-headers.mjs",
   "server.bundle.mjs",
+  "http-server.bundle.mjs",
   "cli.bundle.mjs",
 ];
 
 interface McpJson {
-  mcpServers?: Record<string, { args?: unknown[] }>;
+  mcpServers?: Record<string, unknown>;
+}
+
+function readServerEntry(path: string, key: string): unknown {
+  if (!existsSync(path)) return null;
+  const parsed = JSON.parse(readFileSync(path, "utf-8")) as McpJson;
+  return parsed.mcpServers?.[key] ?? null;
 }
 
 function readArgs0(path: string, key: string): string | null {
-  if (!existsSync(path)) return null;
-  const parsed = JSON.parse(readFileSync(path, "utf-8")) as McpJson;
-  const args = parsed.mcpServers?.[key]?.args;
+  const entry = readServerEntry(path, key) as { args?: unknown[] } | null;
+  const args = entry?.args;
   if (!Array.isArray(args) || args.length === 0) return null;
   const a0 = args[0];
   return typeof a0 === "string" ? a0 : null;
@@ -75,35 +94,35 @@ function npmPackDryRunJson() {
 }
 
 describe("Issue #531 — asymmetric-drift invariant", () => {
-  test(".mcp.json.example args[0] is the ${CLAUDE_PLUGIN_ROOT}/start.mjs placeholder", () => {
+  test(".mcp.json.example carries the canonical HTTP daemon entry", () => {
     // After the #531 architectural untrack (commit 9261377), .mcp.json is no
     // longer tracked in source — the canonical template moved to
     // .mcp.json.example. Contributors copy it to .mcp.json locally; end users
     // get MCP via .claude-plugin/plugin.json. This test pins the template.
-    const got = readArgs0(resolve(ROOT, ".mcp.json.example"), "context-mode");
-    expect(got, ".mcp.json.example missing or args[0] not a string").toBe(PLACEHOLDER);
+    const got = readServerEntry(resolve(ROOT, ".mcp.json.example"), "quietcontext");
+    expect(got, ".mcp.json.example missing quietcontext entry").toEqual(CANONICAL_SERVER_ENTRY);
   });
 
-  test(".claude-plugin/plugin.json args[0] is the ${CLAUDE_PLUGIN_ROOT}/start.mjs placeholder", () => {
-    const got = readArgs0(
+  test(".claude-plugin/plugin.json carries the canonical HTTP daemon entry", () => {
+    const got = readServerEntry(
       resolve(ROOT, ".claude-plugin", "plugin.json"),
-      "context-mode",
+      "quietcontext",
     );
-    expect(got, "plugin.json missing or args[0] not a string").toBe(PLACEHOLDER);
+    expect(got, "plugin.json missing quietcontext entry").toEqual(CANONICAL_SERVER_ENTRY);
   });
 
-  test(".mcp.json.example args[0] EQUALS .claude-plugin/plugin.json args[0] (drift guard)", () => {
+  test(".mcp.json.example EQUALS .claude-plugin/plugin.json entry (drift guard)", () => {
     // Core architectural invariant. If the source-tracked template and the
     // shipped Claude Code manifest ever drift, fresh installs break silently.
     // This is the test-time mirror of scripts/assert-asymmetric-drift.mjs.
-    const exampleArgs = readArgs0(resolve(ROOT, ".mcp.json.example"), "context-mode");
-    const pluginArgs = readArgs0(
+    const exampleEntry = readServerEntry(resolve(ROOT, ".mcp.json.example"), "quietcontext");
+    const pluginEntry = readServerEntry(
       resolve(ROOT, ".claude-plugin", "plugin.json"),
-      "context-mode",
+      "quietcontext",
     );
-    expect(exampleArgs).not.toBeNull();
-    expect(pluginArgs).not.toBeNull();
-    expect(exampleArgs).toBe(pluginArgs);
+    expect(exampleEntry).not.toBeNull();
+    expect(pluginEntry).not.toBeNull();
+    expect(exampleEntry).toEqual(pluginEntry);
   });
 
   test(".claude-plugin/plugin.json points skills at the shipped top-level skills directory (#658)", () => {
@@ -185,19 +204,19 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
     const scratch = mkdtempSync(join(tmpdir(), "asymmetric-drift-"));
     try {
       mkdirSync(join(scratch, ".claude-plugin"), { recursive: true });
-      // mcp.json correct
+      // template correct
       writeFileSync(
-        join(scratch, ".mcp.json"),
+        join(scratch, ".mcp.json.example"),
         JSON.stringify({
-          mcpServers: { "context-mode": { command: "node", args: [PLACEHOLDER] } },
+          mcpServers: { "context-mode": CANONICAL_SERVER_ENTRY },
         }),
       );
-      // plugin.json DRIFTED — bare relative path (the #253 regression shape)
+      // plugin.json DRIFTED — legacy stdio child spawn (pre-daemon shape)
       writeFileSync(
         join(scratch, ".claude-plugin", "plugin.json"),
         JSON.stringify({
           name: "context-mode",
-          mcpServers: { "context-mode": { command: "node", args: ["./start.mjs"] } },
+          mcpServers: { "context-mode": { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/start.mjs"] } },
         }),
       );
       const r = spawnSync(
@@ -226,7 +245,7 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
       writeFileSync(
         join(scratch, ".mcp.json.example"),
         JSON.stringify({
-          mcpServers: { "context-mode": { command: "node", args: [PLACEHOLDER] } },
+          mcpServers: { "context-mode": CANONICAL_SERVER_ENTRY },
         }),
       );
       writeFileSync(
@@ -234,7 +253,7 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
         JSON.stringify({
           name: "context-mode",
           skills: SKILLS_PATH,
-          mcpServers: { "context-mode": { command: "node", args: [PLACEHOLDER] } },
+          mcpServers: { "context-mode": CANONICAL_SERVER_ENTRY },
         }),
       );
       writeFileSync(join(scratch, "cli.bundle.mjs"), "");
@@ -267,7 +286,7 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
   // workspace-committed `.github/hooks/context-mode.json` etc.). The fix was
   // surgical at the adapter layer; nothing structural prevents a future
   // contributor from accidentally re-introducing the same bug class in any
-  // of the 17 adapters under configs/.
+  // of the 15 adapters under configs/.
   //
   // This invariant scans every committed config template under configs/**
   // and asserts that no string value contains an absolute path, an fnm

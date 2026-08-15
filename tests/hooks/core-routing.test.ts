@@ -9,7 +9,6 @@ import {
   readFileSync,
   mkdtempSync,
   rmSync,
-  utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -27,7 +26,6 @@ let routePreToolUse: (
   projectDir?: string,
   platform?: string,
   sessionId?: string,
-  options?: { mcpToolsAvailable?: boolean },
 ) => {
   action: string;
   reason?: string;
@@ -35,10 +33,10 @@ let routePreToolUse: (
   additionalContext?: string;
 } | null;
 
-let resetGuidanceThrottle: (sessionId?: string) => void;
+let resetGuidanceThrottle: () => void;
 let initSecurity: (buildDir: string) => Promise<boolean>;
 let ROUTING_BLOCK: string;
-let createRoutingBlock: (t: any, options?: { includeCommands?: boolean; toolSearchBootstrap?: boolean }) => string;
+let createRoutingBlock: (t: any, options?: { includeCommands?: boolean }) => string;
 let READ_GUIDANCE: string;
 let GREP_GUIDANCE: string;
 
@@ -60,9 +58,9 @@ beforeAll(async () => {
 //
 // Use an isolated temp dir for sentinels so the directory scan in isMCPReady()
 // is not polluted by leftover sentinels from real MCP servers running on the
-// developer's machine. The hook honors CONTEXT_MODE_MCP_SENTINEL_DIR.
+// developer's machine. The hook honors QUIET_CONTEXT_MCP_SENTINEL_DIR.
 const _sentinelDir = mkdtempSync(join(tmpdir(), "ctx-test-sentinels-"));
-process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = _sentinelDir;
+process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR = _sentinelDir;
 const mcpSentinel = resolve(_sentinelDir, `context-mode-mcp-ready-${process.pid}`);
 
 beforeEach(() => {
@@ -76,7 +74,7 @@ afterEach(() => {
 
 afterAll(() => {
   try { rmSync(_sentinelDir, { recursive: true, force: true }); } catch {}
-  delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+  delete process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
 });
 
 describe("routePreToolUse", () => {
@@ -103,21 +101,6 @@ describe("routePreToolUse", () => {
         undefined,
         "codex",
         "codex-cmd-curl",
-      );
-      expect(result).not.toBeNull();
-      expect(result!.action).toBe("modify");
-      expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget redirected",
-      );
-    });
-
-    it("denies agy run_command CommandLine payloads like Bash command payloads", () => {
-      const result = routePreToolUse(
-        "run_command",
-        { CommandLine: "curl https://example.com" },
-        undefined,
-        "antigravity-cli",
-        "agy-commandline-curl",
       );
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
@@ -339,20 +322,6 @@ describe("routePreToolUse", () => {
       expect(result!.action).toBe("context");
       expect(result!.additionalContext).toBe(READ_GUIDANCE);
     });
-
-    it("treats agy view_file AbsolutePath payloads as Read", () => {
-      resetGuidanceThrottle("agy-view-file");
-      const result = routePreToolUse(
-        "view_file",
-        { AbsolutePath: "/some/file.ts" },
-        undefined,
-        "antigravity-cli",
-        "agy-view-file",
-      );
-      expect(result).not.toBeNull();
-      expect(result!.action).toBe("context");
-      expect(result!.additionalContext).toContain("ctx_execute_file");
-    });
   });
 
   // ─── Grep routing ──────────────────────────────────────
@@ -395,23 +364,6 @@ describe("routePreToolUse", () => {
       expect(result!.reason).toContain(url);
     });
 
-    it("treats agy read_url_content URL payloads as WebFetch", () => {
-      const url = "https://example.com/docs";
-      const result = routePreToolUse(
-        "read_url_content",
-        { URL: url },
-        undefined,
-        "antigravity-cli",
-        "agy-read-url",
-      );
-      expect(result).not.toBeNull();
-      expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain(url);
-      // agy's call surface is context-mode/<tool> (see hooks/core/tool-naming.mjs),
-      // not Claude's mcp__context-mode__<tool> form.
-      expect(result!.reason).toContain("context-mode/ctx_fetch_and_index");
-    });
-
     it("treats mcp_web_fetch as WebFetch and blocks it", () => {
       const url = "https://example.com";
       const result = routePreToolUse("mcp_web_fetch", { url });
@@ -444,52 +396,6 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("mcp_web_fetch", { url: "https://example.com" });
       expect(result).toBeNull();
     });
-
-    it("passes WebFetch through when the caller context cannot invoke ctx_* tools (#794)", () => {
-      const result = routePreToolUse(
-        "WebFetch",
-        { url: "https://example.com" },
-        undefined,
-        "claude-code",
-        "subagent-webfetch",
-        { mcpToolsAvailable: false },
-      );
-      expect(result).toBeNull();
-    });
-
-    it("keeps WebFetch redirected when options are omitted", () => {
-      const result = routePreToolUse(
-        "WebFetch",
-        { url: "https://example.com" },
-        undefined,
-        "claude-code",
-        "main-webfetch-default-options",
-      );
-      expect(result).not.toBeNull();
-      expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("ctx_fetch_and_index");
-    });
-
-    it("Claude Code pretooluse treats subagent hook payloads as ctx_* unavailable (#794)", async () => {
-      const main = await spawnPreToolUseHook({
-        tool_name: "WebFetch",
-        tool_input: { url: "https://example.com" },
-        session_id: "core-routing-main-webfetch",
-      });
-      expect(main.status).toBe(0);
-      expect(main.parsed?.hookSpecificOutput?.permissionDecision).toBe("deny");
-      expect(main.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain("ctx_fetch_and_index");
-
-      const subagent = await spawnPreToolUseHook({
-        tool_name: "WebFetch",
-        tool_input: { url: "https://example.com" },
-        session_id: "core-routing-subagent-webfetch",
-        agent_id: "agent-794",
-        agent_type: "claude-code-guide",
-      });
-      expect(subagent.status).toBe(0);
-      expect(subagent.stdout).toBe("");
-    });
   });
 
   // ─── MCP readiness: all redirects degrade gracefully (#230) ───
@@ -512,33 +418,12 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("Bash", { command: "./gradlew build" });
       expect(result).toBeNull();
     });
-
-    it("allows MCP-backed redirects when the caller context cannot invoke ctx_* tools", () => {
-      const cases = [
-        ["Bash", { command: "curl https://example.com" }],
-        ["Bash", { command: "node -e \"fetch('https://example.com')\"" }],
-        ["Bash", { command: "./gradlew build" }],
-        ["WebFetch", { url: "https://example.com" }],
-      ] as const;
-
-      for (const [tool, input] of cases) {
-        const result = routePreToolUse(
-          tool,
-          input,
-          undefined,
-          "claude-code",
-          `subagent-${tool}`,
-          { mcpToolsAvailable: false },
-        );
-        expect(result).toBeNull();
-      }
-    });
   });
 
-  // ─── Subagent ctx_commands omission (#233) ──────────────
+  // ─── Compact routing contract ───────────────────────────
 
-  describe("Subagent ctx_commands omission (#233)", () => {
-    it("Agent subagent prompt omits ctx_commands", () => {
+  describe("compact routing contract", () => {
+    it("Agent subagent prompt omits maintenance commands", () => {
       const result = routePreToolUse("Agent", {
         prompt: "Search the codebase",
         subagent_type: "general-purpose",
@@ -546,39 +431,33 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       const prompt = (result!.updatedInput as Record<string, string>).prompt;
-      expect(prompt).not.toContain("<ctx_commands>");
-      expect(prompt).toContain("<tool_selection_hierarchy>");
+      expect(prompt).not.toContain("maintenance:");
+      expect(prompt).toContain("<context_mode>");
     });
 
-    it("injects Claude Code Agent routing and ToolSearch bootstrap by default", () => {
-      const result = routePreToolUse("Agent", {
-        prompt: "Research this repository",
-        subagent_type: "general-purpose",
-      });
-      expect(result).not.toBeNull();
-      expect(result!.action).toBe("modify");
-      const prompt = (result!.updatedInput as Record<string, string>).prompt;
-      expect(prompt).toContain("<context_window_protection>");
-      expect(prompt).toContain("ToolSearch");
-      expect(prompt).not.toContain("<ctx_commands>");
+    it("main session keeps routing rules without verbose wrappers", () => {
+      expect(ROUTING_BLOCK).toContain("<context_mode>");
+      expect(ROUTING_BLOCK).toContain("maintenance:");
+      expect(ROUTING_BLOCK).toContain("ctx_stats");
+      expect(ROUTING_BLOCK).toContain("ctx_execute");
+      expect(ROUTING_BLOCK).toContain("Native Write/Edit");
+      expect(ROUTING_BLOCK).not.toContain("<context_window_protection>");
+      expect(ROUTING_BLOCK).not.toContain("<tool_selection_hierarchy>");
+      expect(ROUTING_BLOCK).not.toContain("<ctx_commands>");
     });
 
-    it("ROUTING_BLOCK constant includes ctx_commands for main session", () => {
-      expect(ROUTING_BLOCK).toContain("<ctx_commands>");
-      expect(ROUTING_BLOCK).toContain("ctx stats");
-    });
-
-    it("createRoutingBlock with includeCommands: false omits section", () => {
+    it("subagent routing omits maintenance commands", () => {
       const t = (name: string) => `mcp__test__${name}`;
       const block = createRoutingBlock(t, { includeCommands: false });
-      expect(block).not.toContain("<ctx_commands>");
-      expect(block).toContain("<tool_selection_hierarchy>");
+      expect(block).not.toContain("maintenance:");
+      expect(block).toContain("<context_mode>");
     });
 
-    it("createRoutingBlock default includes ctx_commands", () => {
+    it("createRoutingBlock uses platform-specific tool names", () => {
       const t = (name: string) => `mcp__test__${name}`;
       const block = createRoutingBlock(t);
-      expect(block).toContain("<ctx_commands>");
+      expect(block).toContain("mcp__test__ctx_execute");
+      expect(block).toContain("mcp__test__ctx_search");
     });
   });
 
@@ -639,45 +518,6 @@ describe("routePreToolUse", () => {
           commands: [{ label: "test", command: "ls -la" }],
           queries: ["file list"],
         },
-      );
-      expect(result).toBeNull();
-    });
-
-    it("pins Claude Code ctx_execute shell cwd from hook projectDir (#756)", () => {
-      const result = routePreToolUse(
-        "mcp__plugin_context-mode_context-mode__ctx_execute",
-        { language: "shell", code: "pwd" },
-        "/worktree/repo",
-        "claude-code",
-      );
-      expect(result?.action).toBe("modify");
-      expect(result?.updatedInput).toEqual({
-        language: "shell",
-        code: "pwd",
-        cwd: "/worktree/repo",
-      });
-    });
-
-    it("pins Claude Code ctx_batch_execute cwd from hook projectDir (#756)", () => {
-      const result = routePreToolUse(
-        "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
-        { commands: [{ label: "branch", command: "git rev-parse --abbrev-ref HEAD" }] },
-        "/worktree/repo",
-        "claude-code",
-      );
-      expect(result?.action).toBe("modify");
-      expect(result?.updatedInput).toEqual({
-        commands: [{ label: "branch", command: "git rev-parse --abbrev-ref HEAD" }],
-        cwd: "/worktree/repo",
-      });
-    });
-
-    it("does not overwrite explicit ctx_execute cwd", () => {
-      const result = routePreToolUse(
-        "mcp__plugin_context-mode_context-mode__ctx_execute",
-        { language: "shell", code: "pwd", cwd: "/explicit" },
-        "/worktree/repo",
-        "claude-code",
       );
       expect(result).toBeNull();
     });
@@ -742,10 +582,10 @@ describe("routePreToolUse", () => {
       );
       previousHome = process.env.HOME;
       previousCodexHome = process.env.CODEX_HOME;
-      previousPlatform = process.env.CONTEXT_MODE_PLATFORM;
+      previousPlatform = process.env.QUIET_CONTEXT_PLATFORM;
       process.env.HOME = homeDir;
       process.env.CODEX_HOME = codexDir;
-      process.env.CONTEXT_MODE_PLATFORM = "codex";
+      process.env.QUIET_CONTEXT_PLATFORM = "codex";
     });
 
     afterEach(() => {
@@ -753,8 +593,8 @@ describe("routePreToolUse", () => {
       else process.env.HOME = previousHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previousCodexHome;
-      if (previousPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
-      else process.env.CONTEXT_MODE_PLATFORM = previousPlatform;
+      if (previousPlatform === undefined) delete process.env.QUIET_CONTEXT_PLATFORM;
+      else process.env.QUIET_CONTEXT_PLATFORM = previousPlatform;
       try { rmSync(projectDir, { recursive: true, force: true }); } catch {}
       try { rmSync(homeDir, { recursive: true, force: true }); } catch {}
     });
@@ -783,30 +623,18 @@ describe("routePreToolUse", () => {
     //   - file writes go through the native Write/Edit tool
     //   - ctx_execute / ctx_execute_file / Bash subprocesses do not persist edits
     //   - artifacts get written to files (path + 1-line description returned)
-    it("file_writing_policy points file writes at native Write/Edit tools", () => {
-      expect(ROUTING_BLOCK).toContain("<file_writing_policy>");
-      expect(ROUTING_BLOCK).toContain("File writes use the native Write or Edit tool");
-      // semantic intent: ctx_execute family must not be used for file writes —
-      // expressed positively as "do not persist edits to the host filesystem"
-      expect(ROUTING_BLOCK).toContain("ctx_execute");
+    it("routes file writes to native Write/Edit tools", () => {
+      expect(ROUTING_BLOCK).toContain("Native Write/Edit");
       expect(ROUTING_BLOCK).toContain("do not persist edits");
     });
 
-    it("when_not_to_use redirects ctx_execute away from file creation", () => {
-      // Replaces the old `<forbidden_actions>` container; same semantic intent
-      // (do not pick ctx_execute for file creation) expressed via WHEN NOT.
-      expect(ROUTING_BLOCK).toContain("<when_not_to_use>");
-      expect(ROUTING_BLOCK).toContain("for file writes");
-      expect(ROUTING_BLOCK).toContain("analysis, processing, and computation only");
+    it("keeps processing in the sandbox", () => {
+      expect(ROUTING_BLOCK).toContain("raw bytes stay in the sandbox");
+      expect(ROUTING_BLOCK).toContain("only derived output enters context");
     });
 
-    it("artifact_policy points artifacts at files with file-path return shape", () => {
-      // Replaces the old "Write artifacts ... NEVER inline" wording.
-      // The semantic intent — write artifacts to files, return only the path
-      // plus a 1-line description — is asserted via the positive surface.
-      expect(ROUTING_BLOCK).toContain(
-        "Write artifacts (code, configs, PRDs) to files",
-      );
+    it("keeps artifact output on disk", () => {
+      expect(ROUTING_BLOCK).toContain("Artifacts go to files");
       expect(ROUTING_BLOCK).toContain("file path + 1-line description");
     });
   });
@@ -909,10 +737,10 @@ describe("routePreToolUse", () => {
       expect(fired).toEqual(expected);
     });
 
-    it("honors CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY to tune cadence", () => {
-      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+    it("honors QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY to tune cadence", () => {
+      const prev = process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
       try {
-        process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = "3";
+        process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = "3";
         const calls = Array.from({ length: 7 }, (_, i) =>
           routePreToolUse(`mcp__notion__tool_${i}`, {}),
         );
@@ -920,17 +748,17 @@ describe("routePreToolUse", () => {
         // period=3 → fires on calls 1, 4, 7 (indices 0, 3, 6).
         expect(fired).toEqual([true, false, false, true, false, false, true]);
       } finally {
-        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
-        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+        if (prev === undefined) delete process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = prev;
       }
     });
 
     it("falls back to default cadence on invalid env values", () => {
-      const prev = process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
+      const prev = process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
       try {
         // Out-of-range, NaN, negative — all coerce to the default (10).
         for (const v of ["0", "-1", "9999", "not-a-number", ""]) {
-          process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = v;
+          process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = v;
           resetGuidanceThrottle();
           const first = routePreToolUse("mcp__slack__a", {});
           const second = routePreToolUse("mcp__slack__b", {});
@@ -939,8 +767,8 @@ describe("routePreToolUse", () => {
           expect(second, `value=${JSON.stringify(v)}`).toBeNull();
         }
       } finally {
-        if (prev === undefined) delete process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY;
-        else process.env.CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY = prev;
+        if (prev === undefined) delete process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY;
+        else process.env.QUIET_CONTEXT_EXTERNAL_MCP_NUDGE_EVERY = prev;
       }
     });
 
@@ -1019,15 +847,6 @@ function createSentinel(pidOrLabel: number | string, content?: string): string {
   return path;
 }
 
-// #844: isMCPReady() only cleans up a dead-PID sentinel once it is OLDER than
-// the freshness window (a recently-refreshed sentinel may belong to a live
-// server in another PID namespace). Age a sentinel past that window so the
-// stale-cleanup path is exercised deterministically.
-function ageSentinel(path: string): void {
-  const tenMinAgoSec = Date.now() / 1000 - 600;
-  utimesSync(path, tenMinAgoSec, tenMinAgoSec);
-}
-
 function hasUnrelatedLiveSentinel(): boolean {
   try {
     const dir = sentinelDir();
@@ -1064,13 +883,13 @@ describe("mcp-ready: contract", () => {
     let originalEnv: string | undefined;
     beforeEach(() => {
       originalPlatform = process.platform;
-      originalEnv = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
-      delete process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+      originalEnv = process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
+      delete process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
     });
     afterEach(() => {
       Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
       if (originalEnv !== undefined) {
-        process.env.CONTEXT_MODE_MCP_SENTINEL_DIR = originalEnv;
+        process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR = originalEnv;
       }
     });
 
@@ -1113,45 +932,21 @@ describe.skipIf(POLLUTED)("mcp-ready: stale-cleanup self-healing", () => {
     fixtures.clear();
   });
 
-  it("unlinks a STALE sentinel whose PID is dead", () => {
+  it("unlinks a sentinel whose PID is dead", () => {
     const path = createSentinel(DEAD_PID);
-    ageSentinel(path);
     isMCPReady();
     expect(existsSync(path)).toBe(false);
     fixtures.delete(path);
   });
 
-  it("unlinks two STALE dead sentinels in a single scan", () => {
+  it("unlinks two dead sentinels in a single scan", () => {
     const a = createSentinel(DEAD_PID);
     const b = createSentinel(DEAD_PID - 1);
-    ageSentinel(a);
-    ageSentinel(b);
     expect(isMCPReady()).toBe(false);
     expect(existsSync(a)).toBe(false);
     expect(existsSync(b)).toBe(false);
     fixtures.delete(a);
     fixtures.delete(b);
-  });
-
-  // #844: a recently-refreshed sentinel must NOT be cleaned up even when its
-  // PID is invisible from this namespace (shared /tmp across PID namespaces).
-  it("keeps a FRESH dead/invisible-PID sentinel (#844 cross-namespace guard)", () => {
-    const path = createSentinel(DEAD_PID); // mtime = now → fresh
-    expect(isMCPReady()).toBe(true);
-    expect(existsSync(path)).toBe(true);
-    fixtures.delete(path);
-    try { unlinkSync(path); } catch { /* cleanup */ }
-  });
-
-  it("in one scan: keeps the FRESH sentinel and cleans the STALE one (#844)", () => {
-    const fresh = createSentinel(DEAD_PID);
-    const stale = createSentinel(DEAD_PID - 1);
-    ageSentinel(stale);
-    expect(isMCPReady()).toBe(true);
-    expect(existsSync(fresh)).toBe(true);
-    expect(existsSync(stale)).toBe(false);
-    fixtures.delete(fresh);
-    try { unlinkSync(fresh); } catch { /* cleanup */ }
   });
 });
 
@@ -1248,8 +1043,8 @@ describe("buildSecurityWarningContext — agent-facing security warning (#558)",
       }));
       `,
       {
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: missingBundle,
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: missingBundle,
       },
     );
     expect(r.parsed.failed).toBe(true);
@@ -1302,25 +1097,6 @@ async function spawnRoutingProbe(
 ): Promise<{ status: number | null; stdout: string; parsed: any }> {
   const { spawnSync } = await import("node:child_process");
   const r = spawnSync("node", ["--input-type=module", "-e", code], {
-    encoding: "utf-8",
-    timeout: 15_000,
-    env: { ...process.env, ...env },
-  });
-  const stdout = (r.stdout ?? "").trim();
-  let parsed: any = null;
-  try { parsed = JSON.parse(stdout); } catch { /* surface raw */ }
-  return { status: r.status, stdout, parsed };
-}
-
-async function spawnPreToolUseHook(
-  input: Record<string, unknown>,
-  env: Record<string, string> = {},
-): Promise<{ status: number | null; stdout: string; parsed: any }> {
-  const { spawnSync } = await import("node:child_process");
-  const repoRoot = resolve(SLICE4_DIRNAME, "..", "..");
-  const r = spawnSync(process.execPath, ["hooks/pretooluse.mjs"], {
-    cwd: repoRoot,
-    input: JSON.stringify(input),
     encoding: "utf-8",
     timeout: 15_000,
     env: { ...process.env, ...env },

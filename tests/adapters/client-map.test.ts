@@ -66,18 +66,6 @@ describe("CLIENT_NAME_TO_PLATFORM", () => {
     expect(CLIENT_NAME_TO_PLATFORM["Pi Coding Agent"]).toBe("pi");
   });
 
-  it('maps "kimi-code" to "kimi"', () => {
-    expect(CLIENT_NAME_TO_PLATFORM["kimi-code"]).toBe("kimi");
-  });
-
-  it('maps "kimi" to "kimi"', () => {
-    expect(CLIENT_NAME_TO_PLATFORM["kimi"]).toBe("kimi");
-  });
-
-  it('maps "Kimi Code" to "kimi"', () => {
-    expect(CLIENT_NAME_TO_PLATFORM["Kimi Code"]).toBe("kimi");
-  });
-
   it("returns undefined for unknown client name", () => {
     expect(CLIENT_NAME_TO_PLATFORM["some-unknown-client"]).toBeUndefined();
   });

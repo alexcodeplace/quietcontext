@@ -44,13 +44,11 @@ import {
   StorageDirectoryError,
 } from "../../src/session/db.js";
 import { ROUTING_BLOCK } from "../../hooks/routing-block.mjs";
-import { sanitizeSchemaForStrictClients, resolveExecTimeout, AGY_DEFAULT_EXEC_TIMEOUT_MS, REGISTERED_CTX_TOOLS } from "../../src/server.js";
-import { stripJsonComments, parseJsonc } from "../../src/util/jsonc.js";
 
 // ─── Shared setup ───────────────────────────────────────────────────────────
 const runtimes = detectRuntimes();
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const STORAGE_ENV_KEY = "CONTEXT_MODE_DIR";
+const STORAGE_ENV_KEY = "QUIET_CONTEXT_DIR";
 const savedStorageEnv = process.env[STORAGE_ENV_KEY];
 
 afterEach(() => {
@@ -103,8 +101,8 @@ describe("storage path resolution", () => {
     expect(
       resolveDefaultSessionDir({
         configDir: ".ignored",
-        configDirEnv: "CONTEXT_MODE_TEST_CONFIG_DIR",
-        env: { CONTEXT_MODE_TEST_CONFIG_DIR: configRoot },
+        configDirEnv: "QUIET_CONTEXT_TEST_CONFIG_DIR",
+        env: { QUIET_CONTEXT_TEST_CONFIG_DIR: configRoot },
       }),
     ).toBe(join(configRoot, "context-mode", "sessions"));
   });
@@ -114,8 +112,8 @@ describe("storage path resolution", () => {
     const root = resolve(tmpdir(), "context-mode-storage-root");
     const defaultDir = () => resolveDefaultSessionDir({
       configDir: ".ignored",
-      legacySessionDirEnv: "CONTEXT_MODE_TEST_SESSION_DIR",
-      env: { CONTEXT_MODE_TEST_SESSION_DIR: legacyDir },
+      legacySessionDirEnv: "QUIET_CONTEXT_TEST_SESSION_DIR",
+      env: { QUIET_CONTEXT_TEST_SESSION_DIR: legacyDir },
     });
 
     delete process.env[STORAGE_ENV_KEY];
@@ -128,7 +126,7 @@ describe("storage path resolution", () => {
     expect(resolveSessionStorageDir(defaultDir).path).toBe(join(root, "sessions"));
   });
 
-  test("uses CONTEXT_MODE_DIR as the single root for sessions, content, and stats", () => {
+  test("uses QUIET_CONTEXT_DIR as the single root for sessions, content, and stats", () => {
     const root = resolve(tmpdir(), "context-mode-storage-root");
     process.env[STORAGE_ENV_KEY] = root;
 
@@ -152,7 +150,7 @@ describe("storage path resolution", () => {
     });
   });
 
-  test("treats blank CONTEXT_MODE_DIR as default and reports ignored metadata", () => {
+  test("treats blank QUIET_CONTEXT_DIR as default and reports ignored metadata", () => {
     process.env[STORAGE_ENV_KEY] = " \t ";
     const defaultSessionsDir = join(tmpdir(), "context-mode-default", "sessions");
 
@@ -173,18 +171,18 @@ describe("storage path resolution", () => {
       ignoredEnvVar: STORAGE_ENV_KEY,
       ignoredReason: "empty",
     });
-    expect(describeStorageDirectorySource(session)).toBe("default; ignored empty CONTEXT_MODE_DIR");
+    expect(describeStorageDirectorySource(session)).toBe("default; ignored empty QUIET_CONTEXT_DIR");
 
     const err = new StorageDirectoryError("session", session.path, STORAGE_ENV_KEY, undefined, undefined, session);
-    expect(formatStorageDirectoryError(err)).toContain("Ignored empty CONTEXT_MODE_DIR; using adapter default.");
+    expect(formatStorageDirectoryError(err)).toContain("Ignored empty QUIET_CONTEXT_DIR; using adapter default.");
   });
 
-  test("rejects a relative CONTEXT_MODE_DIR", () => {
+  test("rejects a relative QUIET_CONTEXT_DIR", () => {
     process.env[STORAGE_ENV_KEY] = "relative/path";
 
     expect(() => resolveSessionStorageDir(() => "/ignored")).toThrow(StorageDirectoryError);
     expect(() => resolveSessionStorageDir(() => "/ignored")).toThrow(
-      "CONTEXT_MODE_DIR must be an absolute path.",
+      "QUIET_CONTEXT_DIR must be an absolute path.",
     );
   });
 
@@ -930,7 +928,7 @@ print(f"count: {data['count']}")
 //
 // Mirrors the executeFile relative-path resolution tests (line ~598). Confirms
 // that ctx_index resolves a relative `path` argument against the detected
-// project directory (CLAUDE_PROJECT_DIR / *_PROJECT_DIR / CONTEXT_MODE_PROJECT_DIR
+// project directory (CLAUDE_PROJECT_DIR / *_PROJECT_DIR / QUIET_CONTEXT_PROJECT_DIR
 // → cwd fallback) instead of the MCP server process cwd. End-to-end via
 // JSON-RPC against a freshly spawned server with an injected project dir.
 
@@ -956,7 +954,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         CLAUDE_PROJECT_DIR: projectDirEnv,
       },
     });
@@ -1140,7 +1138,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
   test("no *_PROJECT_DIR env set → relative path falls back to spawned-server cwd", async () => {
     // Strip every project-dir env the resolver chain consults (see
     // server.ts getProjectDir) so resolution is forced down to process.cwd().
-    // start.mjs would re-set CONTEXT_MODE_PROJECT_DIR and CLAUDE_PROJECT_DIR
+    // start.mjs would re-set QUIET_CONTEXT_PROJECT_DIR and CLAUDE_PROJECT_DIR
     // from originalCwd — that originalCwd is the `cwd` we hand to spawn(),
     // which is exactly what we want to assert on.
     const fallbackCwd = mkdtempSync(join(tmpdir(), "ctx-index-cwdfallback-"));
@@ -1159,7 +1157,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
       if (k === "VSCODE_CWD") continue;
       strippedEnv[k] = v;
     }
-    strippedEnv.CONTEXT_MODE_DISABLE_VERSION_CHECK = "1";
+    strippedEnv.QUIET_CONTEXT_DISABLE_VERSION_CHECK = "1";
 
     const proc = spawn("node", [mcpEntry], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -1224,21 +1222,21 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
   // ── JetBrains regression: IDEA_INITIAL_DIRECTORY must enter the cascade ──
   //
   // JetBrains adapter sets only IDEA_INITIAL_DIRECTORY (no CLAUDE_PROJECT_DIR,
-  // no CONTEXT_MODE_PROJECT_DIR). Before the fix, getProjectDir() ignored that
+  // no QUIET_CONTEXT_PROJECT_DIR). Before the fix, getProjectDir() ignored that
   // var and fell through to process.cwd(), which is the IDE bin dir on
   // JetBrains — making `ctx_index({ path: "rel/foo.md" })` resolve to a path
   // under the IDE installation and ENOENT.
   //
   // Spawn the compiled server directly (build/server.js) instead of start.mjs
   // so we never enter the start.mjs path that auto-populates CLAUDE_PROJECT_DIR
-  // and CONTEXT_MODE_PROJECT_DIR from cwd. This lets us isolate the cascade
+  // and QUIET_CONTEXT_PROJECT_DIR from cwd. This lets us isolate the cascade
   // and prove that IDEA_INITIAL_DIRECTORY alone is enough to resolve relative
   // paths under the JetBrains project root.
   test("relative path resolves against IDEA_INITIAL_DIRECTORY (JetBrains)", async () => {
     const buildEntry = resolve(__dirname, "..", "..", "build", "server.js");
     if (!existsSync(buildEntry)) {
       // Compile src → build/ on demand. Bundle is untouched (CI rebuilds it).
-      execSync("npx tsc --pretty false", {
+      execSync("npx tsc --silent", {
         cwd: resolve(__dirname, "..", ".."),
         stdio: "pipe",
         timeout: 60_000,
@@ -1249,28 +1247,31 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     // env carries only IDEA_INITIAL_DIRECTORY pointing at the real project.
     const fakeIdeBin = mkdtempSync(join(tmpdir(), "ctx-jetbrains-bin-"));
 
-    // Strip inherited platform workspace/identification vars so the cascade is
-    // forced to consult IDEA_INITIAL_DIRECTORY. Issue #545 (v1.0.124): when a
-    // host env var (Claude Code, Codex, etc.) leaks into this child,
-    // detectPlatform() can pick that host, enter strict mode, and ban
-    // IDEA_INITIAL_DIRECTORY as a foreign var.
+    // Strip every PROJECT_DIR env var from the inherited env so the cascade
+    // is forced to consult IDEA_INITIAL_DIRECTORY. Issue #545 (v1.0.124):
+    // also strip the claude-code IDENTIFICATION vars so detectPlatform()
+    // doesn't misclassify the spawned MCP child as claude-code (which would
+    // then run strict-mode and ban IDEA_INITIAL_DIRECTORY as a foreign var).
+    // The test process inherits CLAUDE_CODE_ENTRYPOINT / CLAUDE_PLUGIN_ROOT
+    // from whatever Claude Code session launched the test runner.
     const cleanEnv = { ...process.env };
-    for (const key of Object.keys(cleanEnv)) {
-      if (
-        /^(CLAUDE|CODEX|GEMINI|VSCODE|CURSOR|OPENCODE|KILO|KIRO|PI|OMP|ZED|QWEN|KIMI|ANTIGRAVITY|OPENCLAW|COPILOT)_/.test(key) ||
-        key === "CONTEXT_MODE_PLATFORM" ||
-        key === "CONTEXT_MODE_PROJECT_DIR"
-      ) {
-        delete cleanEnv[key];
-      }
-    }
+    delete cleanEnv.CLAUDE_PROJECT_DIR;
+    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+    delete cleanEnv.CLAUDE_PLUGIN_ROOT;
+    delete cleanEnv.CLAUDE_SESSION_ID;
+    delete cleanEnv.GEMINI_PROJECT_DIR;
+    delete cleanEnv.VSCODE_CWD;
+    delete cleanEnv.OPENCODE_PROJECT_DIR;
+    delete cleanEnv.PI_PROJECT_DIR;
+    delete cleanEnv.PI_WORKSPACE_DIR;
+    delete cleanEnv.QUIET_CONTEXT_PROJECT_DIR;
 
     const proc = spawn("node", [buildEntry], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: fakeIdeBin,
       env: {
         ...cleanEnv,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         IDEA_INITIAL_DIRECTORY: ctxProjectDir,
       },
     });
@@ -1404,7 +1405,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         CLAUDE_PROJECT_DIR: projectDir,
         ...extraEnv,
       },
@@ -1651,7 +1652,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
     }
   }, 30_000);
 
-  test("ctx_index returns an actionable storage error when CONTEXT_MODE_DIR is unwritable", async () => {
+  test("ctx_index returns an actionable storage error when QUIET_CONTEXT_DIR is unwritable", async () => {
     if (process.platform === "win32") return;
 
     const projectDir = setupProject([], {
@@ -1660,7 +1661,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
     const storageRoot = mkdtempSync(join(tmpdir(), "ctx-storage-deny-"));
     chmodSync(storageRoot, 0o500);
     const proc = spawnServerInProject(projectDir, {
-      CONTEXT_MODE_DIR: storageRoot,
+      QUIET_CONTEXT_DIR: storageRoot,
     });
 
     try {
@@ -1679,7 +1680,7 @@ describe("ctx_index: Read deny-policy enforcement (#442)", () => {
         "context-mode content directory is not writable:",
       );
       expect(indexResp.result?.content?.[0]?.text).toContain(
-        "Set CONTEXT_MODE_DIR to a writable absolute path.",
+        "Set QUIET_CONTEXT_DIR to a writable absolute path.",
       );
     } finally {
       killProc(proc);
@@ -1735,6 +1736,138 @@ describe("ctx_insight: execFile migration source guard (#441)", () => {
     expect(serverSrc).toMatch(/export type BrowserOpenResult\b/);
     expect(serverSrc).toMatch(/export type KillResult\b/);
   });
+
+  test("port schema is bounded to a valid TCP port range", () => {
+    const portDecl = serverSrc.match(/port:\s*z\.coerce\.number\(\)([^,\n]*)\.optional\(\)/);
+    expect(portDecl).not.toBeNull();
+    const constraints = portDecl![1];
+    expect(constraints).toContain(".int()");
+    expect(constraints).toContain(".min(1)");
+    expect(constraints).toContain(".max(65535)");
+  });
+});
+
+describe("ctx_insight: port schema rejects invalid values (#441)", () => {
+  function spawnInsightServer(): ChildProcess {
+    return spawn("node", [mcpEntry], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1" },
+    });
+  }
+
+  async function awaitRpc(
+    proc: ChildProcess,
+    id: number,
+    request: Record<string, unknown>,
+    timeoutMs = 10_000,
+  ): Promise<DoctorJsonRpcResponse | undefined> {
+    return new Promise((resolve) => {
+      let buffer = "";
+      const onData = (d: Buffer) => {
+        buffer += d.toString();
+        let idx: number;
+        while ((idx = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line) as DoctorJsonRpcResponse;
+            if (parsed.id === id) {
+              proc.stdout!.off("data", onData);
+              clearTimeout(timer);
+              resolve(parsed);
+              return;
+            }
+          } catch { /* ignore */ }
+        }
+      };
+      const timer = setTimeout(() => {
+        proc.stdout!.off("data", onData);
+        resolve(undefined);
+      }, timeoutMs);
+      proc.stdout!.on("data", onData);
+      sendRpc(proc, request);
+    });
+  }
+
+  // Each invalid value is exercised against a fresh server so a schema
+  // failure on one input cannot mask a regression on another.
+  const invalidPortCases: Array<{ label: string; port: unknown }> = [
+    { label: "zero (below min)", port: 0 },
+    { label: "negative (below min)", port: -1 },
+    { label: "above 16-bit range", port: 65536 },
+    { label: "non-integer", port: 3.14 },
+    { label: "non-numeric string", port: "not-a-port" },
+  ];
+
+  for (const { label, port } of invalidPortCases) {
+    test(`rejects port=${JSON.stringify(port)} (${label}) at schema layer`, async () => {
+      const proc = spawnInsightServer();
+      try {
+        const init = await awaitRpc(proc, 1, {
+          jsonrpc: "2.0", id: 1, method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-insight-441", version: "1.0" } },
+        });
+        // Init must succeed before tools/call — otherwise an unrelated startup
+        // failure could masquerade as schema rejection.
+        expect(init?.result).toBeDefined();
+        sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+        const resp = await awaitRpc(proc, 100, {
+          jsonrpc: "2.0", id: 100, method: "tools/call",
+          params: { name: "ctx_insight", arguments: { port } },
+        });
+
+        // Schema rejection surfaces as either a JSON-RPC `error` envelope or
+        // a tool result with `isError: true`. Both shapes count as "the
+        // handler never executed" — the contract this test pins.
+        const rejected =
+          (resp?.error !== undefined) ||
+          (resp?.result?.isError === true);
+        expect(rejected).toBe(true);
+
+        // Cross-check: no "Dashboard running" success text leaked through.
+        const text = resp?.result?.content?.[0]?.text ?? "";
+        expect(text).not.toMatch(/Dashboard running at/);
+      } finally {
+        try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+      }
+    }, 20_000);
+  }
+
+  // Pin the schema layer specifically: at least one case must surface as a
+  // JSON-RPC `error` with code -32602 (Invalid params), proving zod rejected
+  // the input before the handler ran.  A regression that loosened the schema
+  // back to `z.coerce.number().optional()` and let the handler crash on
+  // `port=0` would still satisfy the lenient `isError === true` checks above
+  // — but it would not produce a -32602 envelope here.
+  test("schema layer rejects out-of-range port with JSON-RPC -32602", async () => {
+    const proc = spawnInsightServer();
+    try {
+      const init = await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-insight-441-schema", version: "1.0" } },
+      });
+      expect(init?.result).toBeDefined();
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const resp = await awaitRpc(proc, 200, {
+        jsonrpc: "2.0", id: 200, method: "tools/call",
+        params: { name: "ctx_insight", arguments: { port: 70000 } },
+      });
+
+      // Either a top-level error with code -32602 or an isError result whose
+      // text mentions schema/range-validation language. Both prove zod fired.
+      const errCode = resp?.error?.code;
+      const text = resp?.result?.content?.[0]?.text ?? "";
+      const schemaSignal =
+        errCode === -32602 ||
+        /(less than or equal|65535|invalid|too_big|expected number)/i.test(text);
+      expect(schemaSignal).toBe(true);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 20_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1742,14 +1875,14 @@ describe("ctx_insight: execFile migration source guard (#441)", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Regression for PR #365 follow-up. ctx_index was routed through the
-// `getProjectDir()` env cascade (CLAUDE_PROJECT_DIR → ... → CONTEXT_MODE_PROJECT_DIR
+// `getProjectDir()` env cascade (CLAUDE_PROJECT_DIR → ... → QUIET_CONTEXT_PROJECT_DIR
 // → cwd) but the PolyglotExecutor still captured CLAUDE_PROJECT_DIR ?? cwd
 // at construction time. ctx_execute_file therefore resolved the same
 // relative path differently from ctx_index whenever only
-// CONTEXT_MODE_PROJECT_DIR was set (e.g. Cursor / OpenClaw / Codex spawns).
+// QUIET_CONTEXT_PROJECT_DIR was set (e.g. Cursor / OpenClaw / Codex spawns).
 // Fix: executor now resolves projectRoot lazily via the server's getProjectDir.
 
-describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
+describe("ctx_execute_file: QUIET_CONTEXT_PROJECT_DIR env cascade", () => {
   const execProjectDir = mkdtempSync(join(tmpdir(), "ctx-exec-projroot-"));
   const execScriptDir = join(execProjectDir, "rel");
   const execScriptName = "script.js";
@@ -1758,7 +1891,7 @@ describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
   // Spawn build/server.js directly to bypass start.mjs's auto-set of
   // CLAUDE_PROJECT_DIR = process.cwd(). That auto-set would defeat the
   // test by injecting a CLAUDE_PROJECT_DIR before getProjectDir() can
-  // fall through to CONTEXT_MODE_PROJECT_DIR.
+  // fall through to QUIET_CONTEXT_PROJECT_DIR.
   const buildServerEntry = resolve(__dirname, "..", "..", "build", "server.js");
 
   beforeAll(() => {
@@ -1776,15 +1909,15 @@ describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
 
   function spawnServerCtxModeOnly(projectDirEnv: string): ChildProcess {
     // Strip every CLAUDE_*-style projectDir signal so the executor MUST
-    // fall back through the env cascade to CONTEXT_MODE_PROJECT_DIR.
-    const env = { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1" };
+    // fall back through the env cascade to QUIET_CONTEXT_PROJECT_DIR.
+    const env = { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1" };
     delete env.CLAUDE_PROJECT_DIR;
     delete env.GEMINI_PROJECT_DIR;
     delete env.VSCODE_CWD;
     delete env.OPENCODE_PROJECT_DIR;
     delete env.PI_PROJECT_DIR;
     delete env.IDEA_INITIAL_DIRECTORY;
-    env.CONTEXT_MODE_PROJECT_DIR = projectDirEnv;
+    env.QUIET_CONTEXT_PROJECT_DIR = projectDirEnv;
     return spawn("node", [buildServerEntry], {
       stdio: ["pipe", "pipe", "pipe"],
       env,
@@ -1829,7 +1962,7 @@ describe("ctx_execute_file: CONTEXT_MODE_PROJECT_DIR env cascade", () => {
     });
   }
 
-  test("relative path resolves against CONTEXT_MODE_PROJECT_DIR when CLAUDE_PROJECT_DIR is unset", async () => {
+  test("relative path resolves against QUIET_CONTEXT_PROJECT_DIR when CLAUDE_PROJECT_DIR is unset", async () => {
     const proc = spawnServerCtxModeOnly(execProjectDir);
     try {
       await awaitRpc(proc, 1, {
@@ -2211,32 +2344,6 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
     expect(serverSrc).toMatch(/existsSync\(bundlePath\)/);
   });
 
-  test("ctx_doctor and ctx_upgrade prefer the Codex plugin manager runtime root only for Codex", () => {
-    expect(serverSrc).toContain("parseCodexContextModePluginRoot");
-    expect(serverSrc).toContain("function resolveCodexRuntimePluginRoot");
-    expect(serverSrc).toContain("function getRuntimeAwarePackageRoot");
-
-    const helperBody = serverSrc.slice(
-      serverSrc.indexOf("function getRuntimeAwarePackageRoot"),
-      serverSrc.indexOf("// Prevent silent MCP server death"),
-    );
-    expect(helperBody).toContain('platformId === "codex"');
-    expect(helperBody).toContain("resolveCodexRuntimePluginRoot(packageRoot)");
-
-    const doctorBody = serverSrc.slice(
-      serverSrc.indexOf('server.registerTool(\n  "ctx_doctor"'),
-      serverSrc.indexOf('server.registerTool(\n  "ctx_upgrade"'),
-    );
-    const upgradeBody = serverSrc.slice(
-      serverSrc.indexOf('server.registerTool(\n  "ctx_upgrade"'),
-      serverSrc.indexOf("// ── ctx-purge"),
-    );
-
-    expect(doctorBody).toContain("getRuntimeAwarePackageRoot(currentPlatform)");
-    expect(upgradeBody).toContain("platformId = signal.platform");
-    expect(upgradeBody).toContain("getRuntimeAwarePackageRoot(platformId)");
-  });
-
   test("tries build/cli.js second", () => {
     expect(serverSrc).toContain('resolve(pluginRoot, "build", "cli.js")');
   });
@@ -2257,12 +2364,7 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
     expect(serverSrc).toContain('readFileSync(join(T,"package.json"),"utf8")');
     expect(serverSrc).toContain("pkg.files");
     expect(serverSrc).toContain("Array.isArray(pkg.files)");
-    // The inline cpSync passes `filter:noSymlink` to refuse copying symlinks
-    // back into the plugin tree. Anchor on this shape so future drift toward
-    // the unfiltered form is caught.
-    expect(serverSrc).toContain(
-      "cpSync(from,to,{recursive:true,force:true,filter:noSymlink})",
-    );
+    expect(serverSrc).toContain("cpSync(from,to,{recursive:true,force:true})");
     expect(serverSrc).toMatch(/npm.*install/);
   });
 
@@ -2452,7 +2554,7 @@ describe("Platform-aware session paths via adapter", () => {
       "PI_PROJECT_DIR",
       "IDEA_INITIAL_DIRECTORY",
       "CURSOR_CWD",
-      "CONTEXT_MODE_PROJECT_DIR",
+      "QUIET_CONTEXT_PROJECT_DIR",
     ]) {
       expect(utilSrc).toContain(v);
     }
@@ -3041,10 +3143,10 @@ import {
 interface MockResult { stdout: string; stderr?: string; timedOut?: boolean; }
 
 function mkMockExecutor(
-  handler: (code: string, timeout: number | undefined, cwd: string | undefined) => Promise<MockResult> | MockResult,
-): { execute: (input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }) => Promise<MockResult> } {
+  handler: (code: string, timeout: number | undefined) => Promise<MockResult> | MockResult,
+): { execute: (input: { language: "shell"; code: string; timeout: number | undefined }) => Promise<MockResult> } {
   return {
-    execute: async ({ code, timeout, cwd }) => Promise.resolve(handler(code, timeout, cwd)),
+    execute: async ({ code, timeout }) => Promise.resolve(handler(code, timeout)),
   };
 }
 
@@ -3085,22 +3187,6 @@ describe("runBatchCommands serial path (concurrency=1)", () => {
     expect(seenCode).not.toContain("NODE 2>&1");
     expect(outputs[0]).toContain("stdout");
     expect(outputs[0]).toContain("stderr");
-  });
-
-  test("passes cwd override to serial shell executions (#756)", async () => {
-    const seenCwds: Array<string | undefined> = [];
-    const exec = mkMockExecutor((_code, _timeout, cwd) => {
-      seenCwds.push(cwd);
-      return { stdout: "ok" };
-    });
-
-    await runBatchCommands(
-      [{ label: "cwd", command: "pwd" }],
-      { timeout: 5000, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX, cwd: "/worktree/repo" },
-      exec,
-    );
-
-    expect(seenCwds).toEqual(["/worktree/repo"]);
   });
 
   test("cascading skip: timeout in first cmd skips the rest", async () => {
@@ -3221,26 +3307,6 @@ describe("runBatchCommands parallel path (concurrency>1)", () => {
     expect(outputs[0]).toContain("one stderr");
     expect(outputs[1]).toContain("two stdout");
     expect(outputs[1]).toContain("two stderr");
-  });
-
-  test("passes cwd override to parallel shell executions (#756)", async () => {
-    const seenCwds: Array<string | undefined> = [];
-    const exec = mkMockExecutor((_code, _timeout, cwd) => {
-      seenCwds.push(cwd);
-      return { stdout: "ok" };
-    });
-    const cmds: BatchCommand[] = [
-      { label: "A", command: "pwd" },
-      { label: "B", command: "git branch --show-current" },
-    ];
-
-    await runBatchCommands(
-      cmds,
-      { timeout: 5000, concurrency: 2, nodeOptsPrefix: NOOP_PREFIX, cwd: "/worktree/repo" },
-      exec,
-    );
-
-    expect(seenCwds).toEqual(["/worktree/repo", "/worktree/repo"]);
   });
 
   test("order preservation: outputs match input order, not completion order", async () => {
@@ -4052,7 +4118,7 @@ interface DoctorJsonRpcResponse {
 function startMcpServer(extraEnv: Record<string, string> = {}): ChildProcess {
   return spawn("node", [mcpEntry], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1", ...extraEnv },
+    env: { ...process.env, QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1", ...extraEnv },
   });
 }
 
@@ -4142,7 +4208,7 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
 
   test("ctx_doctor reports storage roots and ignored empty override", async () => {
     const storageRoot = mkdtempSync(join(tmpdir(), "ctx-doctor-storage-"));
-    const proc = startMcpServer({ CONTEXT_MODE_DIR: " \t ", HOME: storageRoot, USERPROFILE: storageRoot });
+    const proc = startMcpServer({ QUIET_CONTEXT_DIR: " \t ", HOME: storageRoot, USERPROFILE: storageRoot });
     const responses = await initAndCallDoctor(proc, 1);
     const call = responses.find((r) => r.id === 100);
 
@@ -4152,21 +4218,21 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
     expect(text).toContain("Storage sessions:");
     expect(text).toContain("Storage content:");
     expect(text).toContain("Storage stats:");
-    expect(text).toContain("(default; ignored empty CONTEXT_MODE_DIR)");
+    expect(text).toContain("(default; ignored empty QUIET_CONTEXT_DIR)");
   }, 30_000);
 
   test("ctx_doctor reports storage root override source", async () => {
     const storageRoot = mkdtempSync(join(tmpdir(), "ctx-doctor-storage-root-"));
-    const proc = startMcpServer({ CONTEXT_MODE_DIR: storageRoot });
+    const proc = startMcpServer({ QUIET_CONTEXT_DIR: storageRoot });
     const responses = await initAndCallDoctor(proc, 1);
     const call = responses.find((r) => r.id === 100);
 
     expect(call).toBeDefined();
     expect(call!.error).toBeUndefined();
     const text = call!.result?.content?.[0]?.text ?? "";
-    expect(text).toContain(`Storage sessions: ${join(storageRoot, "sessions")} (via CONTEXT_MODE_DIR)`);
-    expect(text).toContain(`Storage content: ${join(storageRoot, "content")} (via CONTEXT_MODE_DIR)`);
-    expect(text).toContain(`Storage stats: ${join(storageRoot, "sessions")} (via CONTEXT_MODE_DIR)`);
+    expect(text).toContain(`Storage sessions: ${join(storageRoot, "sessions")} (via QUIET_CONTEXT_DIR)`);
+    expect(text).toContain(`Storage content: ${join(storageRoot, "content")} (via QUIET_CONTEXT_DIR)`);
+    expect(text).toContain(`Storage stats: ${join(storageRoot, "sessions")} (via QUIET_CONTEXT_DIR)`);
   }, 30_000);
 
   test("three concurrent ctx_doctor calls all succeed without crashing the server", async () => {
@@ -4947,7 +5013,7 @@ describe("startup banner suppressed in stdio transport mode", () => {
     const stderr = await new Promise<string>((res) => {
       const proc = spawn(process.execPath, [bundlePath], {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1" },
+        env: { ...process.env, QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1" },
       });
       let data = "";
       proc.stderr.on("data", (chunk: Buffer) => { data += chunk.toString(); });
@@ -5004,10 +5070,10 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
       // Ensure env path is NOT taken — both env vars unset.
       const prevSid = process.env.CLAUDE_SESSION_ID;
       const prevProjDir = process.env.CLAUDE_PROJECT_DIR;
-      const prevCmProjDir = process.env.CONTEXT_MODE_PROJECT_DIR;
+      const prevCmProjDir = process.env.QUIET_CONTEXT_PROJECT_DIR;
       delete process.env.CLAUDE_SESSION_ID;
       delete process.env.CLAUDE_PROJECT_DIR;
-      delete process.env.CONTEXT_MODE_PROJECT_DIR;
+      delete process.env.QUIET_CONTEXT_PROJECT_DIR;
       try {
         // bypassCache: this test runs after others may have populated the cache.
         const sid = resolveSessionIdFromSessionDB({
@@ -5019,9 +5085,9 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
 
         // currentAttribution wraps it the same way for prod callers — when the
         // env var is unset it must surface the DB-resolved sid via the
-        // wrapper too. We re-set CONTEXT_MODE_PROJECT_DIR so the wrapper's
+        // wrapper too. We re-set QUIET_CONTEXT_PROJECT_DIR so the wrapper's
         // own (cache-bypassed by 2s window starting fresh) call also resolves.
-        process.env.CONTEXT_MODE_PROJECT_DIR = projectDir;
+        process.env.QUIET_CONTEXT_PROJECT_DIR = projectDir;
         // Wait long enough that the previous lookup's 2s cache won't shadow
         // the wrapper's own resolveSessionIdFromSessionDB call (env-driven path).
         // Easier: bypass via a direct call shape — the wrapper just composes.
@@ -5034,8 +5100,8 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
       } finally {
         if (prevSid !== undefined) process.env.CLAUDE_SESSION_ID = prevSid;
         if (prevProjDir !== undefined) process.env.CLAUDE_PROJECT_DIR = prevProjDir;
-        if (prevCmProjDir !== undefined) process.env.CONTEXT_MODE_PROJECT_DIR = prevCmProjDir;
-        else delete process.env.CONTEXT_MODE_PROJECT_DIR;
+        if (prevCmProjDir !== undefined) process.env.QUIET_CONTEXT_PROJECT_DIR = prevCmProjDir;
+        else delete process.env.QUIET_CONTEXT_PROJECT_DIR;
       }
     } finally {
       try { rmSync(sessionsDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -5091,96 +5157,6 @@ test("OpenCode legacy MCP suppression parses JSONC URLs without stripping // ins
     process.chdir(cwd);
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-// #787 review regression, applied to server.ts: its local stripJsonComments
-// ended with a whole-string trailing-comma regex that deleted commas INSIDE
-// string values ("[1, ]" -> "[1 ]"). That corruption always leaves the JSON
-// valid (only the comma char is deleted; the anchoring bracket stays), and
-// shouldSuppressMcpToolsForNativePluginHost() — the only public surface over
-// readNativePluginHostSettings() — checks just the plugin array for a
-// "context-mode" substring and the mcp object for a "context-mode" key, so a
-// deleted in-string comma can never flip the boolean ("context-mode" contains
-// no comma to delete and no bracket to leave behind). Pin the fix
-// structurally instead: server.ts must delegate to the shared string-aware
-// src/util/jsonc.ts — whose in-string-comma behavior IS pinned by the
-// "parseJsonc / stripJsonComments" suite below — and must not reintroduce a
-// local whole-string trailing-comma regex.
-test("server.ts delegates JSONC stripping to string-aware src/util/jsonc (#787 in-string trailing-comma regression)", async () => {
-  const serverSrc = readFileSync(resolve(__dirname, "../../src/server.ts"), "utf8");
-  expect(serverSrc).toContain('from "./util/jsonc.js"');
-  expect(serverSrc).not.toContain('.replace(/,(\\s*[}\\]])/g');
-  // End-to-end sanity through the public boolean: a JSONC config that needs
-  // the strip path (comment + real trailing comma) and embeds a
-  // trailing-comma-like pattern inside a string value still parses and
-  // suppresses.
-  const { shouldSuppressMcpToolsForNativePluginHost } = await import("../../src/server.js");
-  const dir = mkdtempSync(join(tmpdir(), "opencode-jsonc-comma-"));
-  const cwd = process.cwd();
-  try {
-    writeFileSync(join(dir, "opencode.jsonc"), `{
-      // forces the comment/trailing-comma strip path
-      "note": "array literal: [1, ]",
-      "plugin": ["context-mode"],
-      "mcp": {
-        "context-mode": { "type": "local", "command": ["context-mode"] }
-      },
-    }\n`);
-    process.chdir(dir);
-    expect(shouldSuppressMcpToolsForNativePluginHost({ platform: "opencode" })).toBe(true);
-  } finally {
-    process.chdir(cwd);
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ─── src/util/jsonc — shared string-aware JSONC strip/parse (#787/#806) ─────
-// The naive regex strippers that lived in src/server.ts and the OpenCode
-// adapter corrupted string VALUES: `//` inside URLs was cut as a "comment"
-// (#806), and a whole-string trailing-comma regex ate commas inside string
-// literals ("[1, ]" -> "[1 ]", the 386a196 regression). These tests pin the
-// shared util that replaced both.
-describe("parseJsonc / stripJsonComments (src/util/jsonc)", () => {
-  test("preserves // inside string values (URLs) while stripping line comments", () => {
-    const jsonc = '{\n  // strip me\n  "url": "https://mcp.context7.com/mcp"\n}';
-    expect(parseJsonc<{ url: string }>(jsonc)?.url).toBe("https://mcp.context7.com/mcp");
-    expect(stripJsonComments('{"url": "https://example.com/x"}')).toBe('{"url": "https://example.com/x"}');
-  });
-
-  test("treats // after an escaped quote as still inside the string", () => {
-    const jsonc = '{ // c\n "say": "say \\"hi\\" // not a comment" }';
-    expect(parseJsonc<{ say: string }>(jsonc)?.say).toBe('say "hi" // not a comment');
-  });
-
-  test("parses CRLF input with line comments", () => {
-    const jsonc = '{\r\n  // comment\r\n  "a": 1,\r\n  "b": 2\r\n}\r\n';
-    expect(parseJsonc(jsonc)).toEqual({ a: 1, b: 2 });
-  });
-
-  test("removes trailing commas before } and ], including whitespace/comment-separated ones", () => {
-    expect(parseJsonc('{ // c\n "a": [1, 2,], "b": { "c": 3, }, }')).toEqual({ a: [1, 2], b: { c: 3 } });
-    expect(parseJsonc('{ "a": 1, /* note */ }')).toEqual({ a: 1 });
-  });
-
-  test("strips a block comment containing a URL without touching neighbors", () => {
-    const jsonc = '{ /* see https://example.com/docs */ "a": 1, // tail\n "b": 2 }';
-    expect(parseJsonc(jsonc)).toEqual({ a: 1, b: 2 });
-  });
-
-  test("preserves a comma inside a string value (the 386a196 regression)", () => {
-    const jsonc = '{\n  // forces the strip path\n  "note": "array literal: [1, ]"\n}';
-    expect(parseJsonc<{ note: string }>(jsonc)?.note).toBe("array literal: [1, ]");
-    expect(stripJsonComments('{"a":"x, ]","b":[1,]}')).toBe('{"a":"x, ]","b":[1]}');
-  });
-
-  test("plain valid JSON passes through parseJsonc unchanged", () => {
-    const raw = '{"a": [1, 2], "u": "https://example.com", "s": "x, ]"}';
-    expect(parseJsonc(raw)).toEqual(JSON.parse(raw));
-  });
-
-  test("returns undefined when input is not JSON at all", () => {
-    expect(parseJsonc("not json at all {{")).toBeUndefined();
-  });
 });
 
 // Issue #623: when ctx_* tool registration is suppressed for the legacy MCP
@@ -6011,7 +5987,7 @@ describe("ctx_index: directory path support (#687)", () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
-        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        QUIET_CONTEXT_DISABLE_VERSION_CHECK: "1",
         CLAUDE_PROJECT_DIR: projectDirEnv,
       },
     });
@@ -6191,528 +6167,4 @@ describe("ctx_index: directory path support (#687)", () => {
       try { proc.kill("SIGTERM"); } catch { /* best effort */ }
     }
   }, 30_000);
-});
-
-describe("ctx_index: root-level symlink defense in directory dispatch", () => {
-  // The directory-dispatch branch used statSync to decide whether to walk
-  // a path as a directory. statSync follows symlinks, so a path like
-  // `/tmp/link -> /etc` reported as a directory and walkDirectoryDetailed
-  // then realpathSync'd internally and indexed /etc. The deny-glob check
-  // at the head of the handler had run against `/tmp/link`, not /etc, so a
-  // user whose deny globs include /etc but not /tmp would still see /etc
-  // contents land in the FTS5 store. Fix: detect root-level symlinks with
-  // lstatSync, realpath them once, and re-apply the deny check against
-  // the actual walk target before dispatching.
-
-  const SERVER_SOURCE = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("ctx_index handler lstats and re-deny-checks symlinks before directory dispatch", () => {
-    const dispatchBlock = SERVER_SOURCE.match(
-      /Root-level symlink defense[\s\S]*?if \(resolvedPath && existsSync\(resolvedPath\) && statSync\(resolvedPath\)\.isDirectory\(\)\)/,
-    );
-    expect(dispatchBlock).not.toBeNull();
-    const block = dispatchBlock![0];
-    expect(block).toMatch(/const lst = lstatSync\(resolvedPath\);/);
-    expect(block).toMatch(/lst\.isSymbolicLink\(\)/);
-    expect(block).toMatch(/realpathSync\(resolvedPath\)/);
-    expect(block).toMatch(
-      /const realDenied = checkFilePathDenyPolicy\(realTarget, "ctx_index"\);/,
-    );
-    expect(block).toMatch(/if \(realDenied\) return realDenied;/);
-    expect(SERVER_SOURCE).toMatch(
-      /import\s*\{[^}]*\brealpathSync\b[^}]*\}\s*from\s*"node:fs"/,
-    );
-  });
-
-  test("algorithm: lstatSync + realpath identifies a symlinked directory whose target differs", () => {
-    // The behavior the fix depends on: lstatSync on a symlink reports
-    // isSymbolicLink()=true and isDirectory()=false. realpathSync resolves
-    // to the target. statSync, by contrast, would report isDirectory()=true
-    // and silently follow -- the pre-fix dispatch relied on that.
-    const base = mkdtempSync(join(tmpdir(), "ctx-index-symlink-defense-"));
-    try {
-      const realDir = join(base, "real");
-      const linkPath = join(base, "link");
-      mkdirSync(realDir, { recursive: true });
-      writeFileSync(join(realDir, "marker.txt"), "real");
-
-      const fsLocal = require("node:fs") as typeof import("node:fs");
-      // "junction" on Windows so the test works without admin / Developer
-      // Mode; lstatSync still reports isSymbolicLink()===true for junctions,
-      // which is what the algorithm-under-test depends on.
-      const symlinkType = process.platform === "win32" ? "junction" : "dir";
-      fsLocal.symlinkSync(realDir, linkPath, symlinkType);
-
-      const lst = fsLocal.lstatSync(linkPath);
-      expect(lst.isSymbolicLink()).toBe(true);
-      expect(lst.isDirectory()).toBe(false);
-      expect(fsLocal.statSync(linkPath).isDirectory()).toBe(true);
-
-      const real = fsLocal.realpathSync(linkPath);
-      expect(real).not.toBe(linkPath);
-      expect(real).toBe(fsLocal.realpathSync(realDir));
-    } finally {
-      rmSync(base, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("ctx_fetch_and_index: response body size cap", () => {
-  // ctx_fetch_and_index spawns a subprocess that fetches a URL, writes the
-  // response body to a tmpfile, exits, and the parent reads the file back
-  // into the long-running MCP server's heap via readFileSync. Without a
-  // cap, an unexpectedly large endpoint (or a slowloris that keeps
-  // appending chunks until the subprocess is killed) can either OOM the
-  // subprocess or, worse, propagate a multi-GB response into the parent
-  // heap and crash the MCP server. Cap to 50 MB on both ends.
-
-  const SERVER_SOURCE = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("subprocess buildFetchCode caps response via Content-Length and post-text length", () => {
-    expect(SERVER_SOURCE).toContain("const MAX_FETCH_BYTES = 50 * 1024 * 1024;");
-    expect(SERVER_SOURCE).toContain("async function safeText(resp)");
-    // The three response paths (JSON, HTML, default) all route through safeText
-    // instead of resp.text() directly.
-    const buildFetchSrc = SERVER_SOURCE.slice(
-      SERVER_SOURCE.indexOf("export function buildFetchCode"),
-      SERVER_SOURCE.indexOf("// fetch_and_index helpers"),
-    );
-    expect(buildFetchSrc.length).toBeGreaterThan(0);
-    expect(buildFetchSrc.match(/await safeText\(resp\)/g)?.length).toBeGreaterThanOrEqual(3);
-    // The pre-fix call sites (one per content-type branch) routed through
-    // `await resp.text()` directly. Now only one such call survives,
-    // inside safeText itself. Count exactly one.
-    const directCalls = buildFetchSrc.match(/await resp\.text\(\)/g) ?? [];
-    expect(directCalls.length).toBe(1);
-  });
-
-  test("parent-side fetchOneUrl stat-gates outputPath before readFileSync", () => {
-    const fetchOneUrlSrc = SERVER_SOURCE.slice(
-      SERVER_SOURCE.indexOf("async function fetchOneUrl"),
-      SERVER_SOURCE.indexOf("async function fetchOneUrl") + 6000,
-    );
-    expect(fetchOneUrlSrc).toContain("MAX_FETCH_OUTPUT_BYTES = 50 * 1024 * 1024");
-    expect(fetchOneUrlSrc).toMatch(/statSync\(outputPath\)\.size/);
-    expect(fetchOneUrlSrc).toMatch(/fileSize > MAX_FETCH_OUTPUT_BYTES/);
-  });
-});
-
-describe("getStatsFilePath: sanitize CLAUDE_SESSION_ID before path.join", () => {
-  // CLAUDE_SESSION_ID flows from the hosting process straight into a
-  // path.join, and path.join collapses ".." segments. CLAUDE_SESSION_ID=
-  // "../../evil" would write "stats-evil.json" two levels above statsDir.
-  // The env var is not under direct MCP-tool-caller control, but in CI /
-  // multi-tenant contexts where the host env is partly influenceable this
-  // is an arbitrary-write primitive. Reject any session id whose
-  // characters aren't [A-Za-z0-9._-] and fall back to pid-based id.
-
-  const SERVER_SOURCE = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("sanitizeSessionId exists and is called from getStatsFilePath", () => {
-    expect(SERVER_SOURCE).toMatch(/const SESSION_ID_RE = \/\^\[A-Za-z0-9\._-\]\+\$\//);
-    expect(SERVER_SOURCE).toContain("function sanitizeSessionId(raw: string): string {");
-    const getStatsSlice = SERVER_SOURCE.slice(
-      SERVER_SOURCE.indexOf("function getStatsFilePath"),
-      SERVER_SOURCE.indexOf("function getStatsFilePath") + 600,
-    );
-    expect(getStatsSlice).toMatch(/sanitizeSessionId\(raw\)/);
-    // The pre-fix direct splice of the env var into the join is gone.
-    expect(getStatsSlice).not.toMatch(
-      /join\(statsDir, `stats-\$\{process\.env\.CLAUDE_SESSION_ID/,
-    );
-  });
-
-  test("algorithm: sanitizer rejects traversal characters and falls back to pid", () => {
-    // Mirror the production sanitizer in isolation. The malicious shapes
-    // must all fall through to the pid-based id; the legitimate UUID-ish
-    // shape passes through unchanged.
-    const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
-    const sanitize = (raw: string): string =>
-      SESSION_ID_RE.test(raw) ? raw : `pid-${process.ppid}`;
-
-    expect(sanitize("../../evil")).toMatch(/^pid-\d+$/);
-    expect(sanitize("/etc/passwd")).toMatch(/^pid-\d+$/);
-    expect(sanitize("a/b")).toMatch(/^pid-\d+$/);
-    expect(sanitize("a\\b")).toMatch(/^pid-\d+$/);
-    expect(sanitize("..\\..")).toMatch(/^pid-\d+$/);
-    expect(sanitize("")).toMatch(/^pid-\d+$/);
-
-    // Legitimate ids pass through.
-    expect(sanitize("session-abc123")).toBe("session-abc123");
-    expect(sanitize("pid-12345")).toBe("pid-12345");
-    expect(sanitize("550e8400-e29b-41d4-a716-446655440000")).toBe(
-      "550e8400-e29b-41d4-a716-446655440000",
-    );
-    expect(sanitize("MyHost_2024.01")).toBe("MyHost_2024.01");
-  });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Cross-platform audit follow-up — schema/observability fixes for #696 #697
-// ═══════════════════════════════════════════════════════════════════════════
-
-describe("ctx_insight schema description (issue #697)", () => {
-  const serverSrc = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("description states it is a dashboard launcher, not a Q&A engine", () => {
-    expect(serverSrc).toMatch(/ctx_insight[\s\S]{0,2000}dashboard launcher/);
-  });
-
-  test("description redirects natural-language queries to ctx_search", () => {
-    expect(serverSrc).toMatch(/ctx_insight[\s\S]{0,2000}use ctx_search/);
-  });
-
-  test("description preserves the original analytics framing", () => {
-    expect(serverSrc).toMatch(/Opens the context-mode Insight dashboard/);
-  });
-});
-
-describe("ctx_batch_execute query_scope (issue #696)", () => {
-  const serverSrc = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("schema declares query_scope enum with batch default", () => {
-    expect(serverSrc).toMatch(/query_scope:\s*z\s*\.enum\(\["batch",\s*"global"\]\)/);
-    expect(serverSrc).toContain('.default("batch")');
-  });
-
-  test("schema describes both scope semantics", () => {
-    expect(serverSrc).toMatch(/query_scope[\s\S]{0,2000}searches ONLY the chunks/i);
-    expect(serverSrc).toMatch(/query_scope[\s\S]{0,2000}searches the entire persistent index/i);
-  });
-
-  test("formatBatchQueryResults default scope keeps batch-local tip", async () => {
-    const { formatBatchQueryResults } = await import("../../src/server.js");
-    const store = new ContentStore(":memory:");
-    store.index({ content: "# Section A\n\nValidation of frontmatter is critical.\n", source: "batch:cmd1" });
-    const lines = formatBatchQueryResults(store, ["validation"], "batch:cmd1");
-    const text = lines.join("\n");
-    expect(text).toMatch(/Results are scoped to this batch only/);
-    expect(text).toMatch(/query_scope:\s*"global"/);
-  });
-
-  test("formatBatchQueryResults global scope drops batch tip and notes global scope", async () => {
-    const { formatBatchQueryResults } = await import("../../src/server.js");
-    const store = new ContentStore(":memory:");
-    store.index({ content: "# Section A\n\nValidation of frontmatter is critical.\n", source: "other:source" });
-    const lines = formatBatchQueryResults(store, ["validation"], "batch:cmd1", undefined, "global");
-    const text = lines.join("\n");
-    expect(text).toMatch(/query_scope:\s*"global"/);
-    expect(text).not.toMatch(/Results are scoped to this batch only/);
-  });
-});
-
-describe("ctx_search progressive throttle observability (issue #697)", () => {
-  const serverSrc = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("env vars override throttle thresholds with positive-number validation", () => {
-    expect(serverSrc).toContain("CONTEXT_MODE_SEARCH_WINDOW_MS");
-    expect(serverSrc).toContain("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER");
-    expect(serverSrc).toContain("CONTEXT_MODE_SEARCH_BLOCK_AFTER");
-    expect(serverSrc).toMatch(/readPositiveEnv\("CONTEXT_MODE_SEARCH_WINDOW_MS"/);
-  });
-
-  test("throttle counter line is surfaced on every response, not only after soft cap", () => {
-    // Branch before the soft cap — should still inform the agent.
-    expect(serverSrc).toMatch(/Throttle:\s*call\s+#\$\{searchCallCount\}/);
-    // Branch at/after soft cap keeps the historical warning shape.
-    expect(serverSrc).toMatch(/⚠ search call #\$\{searchCallCount\}/);
-  });
-
-  test("ctx_search description documents the throttle policy", () => {
-    expect(serverSrc).toMatch(/RETURNS:[\s\S]{0,2000}rolling time window/i);
-    expect(serverSrc).toMatch(/CONTEXT_MODE_SEARCH_WINDOW_MS/);
-  });
-});
-
-describe("ctx_stats cache observability + index_state (issue #697)", () => {
-  test("ContentStore.getIndexState aggregates totals correctly", async () => {
-    const store = new ContentStore(":memory:");
-    expect(store.getIndexState()).toEqual({ totalChunks: 0, totalSources: 0, lastIndexedAt: undefined });
-    store.index({ content: "# A\n\nalpha\n", source: "src-alpha" });
-    store.index({ content: "# B\n\nbeta\n\n# C\n\ngamma\n", source: "src-beta" });
-    const state = store.getIndexState();
-    expect(state.totalSources).toBe(2);
-    expect(state.totalChunks).toBeGreaterThanOrEqual(2);
-    expect(state.lastIndexedAt).toBeDefined();
-    expect(typeof state.lastIndexedAt).toBe("string");
-  });
-
-  test("AnalyticsEngine exposes cache_hit_rate computed from hits + misses (no Observability rendering)", async () => {
-    // hit_rate is still computed correctly on the report; we just don't render
-    // the machine-readable Observability block in ctx_stats output any more.
-    const { AnalyticsEngine, formatReport } = await import("../../src/session/analytics.js");
-    const Database = (await import("better-sqlite3")).default;
-    const sdb = new Database(":memory:");
-    sdb.exec(`
-      CREATE TABLE session_meta (session_id TEXT PRIMARY KEY, started_at TEXT, compact_count INTEGER DEFAULT 0);
-      CREATE TABLE session_events (id INTEGER PRIMARY KEY, session_id TEXT, category TEXT, type TEXT, data TEXT, created_at TEXT);
-      CREATE TABLE session_resume (id INTEGER PRIMARY KEY, session_id TEXT, event_count INTEGER, consumed INTEGER, created_at TEXT);
-    `);
-    const engine = new AnalyticsEngine(sdb);
-    const report = engine.queryAll({
-      bytesReturned: {},
-      bytesIndexed: 0,
-      bytesSandboxed: 0,
-      calls: {},
-      sessionStart: Date.now() - 60_000,
-      cacheHits: 3,
-      cacheMisses: 1,
-      cacheBytesSaved: 1024,
-    });
-    expect(report.cache).toBeDefined();
-    expect(report.cache?.hits).toBe(3);
-    expect(report.cache?.misses).toBe(1);
-    expect(report.cache?.hit_rate).toBeCloseTo(0.75, 5);
-
-    // formatReport MUST NOT emit the Observability block any longer — neither
-    // on the narrative path nor on the legacy path, regardless of whether
-    // indexState is passed.
-    const textLegacy = formatReport(report, "0.0.0-test", null, {
-      indexState: { totalChunks: 42, totalSources: 7, lastIndexedAt: "2026-05-24T12:00:00" },
-    });
-    expect(textLegacy).not.toContain("## Observability");
-    expect(textLegacy).not.toContain("cache.hit_rate:");
-    expect(textLegacy).not.toContain("index.total_chunks");
-    expect(textLegacy).not.toContain("index.total_sources");
-    expect(textLegacy).not.toContain("index.last_indexed_at");
-
-    // Same expectation on the narrative early-return path.
-    const conversation = {
-      sessionId: "observability-removed-narrative-test",
-      events: 12,
-      dbCount: 1,
-      daysAlive: 1.5,
-      snapshotBytes: 0,
-      snapshotsConsumed: 0,
-      byCategory: [],
-      firstEventMs: Date.now() - 86_400_000,
-      lastEventMs: Date.now(),
-    };
-    const textNarrative = formatReport(report, "0.0.0-test", null, {
-      conversation: conversation as any,
-      indexState: { totalChunks: 42, totalSources: 7, lastIndexedAt: "2026-05-24T12:00:00" },
-      cwd: "/test/repo",
-      now: 1716552000000,
-      locale: "en-US",
-      tz: "UTC",
-    });
-    expect(textNarrative).not.toContain("## Observability");
-    expect(textNarrative).not.toContain("cache.hit_rate:");
-    expect(textNarrative).not.toContain("index.total_chunks");
-    expect(textNarrative).not.toContain("index.total_sources");
-    expect(textNarrative).not.toContain("index.last_indexed_at");
-  });
-});
-
-// Gemini's function-calling API (Antigravity CLI `agy`, Gemini CLI) rejects
-// JSON Schema `const` and `additionalProperties` and then silently drops the
-// tool from the model's function list. The sanitizer rewrites the EMITTED
-// tools/list schema in a behavior-preserving way so those tools become callable.
-describe("sanitizeSchemaForStrictClients", () => {
-  test("rewrites `const: X` to `enum: [X]` (an identical single-value constraint)", () => {
-    expect(sanitizeSchemaForStrictClients({ const: "javascript" })).toEqual({ enum: ["javascript"] });
-    expect(sanitizeSchemaForStrictClients({ const: 1 })).toEqual({ enum: [1] });
-  });
-
-  test("strips `additionalProperties` (advisory-only — Zod validates args server-side)", () => {
-    const out = sanitizeSchemaForStrictClients({
-      type: "object",
-      additionalProperties: false,
-      properties: { a: { type: "string" } },
-    }) as Record<string, unknown>;
-    expect(out).not.toHaveProperty("additionalProperties");
-    expect(out.type).toBe("object");
-    expect(out.properties).toEqual({ a: { type: "string" } });
-  });
-
-  test("preserves every Gemini-compatible keyword unchanged", () => {
-    // enum / pattern / default / minLength etc. are accepted by Gemini and must
-    // pass through untouched so non-Gemini clients see an identical schema.
-    const input = {
-      type: "string",
-      enum: ["a", "b"],
-      pattern: "^x",
-      default: "a",
-      minLength: 1,
-      description: "desc",
-    };
-    expect(sanitizeSchemaForStrictClients(input)).toEqual(input);
-  });
-
-  test("recurses through nested properties and arrays", () => {
-    const input = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        language: { const: "shell" },
-        items: { type: "array", items: { const: 1 }, additionalProperties: true },
-      },
-    };
-    expect(sanitizeSchemaForStrictClients(input)).toEqual({
-      type: "object",
-      properties: {
-        language: { enum: ["shell"] },
-        items: { type: "array", items: { enum: [1] } },
-      },
-    });
-  });
-
-  test("leaves primitives and null untouched", () => {
-    expect(sanitizeSchemaForStrictClients("x")).toBe("x");
-    expect(sanitizeSchemaForStrictClients(7)).toBe(7);
-    expect(sanitizeSchemaForStrictClients(true)).toBe(true);
-    expect(sanitizeSchemaForStrictClients(null)).toBe(null);
-  });
-
-  test("does not mutate the input object", () => {
-    const input = { const: "x", additionalProperties: false };
-    sanitizeSchemaForStrictClients(input);
-    expect(input).toEqual({ const: "x", additionalProperties: false });
-  });
-});
-
-describe("parseJsonc / stripJsonComments (src/util/jsonc)", () => {
-  // Regression for the #787 review: the trailing-comma strip used to run a regex
-  // over the WHOLE string, eating commas INSIDE string values. parseJsonc only
-  // reaches the stripper when strict JSON.parse fails (a comment forces that),
-  // so the corruption was silent.
-  test("preserves a comma inside a string value on the comment-strip path", () => {
-    const jsonc = '{\n  // forces the strip path\n  "note": "array literal: [1, ]"\n}';
-    expect(parseJsonc<{ note: string }>(jsonc)?.note).toBe("array literal: [1, ]");
-  });
-
-  test("still strips real trailing commas (object, array, nested) once a comment forces the path", () => {
-    expect(parseJsonc('{ // c\n "a": [1, 2,], "b": { "c": 3, }, }')).toEqual({ a: [1, 2], b: { c: 3 } });
-  });
-
-  test("strips a trailing comma even when a comment sits between it and the bracket", () => {
-    expect(parseJsonc('{ "a": 1, /* note */ }')).toEqual({ a: 1 });
-  });
-
-  test("strips // line and /* */ block comments", () => {
-    expect(parseJsonc('{\n  "a": 1, // line\n  /* block */ "b": 2\n}')).toEqual({ a: 1, b: 2 });
-  });
-
-  test("keeps // and , inside string values intact (URL with trailing-comma-like text)", () => {
-    const jsonc = '{ // c\n "u": "http://x.com/a, ]" }';
-    expect(parseJsonc<{ u: string }>(jsonc)?.u).toBe("http://x.com/a, ]");
-  });
-
-  test("stripJsonComments removes a trailing comma but keeps an identical in-string one", () => {
-    expect(stripJsonComments('{"a":"x, ]","b":[1,]}')).toBe('{"a":"x, ]","b":[1]}');
-  });
-
-  test("returns undefined when both strict and lenient parses fail", () => {
-    expect(parseJsonc("not json at all {{")).toBeUndefined();
-  });
-});
-
-describe("resolveExecTimeout (agy default execution timeout)", () => {
-  const savedPlatform = process.env.CONTEXT_MODE_PLATFORM;
-  const savedOverride = process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS;
-  afterEach(() => {
-    if (savedPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
-    else process.env.CONTEXT_MODE_PLATFORM = savedPlatform;
-    if (savedOverride === undefined) delete process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS;
-    else process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS = savedOverride;
-  });
-
-  test("passes an explicit timeout through on any platform", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
-    expect(resolveExecTimeout(5000)).toBe(5000);
-    process.env.CONTEXT_MODE_PLATFORM = "claude-code";
-    expect(resolveExecTimeout(5000)).toBe(5000);
-  });
-
-  test("applies the agy default ONLY under antigravity-cli when no timeout is given", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
-    delete process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS;
-    expect(resolveExecTimeout(undefined)).toBe(AGY_DEFAULT_EXEC_TIMEOUT_MS);
-  });
-
-  test("leaves the timeout unbounded (undefined) on non-agy hosts", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "claude-code";
-    expect(resolveExecTimeout(undefined)).toBeUndefined();
-  });
-
-  test("honors CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS override under agy", () => {
-    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
-    process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS = "1500";
-    expect(resolveExecTimeout(undefined)).toBe(1500);
-  });
-});
-
-// ─── ctx_* MCP tool annotations (#846) ───────────────────
-// "Server & tools" domain → this file owns tool registration per CONTRIBUTING.md.
-// Inspects the actual registered descriptors via the exported registry, not just
-// descriptions, so a missing/incorrect annotation fails CI.
-describe("ctx_* MCP tool annotations (#846)", () => {
-  type Hints = {
-    readOnlyHint: boolean;
-    destructiveHint: boolean;
-    idempotentHint: boolean;
-    openWorldHint: boolean;
-  };
-  // Classified by real behavior (no blanket readOnlyHint).
-  const EXPECTED: Record<string, Hints> = {
-    ctx_execute:         { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
-    ctx_execute_file:    { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
-    ctx_index:           { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    ctx_search:          { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
-    ctx_fetch_and_index: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true  },
-    ctx_batch_execute:   { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
-    ctx_stats:           { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
-    ctx_doctor:          { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
-    ctx_upgrade:         { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
-    ctx_purge:           { readOnlyHint: false, destructiveHint: true,  idempotentHint: true,  openWorldHint: false },
-    ctx_insight:         { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: true  },
-  };
-  const tools = REGISTERED_CTX_TOOLS as Array<{ name: string; config: { annotations?: Hints } }>;
-  const find = (name: string) => tools.find((t) => t.name === name);
-
-  test("registers exactly the expected ctx_* tools", () => {
-    expect(tools.map((t) => t.name).sort()).toEqual(Object.keys(EXPECTED).sort());
-  });
-
-  test("every ctx_* tool carries explicit annotations classified by real behavior", () => {
-    for (const [name, hints] of Object.entries(EXPECTED)) {
-      const tool = find(name);
-      expect(tool, `${name} not registered`).toBeDefined();
-      expect(tool!.config.annotations, `${name} missing annotations`).toBeDefined();
-      expect(tool!.config.annotations).toMatchObject(hints);
-    }
-  });
-
-  test("read-only diagnostic/query tools are readOnlyHint:true (the #846 cancellation fix)", () => {
-    for (const name of ["ctx_search", "ctx_stats", "ctx_doctor"]) {
-      expect(find(name)!.config.annotations!.readOnlyHint).toBe(true);
-    }
-  });
-
-  test("never blanket-marks executing/mutating/destructive tools read-only", () => {
-    for (const name of [
-      "ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_index",
-      "ctx_fetch_and_index", "ctx_purge", "ctx_upgrade", "ctx_insight",
-    ]) {
-      expect(find(name)!.config.annotations!.readOnlyHint).toBe(false);
-    }
-  });
 });

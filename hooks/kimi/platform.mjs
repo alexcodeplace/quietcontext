@@ -1,1 +1,1 @@
-process.env.CONTEXT_MODE_PLATFORM = "kimi";
+process.env.QUIET_CONTEXT_PLATFORM = "kimi";

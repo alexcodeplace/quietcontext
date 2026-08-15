@@ -6,8 +6,8 @@
 
 context-mode is an MCP server + hook bundle that keeps long-running Cursor agent sessions from blowing through their context window. Three pillars:
 
-- **Sandboxed execution** — `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute` run code in 11 languages (Node, Python, Bun, Deno, Ruby, Go, Rust, Java, C, C++, Shell). Only `stdout` enters the agent's context, so analysing huge files no longer floods the window.
-- **FTS5 knowledge base** — `ctx_index`, `ctx_search`, `ctx_fetch_and_index` store research, command output, and web content in SQLite FTS5 with BM25 ranking. The agent searches its own memory instead of re-reading files.
+- **Sandboxed execution** — `execute`, `exec-file`, `batch` run code in 11 languages (Node, Python, Bun, Deno, Ruby, Go, Rust, Java, C, C++, Shell). Only `stdout` enters the agent's context, so analysing huge files no longer floods the window.
+- **FTS5 knowledge base** — `index`, `search`, `fetch-index` store research, command output, and web content in SQLite FTS5 with BM25 ranking. The agent searches its own memory instead of re-reading files.
 - **Native Cursor hooks** — registers `preToolUse`, `postToolUse`, `sessionStart`, `afterAgentResponse`, and `stop` so context-mode can intercept Shell / Read / Grep / WebFetch and redirect them to the sandbox before they pollute context.
 
 ## Install
@@ -70,12 +70,12 @@ If you previously installed context-mode manually (`.cursor/hooks.json` + `.curs
 
 | Tool | Purpose |
 |------|---------|
-| `ctx_execute` | Run code in any of 11 languages, return only stdout |
-| `ctx_execute_file` | Same, but read input from a workspace file path |
-| `ctx_batch_execute` | Run multiple commands in one call, auto-index outputs |
-| `ctx_index` | Store text in FTS5 with a label |
-| `ctx_search` | BM25 search across the knowledge base |
-| `ctx_fetch_and_index` | Fetch a URL, strip HTML, index the result |
+| `execute` | Run code in any of 11 languages, return only stdout |
+| `exec-file` | Same, but read input from a workspace file path |
+| `batch` | Run multiple commands in one call, auto-index outputs |
+| `index` | Store text in FTS5 with a label |
+| `search` | BM25 search across the knowledge base |
+| `fetch-index` | Fetch a URL, strip HTML, index the result |
 | `ctx_stats` | Knowledge base size, hits, top sources |
 | `ctx_doctor` | Diagnose runtime + hook health |
 | `ctx_upgrade` | Apply pending fixes |

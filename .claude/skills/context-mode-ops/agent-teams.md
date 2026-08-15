@@ -38,30 +38,6 @@ Your loop:
 | **Context Mode Architect** | Reviews ALL changes against core architecture. Validates FTS5, MCP protocol, session continuity. Final approval gate. | Always |
 | **QA Engineer** | Runs full test suite, validates across all 12 adapters, checks typecheck. Reports pass/fail matrix. | Always |
 | **DX Engineer** | Reviews user-facing output quality. Checks error messages, help text, diagnostic output. | Always |
-| **Git Archaeologist** | Runs the blame trail BEFORE any fix. Finds the commit that introduced the behavior, the original problem that commit solved, and whether the proposed fix would re-break it. Read-only — writes no code. Gates the fix. | Every bug/regression issue, before code is written |
-
-#### Git Archaeologist — Spawn Prompt (read-only, runs first)
-
-Spawn this agent with `subagent_type: "Explore"` and `ultrathink` authority for EVERY bug/regression — **before** any Staff Engineer writes code. Its `ARCHAEOLOGY_REPORT` is a gate: if the naive fix would re-introduce the original problem a past commit solved, the EM blocks it and re-scopes around the `SAFE_FIX_CONSTRAINTS`.
-
-```
-You are the Git Archaeologist for context-mode. You write NO code, run NO tests.
-Your only job is the blame trail for the behavior reported in issue #{N}.
-
-MUST cite real `git` output (commit SHAs, file:line) — NEVER unverified claims:
-1. Locate the code that produces the reported behavior (`git log -S`, `git log -L`, `git blame`).
-2. Identify the commit that introduced it. Read that commit's message, diff, and linked PR/issue.
-3. Answer: what ORIGINAL problem was that commit solving? Quote the evidence.
-4. Answer: would reverting or changing it re-introduce that original problem?
-   If yes, the naive fix is FORBIDDEN — describe the constraint the fix MUST honor.
-5. List prior attempts: earlier commits/PRs that touched the same lines and what broke.
-
-Deliverable — ARCHAEOLOGY_REPORT:
-  INTRODUCED_BY:        {sha} ({date}) — "{commit subject}" (PR #{n})
-  ORIGINAL_INTENT:      {what that commit fixed, with file:line / PR evidence}
-  REGRESSION_RISK:      {what a naive fix would re-break}
-  SAFE_FIX_CONSTRAINTS: {what any fix MUST preserve to avoid re-breaking it}
-```
 
 ### Platform Agents (Spawned When Platform Is Affected)
 
@@ -95,7 +71,7 @@ Spawn the **pair** (Architect + Staff Engineer) for each affected platform:
 | Hook, PreToolUse, PostToolUse, SessionStart, PreCompact | **Hooks Architect** | Hook lifecycle, matcher patterns, stdin/stdout protocol |
 | Session, compaction, resume, snapshot, continuity | **Session Architect** | SessionDB schema, event extraction, resume flow, PreCompact |
 | Executor, sandbox, polyglot, truncation, timeout | **Executor Architect** | Language runtimes, smart truncation, FTS5 indexing pipeline |
-| Fetch, turndown, HTML, markdown conversion, web | **Web/Fetch Architect** | ctx_fetch_and_index, HTML→markdown, chunking, URL handling |
+| Fetch, turndown, HTML, markdown conversion, web | **Web/Fetch Architect** | fetch-index, HTML→markdown, chunking, URL handling |
 | Performance, benchmark, tokens, context savings | **Performance Engineer** | Token counting, context savings ratio, benchmark comparisons |
 | Version, release, publish, npm, manifest | **Release Engineer** | version-sync, manifest files, npm publish, GitHub releases |
 
@@ -169,7 +145,7 @@ Report back with ONE of:
 - FINDINGS: {investigation results}
 
 ## Tools Available
-- Use context-mode MCP tools (ctx_execute, ctx_batch_execute) for large output
+- Use context-mode MCP tools (execute, batch) for large output
 - Use Grep/Glob for targeted searches
 - Use Read only for files you need to Edit
 - Run tests with: npx vitest run {test file}

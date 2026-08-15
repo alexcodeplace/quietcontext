@@ -1,9 +1,9 @@
 {
-  "name": "context-mode",
+  "name": "quietcontext",
   "version": "1.0.169",
-  "description": "MCP server that saves 98% of your context window with session continuity. Sandboxed code execution in 11 languages, FTS5 knowledge base with BM25 ranking, and automatic state restore across compactions.",
+  "description": "Quiet MCP tools for sandboxed execution, indexing, and search.",
   "author": {
-    "name": "Mert Koseoğlu",
+    "name": "Mert Koseo\u011flu",
     "url": "https://github.com/mksglu"
   },
   "homepage": "https://github.com/mksglu/context-mode#readme",
@@ -20,11 +20,13 @@
     "context7"
   ],
   "mcpServers": {
-    "context-mode": {
-      "command": "node",
-      "args": [
-        "${CLAUDE_PLUGIN_ROOT}/start.mjs"
-      ]
+    "quietcontext": {
+      "type": "http",
+      "url": "http://127.0.0.1:48619/mcp",
+      "headers": {
+        "X-QuietContext-Root": "${PWD}"
+      },
+      "headersHelper": "node ${CLAUDE_PLUGIN_ROOT}/daemon-headers.mjs"
     }
   },
   "skills": "./skills/"

@@ -1,11 +1,11 @@
 {
   "mcpServers": {
-    "context-mode": {
+    "quietcontext": {
       "command": "node",
       "args": ["./start.mjs"],
       "cwd": ".",
       "env": {
-        "CONTEXT_MODE_PLATFORM": "codex"
+        "QUIET_CONTEXT_PLATFORM": "codex"
       },
       "default_tools_approval_mode": "approve"
     }

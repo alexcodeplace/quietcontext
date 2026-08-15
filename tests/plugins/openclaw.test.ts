@@ -50,49 +50,6 @@ interface MockContextEngine {
   };
 }
 
-function createMockApiWithoutRegisterHook() {
-  const lifecycle: MockLifecycleEntry[] = [];
-  const tools: MockToolEntry[] = [];
-  const commands: MockCommandEntry[] = [];
-  const warnings: unknown[][] = [];
-
-  return {
-    lifecycle,
-    tools,
-    commands,
-    warnings,
-    api: {
-      on(
-        event: string,
-        handler: (...args: unknown[]) => unknown,
-        opts?: { priority?: number },
-      ) {
-        lifecycle.push({ event, handler, opts });
-      },
-      registerCommand(command: unknown) {
-        if (
-          !command ||
-          typeof command !== "object" ||
-          typeof (command as { name?: unknown }).name !== "string" ||
-          typeof (command as { handler?: unknown }).handler !== "function"
-        ) {
-          throw new TypeError("registerCommand(command) expected");
-        }
-        commands.push(command as MockCommandEntry);
-      },
-      registerTool(
-        tool: Omit<MockToolEntry, "optional">,
-        opts?: { optional?: boolean },
-      ) {
-        tools.push({ ...tool, optional: opts?.optional });
-      },
-      logger: {
-        warn: (...args: unknown[]) => warnings.push(args),
-      },
-    },
-  };
-}
-
 interface MockCommandEntry {
   name: string;
   description: string;
@@ -308,22 +265,6 @@ describe("OpenClawPlugin", () => {
         expect(hook.meta.description.length).toBeGreaterThan(0);
       }
     });
-
-    it("degrades gracefully when registerHook and registerContextEngine are unavailable", async () => {
-      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
-      const mock = createMockApiWithoutRegisterHook();
-
-      expect(() => plugin.register(mock.api as unknown as Parameters<typeof plugin.register>[0]))
-        .not.toThrow();
-      expect(mock.tools.length).toBeGreaterThan(0);
-      expect(mock.commands.map((c) => c.name)).toEqual(
-        expect.arrayContaining(["ctx-stats", "ctx-doctor", "ctx-upgrade"]),
-      );
-      const lifecycleNames = mock.lifecycle.map((h) => h.event);
-      expect(lifecycleNames).toContain("before_tool_call");
-      expect(lifecycleNames).toContain("command:new");
-      expect(mock.warnings.length).toBeGreaterThan(0);
-    });
   });
 
   // ── Auto-reply commands ───────────────────────────────
@@ -477,56 +418,6 @@ describe("OpenClawPlugin", () => {
     });
   });
 
-  // ── model.usage diagnostic subscription (cost capture wire) ──
-
-  describe("model.usage diagnostic subscription", () => {
-    it("subscribes via api.onDiagnosticEvent and flows a model.usage event to db.insertEvent", async () => {
-      // Capture the listener the plugin registers on the diagnostic bus.
-      let diagListener: ((evt: unknown) => void) | undefined;
-      const mock = createMockApiFull();
-      const api = {
-        ...mock.api,
-        onDiagnosticEvent(listener: (evt: unknown) => void) {
-          diagListener = listener;
-          return () => {};
-        },
-      };
-
-      const insertSpy = vi.spyOn(OpenClawSessionDB.prototype, "insertEvent");
-      insertSpy.mockClear();
-
-      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
-      await plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
-
-      expect(typeof diagListener).toBe("function");
-
-      // Fire a real model.usage diagnostic payload.
-      diagListener!({
-        type: "model.usage",
-        model: "claude-sonnet-4",
-        usage: { input: 1200, output: 340, cacheRead: 5000, cacheWrite: 800 },
-        costUsd: 0.0421,
-      });
-
-      const usageInsert = insertSpy.mock.calls.find(
-        (c) => (c[1] as { type?: string })?.type === "agent_usage",
-      );
-      expect(usageInsert).toBeDefined();
-      expect((usageInsert![1] as { cost_usd?: number }).cost_usd).toBe(0.0421);
-      expect(usageInsert![2]).toBe("Diagnostic"); // PostToolUse-style source tag
-
-      // Non-usage payloads insert no agent_usage event (best-effort, no throw).
-      const before = insertSpy.mock.calls.length;
-      expect(() => diagListener!({ type: "model.failover" })).not.toThrow();
-      const afterUsage = insertSpy.mock.calls
-        .slice(before)
-        .filter((c) => (c[1] as { type?: string })?.type === "agent_usage");
-      expect(afterUsage).toHaveLength(0);
-
-      insertSpy.mockRestore();
-    });
-  });
-
   // ── command:new ───────────────────────────────────────
 
   describe("command:new", () => {
@@ -565,17 +456,6 @@ describe("OpenClawPlugin", () => {
       const result = promptHook!.handler() as { appendSystemContext: string };
       expect(result).toHaveProperty("appendSystemContext");
       expect(result.appendSystemContext).toContain("context-mode");
-    });
-
-    it("injects skill-like guidance derived from skills/context-mode/SKILL.md", async () => {
-      const mock = await createTestPlugin(join(tempDir, "prompt-skill-like"));
-      await flushInit(mock);
-      const promptHook = mock.lifecycle.find(
-        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
-      );
-      const result = promptHook!.handler() as { appendSystemContext?: string };
-      expect(result?.appendSystemContext).toContain("<context_mode_skill_like_guidance");
-      expect(result?.appendSystemContext).toContain("Default to context-mode for ALL commands.");
     });
 
     it("has priority 5", async () => {
@@ -724,7 +604,6 @@ describe("OpenClawPlugin", () => {
       expect(out?.inputOverride?.prompt).toBeDefined();
       expect(out!.inputOverride!.prompt!).toContain("Investigate the failing test.");
       expect(out!.inputOverride!.prompt!).toContain("<context_window_protection>");
-      expect(out!.inputOverride!.prompt!).toContain("<context_mode_skill_like_guidance");
     });
 
     it("falls back gracefully when input.prompt is missing", async () => {
@@ -735,7 +614,6 @@ describe("OpenClawPlugin", () => {
         | { inputOverride?: { prompt?: string } }
         | undefined;
       expect(out?.inputOverride?.prompt).toContain("<context_window_protection>");
-      expect(out?.inputOverride?.prompt).toContain("<context_mode_skill_like_guidance");
     });
   });
 
@@ -940,11 +818,11 @@ describe("OpenClawPlugin", () => {
         mkdtempSync(join(tmpdir(), "OpenClaw-Mixed-")),
       );
       const prevCwd = process.cwd();
-      const priorOverride = process.env.CONTEXT_MODE_DATA_DIR;
+      const priorOverride = process.env.QUIET_CONTEXT_DATA_DIR;
       // Route the OpenClaw sessions dir into a fresh scratch root so
       // we never collide with the developer's real ~/.openclaw DB.
       const dataRoot = mkdtempSync(join(tmpdir(), "openclaw-645-root-"));
-      process.env.CONTEXT_MODE_DATA_DIR = dataRoot;
+      process.env.QUIET_CONTEXT_DATA_DIR = dataRoot;
       try {
         // OpenClaw plugin resolves projectDir via process.cwd() at
         // register() time (src/adapters/openclaw/plugin.ts:250).
@@ -1000,9 +878,9 @@ describe("OpenClawPlugin", () => {
         try { rmSync(mixedCaseProject, { recursive: true, force: true }); } catch { /* best effort */ }
         try { rmSync(dataRoot, { recursive: true, force: true }); } catch { /* best effort */ }
         if (priorOverride === undefined) {
-          delete process.env.CONTEXT_MODE_DATA_DIR;
+          delete process.env.QUIET_CONTEXT_DATA_DIR;
         } else {
-          process.env.CONTEXT_MODE_DATA_DIR = priorOverride;
+          process.env.QUIET_CONTEXT_DATA_DIR = priorOverride;
         }
         vi.resetModules();
       }

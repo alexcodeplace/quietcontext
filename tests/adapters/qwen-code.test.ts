@@ -284,12 +284,12 @@ describe("QwenCodeAdapter", () => {
       rmSync(pluginRoot, { recursive: true, force: true });
     });
 
-    it("writes ALL 6 declared hooks (PreToolUse, PostToolUse, SessionStart, PreCompact, UserPromptSubmit, Stop)", () => {
+    it("writes ALL 5 declared hooks (PreToolUse, PostToolUse, SessionStart, PreCompact, UserPromptSubmit)", () => {
       adapter.configureAllHooks(pluginRoot);
       const written = JSON.parse(readFileSync(join(tempDir, "settings.json"), "utf-8"));
       const hookKeys = Object.keys(written.hooks ?? {}).sort();
       expect(hookKeys).toEqual(
-        ["PostToolUse", "PreCompact", "PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"],
+        ["PostToolUse", "PreCompact", "PreToolUse", "SessionStart", "UserPromptSubmit"],
       );
     });
 
@@ -302,8 +302,6 @@ describe("QwenCodeAdapter", () => {
         SessionStart: "sessionstart.mjs",
         PreCompact: "precompact.mjs",
         UserPromptSubmit: "userpromptsubmit.mjs",
-        // Stop routes to the qwen-code/ hook dir (token-cost capture).
-        Stop: "qwen-code/stop.mjs",
       };
       for (const [hookName, script] of Object.entries(expectedScripts)) {
         const entries = written.hooks[hookName];

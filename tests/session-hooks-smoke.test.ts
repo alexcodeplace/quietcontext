@@ -69,7 +69,7 @@ function runHook(hookFile: string, input: Record<string, unknown>, env?: Record<
       ...process.env,
       CLAUDE_PROJECT_DIR: fakeProjectDir,
       CLAUDE_SESSION_ID: "test-session-117",
-      CONTEXT_MODE_PLATFORM: "claude-code",
+      QUIET_CONTEXT_PLATFORM: "claude-code",
       // Isolate DB writes to fake HOME
       HOME: fakeHomeDir,
       USERPROFILE: fakeHomeDir,
@@ -128,7 +128,7 @@ describe("Issue #117 — Session hooks without build/session/", () => {
       tool_response: "Patch failed",
       tool_output: { is_error: true },
     }, {
-      CONTEXT_MODE_PLATFORM: "codex",
+      QUIET_CONTEXT_PLATFORM: "codex",
       CODEX_PROJECT_DIR: fakeProjectDir,
     });
 

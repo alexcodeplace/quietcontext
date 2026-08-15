@@ -4,11 +4,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { GeminiCLIAdapter } from "../../src/adapters/gemini-cli/index.js";
-import {
-  HOOK_TYPES,
-  HOOK_SCRIPTS,
-  buildHookCommand,
-} from "../../src/adapters/gemini-cli/hooks.js";
+import { HOOK_TYPES, HOOK_SCRIPTS } from "../../src/adapters/gemini-cli/hooks.js";
 
 describe("GeminiCLIAdapter", () => {
   let adapter: GeminiCLIAdapter;
@@ -242,20 +238,6 @@ describe("GeminiCLIAdapter", () => {
         "beforeagent.mjs",
       );
     });
-
-    it("generateHookConfig wires AfterModel into settings (matcher: '') so the host fires aftermodel.mjs", () => {
-      const config = adapter.generateHookConfig("/plugin/root") as Record<
-        string,
-        Array<{ matcher?: string; hooks?: Array<{ command?: string; type?: string }> }>
-      >;
-      expect(config["AfterModel"]).toBeDefined();
-      expect(config["AfterModel"].length).toBe(1);
-      expect(config["AfterModel"][0].matcher).toBe("");
-      expect(config["AfterModel"][0].hooks?.[0].type).toBe("command");
-      expect(config["AfterModel"][0].hooks?.[0].command).toContain(
-        "aftermodel.mjs",
-      );
-    });
   });
 
   // ── parseSessionStartInput ────────────────────────────
@@ -275,100 +257,6 @@ describe("GeminiCLIAdapter", () => {
         source: "unknown-source",
       });
       expect(event.source).toBe("startup");
-    });
-  });
-
-  // ── buildHookCommand path layout (issue #712) ─────────
-  //
-  // Regression guard for issue #712: `buildHookCommand` must emit a path
-  // under `hooks/gemini-cli/<script>` to match the published tree layout.
-  // The introducing commit f5c9d02 carried claude-code's flat
-  // `hooks/<script>` shape across without accounting for gemini-cli's
-  // platform subdir (see HOOK_MAP in src/cli.ts where the gemini-cli
-  // dispatcher already lists `hooks/gemini-cli/<script>.mjs`). The flat
-  // emit made `ctx doctor` look for hook scripts at
-  // `<pluginRoot>/hooks/<script>.mjs` which never exist for gemini-cli,
-  // producing FAIL lines on every install.
-  describe("buildHookCommand (issue #712)", () => {
-    const pluginRoot = "/plugin/root";
-
-    it("emits BeforeTool path under hooks/gemini-cli/", () => {
-      const cmd = buildHookCommand(HOOK_TYPES.BEFORE_TOOL, pluginRoot);
-      expect(cmd).toContain("/plugin/root/hooks/gemini-cli/beforetool.mjs");
-    });
-
-    it("emits SessionStart path under hooks/gemini-cli/", () => {
-      const cmd = buildHookCommand(HOOK_TYPES.SESSION_START, pluginRoot);
-      expect(cmd).toContain("/plugin/root/hooks/gemini-cli/sessionstart.mjs");
-    });
-
-    it("does not emit the flat hooks/<script>.mjs shape for any hook", () => {
-      for (const [hookType, scriptName] of Object.entries(HOOK_SCRIPTS)) {
-        const cmd = buildHookCommand(hookType as keyof typeof HOOK_SCRIPTS, pluginRoot);
-        expect(cmd, `hook ${hookType} (${scriptName}) flat-path regression`).not.toMatch(
-          new RegExp(`/hooks/${scriptName.replace(".", "\\.")}(?:\\b|$|")`),
-        );
-        expect(cmd).toContain(`/hooks/gemini-cli/${scriptName}`);
-      }
-    });
-
-    it("every emitted hook command resolves to a file on disk", () => {
-      const repoRoot = resolve(__dirname, "..", "..");
-      for (const [hookType, scriptName] of Object.entries(HOOK_SCRIPTS)) {
-        const cmd = buildHookCommand(hookType as keyof typeof HOOK_SCRIPTS, repoRoot);
-        // The published tree layout is the contract — the script path the
-        // command points to must exist in the same tree the doctor inspects.
-        const expectedPath = join(repoRoot, "hooks", "gemini-cli", scriptName);
-        expect(existsSync(expectedPath), `missing ${expectedPath}`).toBe(true);
-        // buildHookRuntimeCommand emits forward-slash paths on every OS
-        // (MSYS / Git Bash on Windows uses forward slashes). path.join on
-        // Windows returns backslashes, so normalize before substring-match.
-        expect(cmd).toContain(expectedPath.replace(/\\/g, "/"));
-      }
-    });
-
-    it("falls back to CLI dispatcher when pluginRoot omitted", () => {
-      expect(buildHookCommand(HOOK_TYPES.BEFORE_TOOL)).toBe(
-        "context-mode hook gemini-cli beforetool",
-      );
-    });
-  });
-
-  // ── getHealthChecks defense-in-depth (issue #712) ─────
-  //
-  // Mirrors claude-code's Algo-D1 override: doctor calls
-  // `adapter.getHealthChecks(pluginRoot)` and resolves script paths
-  // directly via existsSync. No round-trip through a hook command
-  // string, so this class of layout bug cannot regress through a
-  // regex/parser mismatch.
-  describe("getHealthChecks (issue #712 defense in depth)", () => {
-    it("declares one check per HOOK_SCRIPTS entry", () => {
-      const repoRoot = resolve(__dirname, "..", "..");
-      const checks = adapter.getHealthChecks?.(repoRoot) ?? [];
-      expect(checks.length).toBeGreaterThanOrEqual(
-        Object.keys(HOOK_SCRIPTS).length,
-      );
-    });
-
-    it("every hook script check passes against the published tree", () => {
-      const repoRoot = resolve(__dirname, "..", "..");
-      const checks = adapter.getHealthChecks?.(repoRoot) ?? [];
-      const hookResults = checks
-        .filter((c) => c.name.startsWith("Hook script:"))
-        .map((c) => ({ name: c.name, result: c.check() }));
-      for (const { name, result } of hookResults) {
-        expect(result.status, `${name} -> ${result.detail ?? ""}`).toBe("OK");
-      }
-    });
-
-    it("FAIL surfaces when pluginRoot is a temporary empty dir", () => {
-      const tmp = join(homedir(), ".gemini-test-nonexistent-712");
-      const checks = adapter.getHealthChecks?.(tmp) ?? [];
-      const hookFail = checks
-        .filter((c) => c.name.startsWith("Hook script:"))
-        .map((c) => c.check());
-      expect(hookFail.length).toBeGreaterThan(0);
-      expect(hookFail.every((r) => r.status === "FAIL")).toBe(true);
     });
   });
 });

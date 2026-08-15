@@ -45,33 +45,24 @@ vi.mock("node:os", async () => {
 
 const {
   detectPlatform,
-  PLATFORM_ENV_VARS,
   __resetClaudeCodePluginCacheForTests,
 } = await import("../../src/adapters/detect.js");
-
-function clearPlatformDetectionEnv() {
-  for (const vars of PLATFORM_ENV_VARS.values()) {
-    for (const { name } of vars) {
-      delete process.env[name];
-    }
-  }
-}
 
 describe("Issue #539 — Claude Code inside VS Code disambiguation", () => {
   let savedEnv: NodeJS.ProcessEnv;
 
   beforeEach(() => {
     savedEnv = { ...process.env };
-    // Wipe every platform marker so each test starts from a clean slate even
-    // when Vitest is launched from another supported agent such as Codex.
-    clearPlatformDetectionEnv();
+    // Wipe every marker so each test starts from a clean slate.
+    delete process.env.CLAUDE_PROJECT_DIR;
+    delete process.env.CLAUDE_SESSION_ID;
+    delete process.env.CLAUDE_CODE_ENTRYPOINT;
+    delete process.env.CLAUDE_PLUGIN_ROOT;
     delete process.env.CLAUDE_PLUGIN_DATA;
     delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
     delete process.env.VSCODE_PID;
     delete process.env.VSCODE_CWD;
-    delete process.env.CODEX_THREAD_ID;
-    delete process.env.CODEX_CI;
-    delete process.env.CONTEXT_MODE_PLATFORM;
+    delete process.env.QUIET_CONTEXT_PLATFORM;
     homedirMock.current = "";
     __resetClaudeCodePluginCacheForTests();
   });

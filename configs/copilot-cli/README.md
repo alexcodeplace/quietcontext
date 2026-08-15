@@ -9,9 +9,9 @@ copilot plugin install mksglu/context-mode:configs/copilot-cli
 
 This registers:
 
-- **MCP server** (`.mcp.json`) — exposes the `ctx_*` tools (`ctx_execute`,
-  `ctx_batch_execute`, `ctx_search`, `ctx_fetch_and_index`, …). The server is
-  launched with `CONTEXT_MODE_PLATFORM=copilot-cli`, so it self-identifies as
+- **MCP server** (`.mcp.json`) — exposes the `ctx_*` tools (`execute`,
+  `batch`, `search`, `fetch-index`, …). The server is
+  launched with `QUIET_CONTEXT_PLATFORM=copilot-cli`, so it self-identifies as
   Copilot regardless of any other CLI installed on the machine — `ctx_upgrade`
   and platform detection resolve `copilot-cli`, never a co-installed Claude Code.
 - **Routing skill** (`skills/context-mode/`) — the MANDATORY "Think in Code"
@@ -36,7 +36,7 @@ npm install -g context-mode
 ## Alternative (no plugin)
 
 ```sh
-copilot mcp add context-mode --env CONTEXT_MODE_PLATFORM=copilot-cli -- context-mode
+copilot mcp add context-mode --env QUIET_CONTEXT_PLATFORM=copilot-cli -- context-mode
 ```
 
 Then, to also install the capture hooks, run the upgrade **from inside Copilot**

@@ -4,7 +4,7 @@
  * `checkFilePathDenyPolicy` must use the canonical `getProjectDir()` helper so
  * that all supported adapters resolve project root via the full env cascade
  * (CLAUDE_PROJECT_DIR, GEMINI_PROJECT_DIR, VSCODE_CWD, OPENCODE_PROJECT_DIR,
- * PI_PROJECT_DIR, CONTEXT_MODE_PROJECT_DIR, cwd).
+ * PI_PROJECT_DIR, QUIET_CONTEXT_PROJECT_DIR, cwd).
  *
  * The previous implementation used `process.env.CLAUDE_PROJECT_DIR ?? cwd()`
  * which fails open (or matches the wrong repo's deny rules) on every
@@ -39,7 +39,7 @@ describe("checkFilePathDenyPolicy: project-dir resolution", () => {
 
     // RED-guard: must NOT use the divergent ad-hoc resolution that
     // skips GEMINI_PROJECT_DIR / VSCODE_CWD / OPENCODE_PROJECT_DIR /
-    // PI_PROJECT_DIR / CONTEXT_MODE_PROJECT_DIR.
+    // PI_PROJECT_DIR / QUIET_CONTEXT_PROJECT_DIR.
     expect(body).not.toMatch(
       /process\.env\.CLAUDE_PROJECT_DIR\s*\?\?\s*process\.cwd\(\)/,
     );
@@ -60,7 +60,7 @@ describe("checkFilePathDenyPolicy: project-dir resolution", () => {
     expect(body).not.toContain("VSCODE_CWD");
     expect(body).not.toContain("OPENCODE_PROJECT_DIR");
     expect(body).not.toContain("PI_PROJECT_DIR");
-    expect(body).not.toContain("CONTEXT_MODE_PROJECT_DIR");
+    expect(body).not.toContain("QUIET_CONTEXT_PROJECT_DIR");
     expect(body).not.toContain("IDEA_INITIAL_DIRECTORY");
   });
 });

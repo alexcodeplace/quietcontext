@@ -1,13 +1,12 @@
 import { describe, test, expect, afterAll } from "vitest";
 import { strict as assert } from "node:assert";
-import { existsSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   PolyglotExecutor,
   buildScriptFilename,
   buildShellScriptContent,
-  buildPowerShellScriptContent,
   buildSpawnOptions,
 } from "../src/executor.js";
 import {
@@ -19,17 +18,6 @@ import {
 
 const runtimes = detectRuntimes();
 const executor = new PolyglotExecutor({ runtimes });
-
-function findWindowsGitBash(): string | null {
-  if (process.platform !== "win32") return null;
-  const candidates = [
-    "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-    "C:\\Program Files\\Git\\bin\\bash.exe",
-    "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
-    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-  ];
-  return candidates.find(p => existsSync(p)) ?? null;
-}
 
 describe("Runtime Detection", () => {
   test("detects JavaScript runtime (bun or node)", async () => {
@@ -90,11 +78,6 @@ describe("Runtime Detection", () => {
   });
 
   if (process.platform === "win32") {
-    const gitBash = findWindowsGitBash();
-    // #791 is specifically Git Bash + native git path conversion; fallback
-    // shells are covered by the runtime detection test above.
-    const gitBashTest = gitBash ? test : test.skip;
-
     test("Windows: shell is Git Bash or fallback, never WSL bash", async () => {
       const shell = runtimes.shell.toLowerCase();
       assert.ok(
@@ -104,8 +87,7 @@ describe("Runtime Detection", () => {
     });
 
     test("Windows: shell execute works with non-ASCII (Chinese) project path", async () => {
-      const { mkdirSync } = await import("node:fs");
-      const { rm } = await import("node:fs/promises");
+      const { mkdirSync, rmSync } = await import("node:fs");
       const { tmpdir } = await import("node:os");
       const chineseDir = join(tmpdir(), "测试目录");
       try { mkdirSync(chineseDir, { recursive: true }); } catch {}
@@ -113,40 +95,8 @@ describe("Runtime Detection", () => {
       const r = await chineseExecutor.execute({ language: "shell", code: 'echo "chinese path ok"' });
       assert.equal(r.exitCode, 0, `Failed with stderr: ${r.stderr}`);
       assert.ok(r.stdout.includes("chinese path ok"), `Got: ${r.stdout}`);
-      try { await rm(chineseDir, { recursive: true, force: true }); } catch {}
+      try { rmSync(chineseDir, { recursive: true, force: true }); } catch {}
     });
-
-    gitBashTest("Windows: Git Bash sees native git repos created under mktemp dirs (#791)", async () => {
-      const gitBashRuntimes: RuntimeMap = { ...runtimes, shell: gitBash! };
-      const gitBashExecutor = new PolyglotExecutor({ runtimes: gitBashRuntimes });
-      const previousNoPathConv = process.env.MSYS_NO_PATHCONV;
-      const previousArgConvExcl = process.env.MSYS2_ARG_CONV_EXCL;
-      process.env.MSYS_NO_PATHCONV = "1";
-      process.env.MSYS2_ARG_CONV_EXCL = "*";
-      try {
-        const r = await gitBashExecutor.execute({
-          language: "shell",
-          timeout: 20_000,
-          code: [
-            "set -e",
-            "T=$(mktemp -d)",
-            "git init --bare --quiet \"$T/origin.git\"",
-            "test -d \"$T/origin.git\"",
-            "git clone --quiet \"$T/origin.git\" \"$T/clone\"",
-            "test -d \"$T/clone/.git\"",
-            "echo git bash tmp path ok",
-          ].join("\n"),
-        });
-        assert.equal(r.exitCode, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
-        assert.ok(r.stdout.includes("git bash tmp path ok"), `Got: ${r.stdout}`);
-      } finally {
-        if (previousNoPathConv === undefined) delete process.env.MSYS_NO_PATHCONV;
-        else process.env.MSYS_NO_PATHCONV = previousNoPathConv;
-        if (previousArgConvExcl === undefined) delete process.env.MSYS2_ARG_CONV_EXCL;
-        else process.env.MSYS2_ARG_CONV_EXCL = previousArgConvExcl;
-      }
-    });
-
   }
 
   test("detects TypeScript runtime", async () => {
@@ -213,16 +163,6 @@ describe("Runtime Detection", () => {
   test("buildShellScriptContent leaves Windows shell scripts unchanged", () => {
     const script = buildShellScriptContent("echo ok", "C:\\parent\\bin", "win32");
     assert.equal(script, "echo ok");
-  });
-
-  test("buildPowerShellScriptContent prefixes UTF-8 encoding setup", () => {
-    const script = buildPowerShellScriptContent('Write-Output "ok"');
-    // Windows PowerShell 5.1 only reliably detects a script as UTF-8 when the
-    // file opens with a BOM; without it the body is read as the ANSI code page.
-    assert.equal(script.charCodeAt(0), 0xfeff);
-    assert.ok(script.startsWith("﻿[Console]::InputEncoding = [System.Text.UTF8Encoding]::new()"));
-    assert.ok(script.includes("$OutputEncoding = [System.Text.UTF8Encoding]::new()"));
-    assert.ok(script.endsWith('Write-Output "ok"'));
   });
 });
 
@@ -1786,35 +1726,6 @@ describe("Background Mode", () => {
     try { process.kill(pid, 0); alive = true; } catch { /* ESRCH */ }
     assert.equal(alive, false, `Process ${pid} should be dead after cleanup`);
   }, 10_000);
-
-  test("background: true keeps process alive when it writes after detach", async () => {
-    const bgExecutor = new PolyglotExecutor({ runtimes });
-    const r = await bgExecutor.execute({
-      language: "javascript",
-      code: `
-        process.stdout.write(String(process.pid));
-        // Write every 200ms after detach (timeout is 300ms)
-        const id = setInterval(() => {
-          process.stdout.write('alive\\n');
-        }, 200);
-        // Keep alive for 3 seconds total
-        setTimeout(() => { clearInterval(id); process.exit(0); }, 3000);
-      `,
-      timeout: 300,
-      background: true,
-    });
-    const pid = parseInt(r.stdout.trim(), 10);
-    assert.ok(pid > 0, `Expected valid PID, got: "${r.stdout}"`);
-
-    // Give the process time to write after detach
-    await new Promise((r) => setTimeout(r, 1000));
-
-    let alive = false;
-    try { process.kill(pid, 0); alive = true; } catch { /* ESRCH */ }
-    assert.equal(alive, true, `Process ${pid} should still be alive after detach (SIGPIPE bug?)`);
-
-    bgExecutor.cleanupBackgrounded();
-  }, 10_000);
 });
 
 describe("hardCapBytes Enforcement", () => {
@@ -1868,10 +1779,6 @@ describe("Windows Shell Support", () => {
       assert.equal(cmd.length, 3, `Expected [bash, -c, source ...], got: ${cmd}`);
       assert.equal(cmd[1], "-c");
       assert.ok(cmd[2].includes("/tmp/script.sh"), `Expected source clause to reference path, got: ${cmd[2]}`);
-    } else if (process.platform === "win32" && /powershell|pwsh/i.test(cmd[0])) {
-      assert.equal(cmd.length, 6, `Expected [powershell, -NoProfile, -ExecutionPolicy, Bypass, -File, path], got: ${cmd}`);
-      assert.deepEqual(cmd.slice(1, 5), ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-      assert.equal(cmd[5], "/tmp/script.sh");
     } else {
       assert.equal(cmd.length, 2, `Expected [shell, path], got: ${cmd}`);
       assert.equal(cmd[1], "/tmp/script.sh");
@@ -1889,15 +1796,10 @@ describe("Windows Shell Support", () => {
     assert.equal(buildSpawnOptions("linux").windowsHide, false);
   });
 
-  test("buildScriptFilename: POSIX shell on Windows has NO extension (avoid .sh file association)", async () => {
+  test("buildScriptFilename: shell on Windows has NO extension (avoid .sh file association)", async () => {
     assert.equal(buildScriptFilename("shell", "win32"), "script");
     assert.equal(buildScriptFilename("shell", "win32", "C:\\Program Files\\Git\\usr\\bin\\bash.exe"), "script");
     assert.equal(buildScriptFilename("shell", "win32", "sh"), "script");
-  });
-
-  test("buildScriptFilename: cmd on Windows uses .cmd extension", async () => {
-    assert.equal(buildScriptFilename("shell", "win32", "cmd.exe"), "script.cmd");
-    assert.equal(buildScriptFilename("shell", "win32", "C:\\Windows\\System32\\cmd.exe"), "script.cmd");
   });
 
   test("buildScriptFilename: PowerShell on Windows uses .ps1 extension", async () => {

@@ -23,9 +23,9 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 // This lives beside the session DB path helpers because packaged hooks and the
 // statusline already consume `hooks/session-db.bundle.mjs` as their no-build
 // runtime bridge. Keeping the storage resolver here avoids adding a second
-// generated hook bundle just to share CONTEXT_MODE_DIR behavior.
+// generated hook bundle just to share QUIET_CONTEXT_DIR behavior.
 
-const STORAGE_ROOT_ENV = "CONTEXT_MODE_DIR" as const;
+const STORAGE_ROOT_ENV = "QUIET_CONTEXT_DIR" as const;
 const STORAGE_SESSIONS_SUBDIR = "sessions";
 const STORAGE_CONTENT_SUBDIR = "content";
 
@@ -297,7 +297,7 @@ function pathFromStorageError(err: unknown): string | null {
  * Returns the worktree suffix to append to session identifiers.
  * Returns empty string when running in the main working tree.
  *
- * Set CONTEXT_MODE_SESSION_SUFFIX to an explicit value to override
+ * Set QUIET_CONTEXT_SESSION_SUFFIX to an explicit value to override
  * (useful in CI environments or when git is unavailable).
  * Set to empty string to disable isolation entirely.
  */
@@ -361,7 +361,7 @@ function getMainWorktreeRoot(projectDir: string): string | null {
 }
 
 export function getWorktreeSuffix(projectDir = process.cwd()): string {
-  const envSuffix = process.env.CONTEXT_MODE_SESSION_SUFFIX;
+  const envSuffix = process.env.QUIET_CONTEXT_SESSION_SUFFIX;
   if (_wtCache && _wtCache.projectDir === projectDir && _wtCache.envSuffix === envSuffix) {
     return _wtCache.suffix;
   }
@@ -771,16 +771,28 @@ export function ensureSessionEventsSchema(
   },
 ): void {
   let db: { pragma: (q: string) => Array<{ name: string }>; exec: (sql: string) => void; close: () => void } | null = null;
+  let primaryFailure: unknown;
+  let closeFailure: unknown;
   try {
     db = new DatabaseCtor(dbPath);
     applyMissingSessionEventsColumns(db);
-  } catch {
-    // best-effort — missing table, file lock, corrupt DB, or DatabaseCtor
-    // load failure. The aggregator's existing skip-on-error handles the
-    // downstream readonly query.
+  } catch (error) {
+    primaryFailure = error;
   } finally {
-    try { db?.close(); } catch { /* ignore */ }
+    try {
+      db?.close();
+    } catch (error) {
+      closeFailure = error;
+    }
   }
+  if (!closeFailure) return;
+  if (primaryFailure) {
+    throw new AggregateError(
+      [primaryFailure, closeFailure],
+      primaryFailure instanceof Error ? primaryFailure.message : "Session-events migration and cleanup failed",
+    );
+  }
+  throw closeFailure;
 }
 
 // ─────────────────────────────────────────────────────────

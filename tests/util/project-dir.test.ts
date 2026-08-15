@@ -65,18 +65,14 @@ describe("isPluginInstallPath", () => {
   it("matches macOS / Linux plugin cache paths", () => {
     expect(isPluginInstallPath("/Users/x/.claude/plugins/cache/context-mode/context-mode/1.0.112")).toBe(true);
     expect(isPluginInstallPath("/home/x/.claude/plugins/cache/foo/foo/1.0.0")).toBe(true);
-    expect(isPluginInstallPath("/Users/x/.codex/plugins/cache/context-mode/context-mode/1.0.151")).toBe(true);
-    expect(isPluginInstallPath("/home/x/.codex/plugins/cache/foo/foo/1.0.0")).toBe(true);
   });
 
   it("matches plugin marketplace paths", () => {
     expect(isPluginInstallPath("/Users/x/.claude/plugins/marketplaces/context-mode")).toBe(true);
-    expect(isPluginInstallPath("/Users/x/.codex/plugins/marketplaces/context-mode")).toBe(true);
   });
 
   it("matches Windows plugin cache paths (backslash + drive letter)", () => {
     expect(isPluginInstallPath("C:\\Users\\x\\.claude\\plugins\\cache\\foo\\foo\\1.0.0")).toBe(true);
-    expect(isPluginInstallPath("C:\\Users\\x\\.codex\\plugins\\cache\\foo\\foo\\1.0.0")).toBe(true);
   });
 
   it("returns false for ordinary project paths", () => {
@@ -102,7 +98,7 @@ describe("resolveProjectDir", () => {
     const result = resolveProjectDir({
       env: {
         CLAUDE_PROJECT_DIR: "/Users/x/proj",
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0", // poisoned
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0", // poisoned
       },
       cwd: "/some/cwd",
       pwd: undefined,
@@ -114,24 +110,12 @@ describe("resolveProjectDir", () => {
     const result = resolveProjectDir({
       env: {
         CLAUDE_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
       },
       cwd: "/Users/x/.claude/plugins/cache/foo/foo/1.0.0",
       pwd: "/Users/x/Server/realproj",
     });
     expect(result).toBe("/Users/x/Server/realproj"); // PWD wins, skipping poisoned env + plugin cwd
-  });
-
-  it("rejects Codex plugin path env vars and falls through to the next source", () => {
-    const result = resolveProjectDir({
-      env: {
-        CLAUDE_PROJECT_DIR: "/Users/x/.codex/plugins/cache/context-mode/context-mode/1.0.151",
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/.codex/plugins/cache/context-mode/context-mode/1.0.151",
-      },
-      cwd: "/Users/x/.codex/plugins/cache/context-mode/context-mode/1.0.151",
-      pwd: "/Users/x/Work/Dev/ucw",
-    });
-    expect(result).toBe("/Users/x/Work/Dev/ucw");
   });
 
   it("uses cwd as last resort when env + PWD are missing or all poisoned", () => {
@@ -240,7 +224,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
     expect(result).toBe("/Users/x/own-qwen-project");
   });
 
-  it("strictPlatform=zed (no workspace var) falls through CONTEXT_MODE_PROJECT_DIR > pwd > cwd", () => {
+  it("strictPlatform=zed (no workspace var) falls through QUIET_CONTEXT_PROJECT_DIR > pwd > cwd", () => {
     const result = resolveProjectDir({
       env: {
         // Foreign workspace vars leaked everywhere — none must win.
@@ -252,7 +236,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
         OPENCODE_PROJECT_DIR: "/leak/opencode",
         CURSOR_CWD: "/leak/cursor",
         // Universal escape hatch.
-        CONTEXT_MODE_PROJECT_DIR: "/Users/x/escape",
+        QUIET_CONTEXT_PROJECT_DIR: "/Users/x/escape",
       },
       cwd: "/some/cwd",
       pwd: undefined,
@@ -264,7 +248,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
   it("non-strict mode preserves the EXACT legacy candidate order (semver lock)", () => {
     // Today's literal order from src/util/project-dir.ts:138-153:
     //   CLAUDE_PROJECT_DIR > GEMINI_PROJECT_DIR > VSCODE_CWD > OPENCODE_PROJECT_DIR
-    //   > PI_PROJECT_DIR > IDEA_INITIAL_DIRECTORY > CURSOR_CWD > CONTEXT_MODE_PROJECT_DIR
+    //   > PI_PROJECT_DIR > IDEA_INITIAL_DIRECTORY > CURSOR_CWD > QUIET_CONTEXT_PROJECT_DIR
     const env = {
       CLAUDE_PROJECT_DIR: "/p1",
       GEMINI_PROJECT_DIR: "/p2",
@@ -273,7 +257,7 @@ describe("resolveProjectDir — strictPlatform algorithmic mode (issue #545)", (
       PI_PROJECT_DIR: "/p5",
       IDEA_INITIAL_DIRECTORY: "/p6",
       CURSOR_CWD: "/p7",
-      CONTEXT_MODE_PROJECT_DIR: "/p8",
+      QUIET_CONTEXT_PROJECT_DIR: "/p8",
     };
     // First wins.
     expect(resolveProjectDir({ env, cwd: "/x", pwd: undefined })).toBe("/p1");

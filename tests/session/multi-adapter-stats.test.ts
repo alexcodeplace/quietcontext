@@ -13,7 +13,7 @@
  * Cited code:
  *   src/session/analytics.ts:592-731  — current getLifetimeStats (single-dir)
  *   src/session/analytics.ts:887-989  — current getRealBytesStats (single-dir)
- *   src/adapters/detect.ts:92-111     — getSessionDirSegments map (17 platforms)
+ *   src/adapters/detect.ts:92-111     — getSessionDirSegments map (15 platforms)
  *
  * Filter (decided in /diagnose conversation, B3a PRD):
  *   real = eventCount >= 100
@@ -97,16 +97,14 @@ function seed(
 // ─────────────────────────────────────────────────────────
 
 describe("Slice 2.1 — enumerateAdapterDirs()", () => {
-  test("returns one entry for each of the 17 known adapters", () => {
+  test("returns one entry for each of the 15 known adapters", () => {
     const dirs = enumerateAdapterDirs({ home: "/HOME" });
     const names = dirs.map((d) => d.name).sort();
     expect(names).toEqual(
       [
         "antigravity",
-        "antigravity-cli",
         "claude-code",
         "codex",
-        "copilot-cli",
         "cursor",
         "gemini-cli",
         "jetbrains-copilot",
@@ -157,7 +155,7 @@ describe("Slice 2.1 — enumerateAdapterDirs()", () => {
 
   test("defaults to os.homedir() when no override passed", () => {
     const dirs = enumerateAdapterDirs();
-    expect(dirs.length).toBe(17);
+    expect(dirs.length).toBe(15);
     const expectedSuffix = sep + join("context-mode", "sessions");
     expect(dirs.every((d) => d.sessionsDir.includes(expectedSuffix))).toBe(true);
   });

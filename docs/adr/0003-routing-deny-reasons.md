@@ -18,8 +18,8 @@ network / security restriction, causing the agent to capitulate to
 training data instead of using the redirected tool.
 
 The intent of the routing layer is to **redirect** the agent to a
-context-efficient alternative (`ctx_fetch_and_index` for WebFetch,
-`ctx_execute` for large-output Bash). It is NOT a security gate, and
+context-efficient alternative (`fetch-index` for WebFetch,
+`execute` for large-output Bash). It is NOT a security gate, and
 its denial text MUST NOT read like one.
 
 There is a real, separate set of denials in `routing.mjs` that ARE
@@ -49,7 +49,7 @@ efficiency reasons.
   `for context-window efficiency` rationale prescription also tried to
   deliver before the 2026-05-24 second amendment).
 - **MUST specify**: the alternative tool to use, by name, as an
-  imperative call (e.g. `Call ctx_fetch_and_index(url, source) now`).
+  imperative call (e.g. `Call fetch-index(url, source) now`).
 - **MUST end with**: a positive imperative retry hint —
   `"Retry the same call on a transient DNS error (EAI_AGAIN,
   ETIMEDOUT, ENETUNREACH)"`.
@@ -135,7 +135,7 @@ MUST NOT contain `"Do NOT retry"`, MUST NOT contain
   `hooks/core/routing.mjs:804` and adds the `EAI_AGAIN | ETIMEDOUT |
   ETIMEOUT | ENETUNREACH | EPERM` transient-DNS retry hint to both
   `routing.mjs` (WebFetch denial) and `src/server.ts:2783-2795`
-  (`ctx_fetch_and_index` subprocess fetch failure) so the two surfaces
+  (`fetch-index` subprocess fetch failure) so the two surfaces
   speak with one voice.
 - Existing `routing.mjs` deny reasons audited for CASE A / CASE B
   classification:

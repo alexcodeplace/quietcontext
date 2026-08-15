@@ -111,11 +111,11 @@ function resolveSessionDir() {
     resolveSessionStorageDir(() => resolveDefaultSessionDir({
       configDir: ".claude",
       configDirEnv: "CLAUDE_CONFIG_DIR",
-      legacySessionDirEnv: "CONTEXT_MODE_SESSION_DIR",
+      legacySessionDirEnv: "QUIET_CONTEXT_SESSION_DIR",
       onLegacySessionDir: () => {
         warnOnce(
           "legacy-session-dir",
-          "CONTEXT_MODE_SESSION_DIR is deprecated; set CONTEXT_MODE_DIR to the parent context-mode root.",
+          "QUIET_CONTEXT_SESSION_DIR is deprecated; set QUIET_CONTEXT_DIR to the parent context-mode root.",
         );
       },
     })),

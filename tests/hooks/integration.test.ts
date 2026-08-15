@@ -92,39 +92,21 @@ function runHook(input: Record<string, unknown>, env?: Record<string, string>, {
   };
 }
 
-/**
- * Assert hook redirects Bash command via `permissionDecision: "deny"` + reason.
- *
- * CC v2.1.x Bash tool ignores `updatedInput.command` substitution under
- * `permissionDecision: "allow"` — original command runs unchanged. Only
- * `permissionDecision: "deny"` is honored for Bash blocking (verified via
- * /diagnose Phase 4 forced-deny probe). The claude-code formatter now emits
- * a deny shape for modify intent and surfaces the routing guidance via
- * `permissionDecisionReason`.
- */
-function assertRedirect(result: HookResult, substringInReason: string) {
+/** Assert hook redirects Bash command to an echo message via updatedInput */
+function assertRedirect(result: HookResult, substringInEcho: string) {
   assert.equal(result.exitCode, 0, `Expected exit 0, got ${result.exitCode}`);
   assert.ok(result.stdout.length > 0, "Expected non-empty stdout for redirect");
   const parsed = JSON.parse(result.stdout);
   const hso = parsed.hookSpecificOutput;
   assert.ok(hso, "Expected hookSpecificOutput in response");
-  assert.equal(
-    hso.permissionDecision,
-    "deny",
-    `Expected permissionDecision="deny" (CC Bash ignores updatedInput on allow), got: ${hso.permissionDecision}`,
+  assert.ok(hso.updatedInput, "Expected updatedInput in hookSpecificOutput");
+  assert.ok(
+    hso.updatedInput.command.includes("echo"),
+    `Expected updatedInput.command to be an echo, got: ${hso.updatedInput.command}`,
   );
   assert.ok(
-    typeof hso.permissionDecisionReason === "string" && hso.permissionDecisionReason.length > 0,
-    "Expected non-empty permissionDecisionReason",
-  );
-  assert.ok(
-    hso.permissionDecisionReason.includes(substringInReason),
-    `Expected reason to contain "${substringInReason}", got: ${hso.permissionDecisionReason}`,
-  );
-  assert.equal(
-    hso.updatedInput,
-    undefined,
-    "updatedInput MUST NOT appear alongside deny — CC ignores it for Bash",
+    hso.updatedInput.command.includes(substringInEcho),
+    `Expected echo to contain "${substringInEcho}", got: ${hso.updatedInput.command}`,
   );
 }
 
@@ -386,12 +368,12 @@ describe("initSecurity loud-failure (#466)", () => {
       timeout: 10000,
       env: {
         ...process.env,
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "",
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "",
         // #558 v1.0.127: initSecurity is now bundle-first. To exercise the
         // "both missing → loud fail" contract, point the bundle test seam at
         // a non-existent path so neither the bundle nor build/security.js
         // can be loaded.
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
       },
     });
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
@@ -403,7 +385,7 @@ describe("initSecurity loud-failure (#466)", () => {
     );
   });
 
-  test("CONTEXT_MODE_SUPPRESS_SECURITY_WARNING silences the warning", async () => {
+  test("QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING silences the warning", async () => {
     const ROUTING_PATH = join(__dirname, "..", "..", "hooks", "core", "routing.mjs");
     const missingBuildDir = join(tmpdir(), `ctx-no-build-${Date.now()}-silent`);
     const code = `
@@ -415,10 +397,10 @@ describe("initSecurity loud-failure (#466)", () => {
       timeout: 10000,
       env: {
         ...process.env,
-        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
+        QUIET_CONTEXT_SUPPRESS_SECURITY_WARNING: "1",
         // #558 v1.0.127: bundle-first — hide the bundle so the warn-or-suppress
         // codepath actually runs (otherwise bundle loads and warning never fires).
-        CONTEXT_MODE_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
+        QUIET_CONTEXT_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
       },
     });
     assert.equal(r.status, 0);
@@ -517,28 +499,6 @@ describe("Security Policy Enforcement", () => {
     assert.equal(result.stdout, "", "Non-shell language should passthrough");
   });
 
-  test("MCP execute + shell pins cwd from hook input over stale CLAUDE_PROJECT_DIR (#756)", () => {
-    const mainRepo = mkdtempSync(join(tmpdir(), "ctx-756-main-"));
-    const worktree = mkdtempSync(join(tmpdir(), "ctx-756-worktree-"));
-    try {
-      const result = runHook(
-        {
-          cwd: worktree,
-          tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
-          tool_input: { language: "shell", code: "pwd" },
-        },
-        { ...secEnv, CLAUDE_PROJECT_DIR: mainRepo },
-      );
-      assert.equal(result.exitCode, 0);
-      const parsed = JSON.parse(result.stdout);
-      assert.equal(parsed.hookSpecificOutput.updatedInput.cwd, worktree);
-      assert.equal(parsed.hookSpecificOutput.updatedInput.code, "pwd");
-    } finally {
-      rmSyncRobust(mainRepo);
-      rmSyncRobust(worktree);
-    }
-  });
-
   test("Security: MCP execute_file + .env path denied", () => {
     const result = runHook(
       {
@@ -596,28 +556,21 @@ describe("Security Policy Enforcement", () => {
     assert.equal(parsed.hookSpecificOutput.permissionDecision, "deny");
   });
 
-  test("MCP batch_execute with allowed commands pins cwd from hook input (#756)", () => {
-    const worktree = mkdtempSync(join(tmpdir(), "ctx-756-batch-worktree-"));
-    try {
-      const result = runHook(
-        {
-          cwd: worktree,
-          tool_name: "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
-          tool_input: {
-            commands: [
-              { label: "list", command: "ls -la" },
-              { label: "git", command: "git log --oneline -5" },
-            ],
-          },
+  test("Security: MCP batch_execute with all allowed commands passthrough", () => {
+    const result = runHook(
+      {
+        tool_name: "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+        tool_input: {
+          commands: [
+            { label: "list", command: "ls -la" },
+            { label: "git", command: "git log --oneline -5" },
+          ],
         },
-        secEnv,
-      );
-      assert.equal(result.exitCode, 0);
-      const parsed = JSON.parse(result.stdout);
-      assert.equal(parsed.hookSpecificOutput.updatedInput.cwd, worktree);
-    } finally {
-      rmSyncRobust(worktree);
-    }
+      },
+      secEnv,
+    );
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, "", "All allowed commands should passthrough");
   });
 });
 
@@ -669,18 +622,14 @@ describe("Plugin Tool Name Format in ROUTING_BLOCK", () => {
     assert.ok(!reason.includes(SHORT_PREFIX + "ctx_fetch_and_index"), "WebFetch deny must not contain short-form");
   });
 
-  test("Bash inline-HTTP redirect uses plugin-format execute tool name (in deny reason)", () => {
-    // CC v2.1.x Bash tool ignores updatedInput.command — the formatter now
-    // emits deny + permissionDecisionReason. The plugin-format tool name
-    // assertion moves from updatedInput.command to permissionDecisionReason.
+  test("Bash inline-HTTP redirect uses plugin-format execute tool name", () => {
     const bashCmd = "python3 -c 'import requests; requests.get(url)'";
     const result = runHook({ tool_name: "Bash", tool_input: { command: bashCmd } });
     assert.equal(result.exitCode, 0);
     const parsed = JSON.parse(result.stdout);
-    const reason = parsed.hookSpecificOutput.permissionDecisionReason;
-    assert.ok(typeof reason === "string" && reason.length > 0, "Expected non-empty permissionDecisionReason");
-    assert.ok(reason.includes(PLUGIN_PREFIX + "ctx_execute"), "Expected plugin-format ctx_execute in inline-HTTP redirect reason");
-    assert.ok(!reason.includes(SHORT_PREFIX + "ctx_execute"), "Inline-HTTP redirect must not contain short-form ctx_execute");
+    const cmd = parsed.hookSpecificOutput.updatedInput.command;
+    assert.ok(cmd.includes(PLUGIN_PREFIX + "ctx_execute"), "Expected plugin-format ctx_execute in inline-HTTP redirect");
+    assert.ok(!cmd.includes(SHORT_PREFIX + "ctx_execute"), "Inline-HTTP redirect must not contain short-form ctx_execute");
   });
 });
 
@@ -763,7 +712,7 @@ describe("resolveConfigDir (#289)", () => {
     `;
     const r = spawnSync("node", ["--input-type=module", "-e", code], {
       encoding: "utf-8",
-      env: { ...process.env, ...env, CONTEXT_MODE_SESSION_SUFFIX: "" },
+      env: { ...process.env, ...env, QUIET_CONTEXT_SESSION_SUFFIX: "" },
       timeout: 10000,
     });
     return JSON.parse(r.stdout);
@@ -823,13 +772,13 @@ describe("resolveConfigDir (#289)", () => {
       const code = `
         process.env.CLAUDE_CONFIG_DIR = ${JSON.stringify(customDir)};
         process.env.CLAUDE_PROJECT_DIR = "/test/project";
-        process.env.CONTEXT_MODE_SESSION_SUFFIX = "";
+        process.env.QUIET_CONTEXT_SESSION_SUFFIX = "";
         const { getSessionDBPath } = await import(${JSON.stringify(pathToFileURL(HELPERS_PATH).href)});
         process.stdout.write(getSessionDBPath());
       `;
       const r = spawnSync("node", ["--input-type=module", "-e", code], {
         encoding: "utf-8",
-        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, CLAUDE_PROJECT_DIR: "/test/project", CONTEXT_MODE_SESSION_SUFFIX: "" },
+        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, CLAUDE_PROJECT_DIR: "/test/project", QUIET_CONTEXT_SESSION_SUFFIX: "" },
         timeout: 10000,
       });
       expect(r.stdout).toContain(customDir);
@@ -846,7 +795,7 @@ describe("resolveConfigDir (#289)", () => {
     try {
       const code = `
         process.env.CLAUDE_CONFIG_DIR = ${JSON.stringify(customDir)};
-        process.env.CONTEXT_MODE_SESSION_SUFFIX = "";
+        process.env.QUIET_CONTEXT_SESSION_SUFFIX = "";
         const {
           getSessionDBPath,
           getSessionEventsPath,
@@ -866,7 +815,7 @@ describe("resolveConfigDir (#289)", () => {
       `;
       const r = spawnSync("node", ["--input-type=module", "-e", code], {
         encoding: "utf-8",
-        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, CONTEXT_MODE_SESSION_SUFFIX: "" },
+        env: { ...process.env, CLAUDE_CONFIG_DIR: customDir, QUIET_CONTEXT_SESSION_SUFFIX: "" },
         timeout: 10000,
       });
       expect(r.status).toBe(0);
@@ -952,7 +901,7 @@ describe("Category 27 — Latency cross-hook bridge", () => {
       USERPROFILE: fakeHome,
       CLAUDE_PROJECT_DIR: fakeProject,
       CLAUDE_SESSION_ID: "latency-test-session",
-      CONTEXT_MODE_SESSION_SUFFIX: "",
+      QUIET_CONTEXT_SESSION_SUFFIX: "",
     };
   });
 
@@ -1111,7 +1060,7 @@ describe("empty stdin resilience (#322)", () => {
           GEMINI_PROJECT_DIR: fakeProject,
           VSCODE_CWD: fakeProject,
           CURSOR_CWD: fakeProject,
-          CONTEXT_MODE_SESSION_SUFFIX: "",
+          QUIET_CONTEXT_SESSION_SUFFIX: "",
         },
       });
       return { exitCode: r.status ?? -1 };

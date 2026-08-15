@@ -7,7 +7,7 @@
  *   context-mode doctor                       → Diagnose runtime issues, hooks, FTS5, version
  *   context-mode upgrade                      → Fix hooks, permissions, and settings
  *   context-mode hook <platform> <event>      → Dispatch a hook script (used by platform hook configs)
- *   CONTEXT_MODE_DIR=/abs/path context-mode   → Override sessions/content storage root
+ *   QUIET_CONTEXT_DIR=/abs/path context-mode   → Override sessions/content storage root
  *     Empty/whitespace is ignored; non-empty values must be absolute.
  *
  * Platform auto-detection: CLI detects which platform is running
@@ -219,7 +219,7 @@ function printHelp(): void {
     "  --type <code|prose>                  Filter by content type",
     "",
     "Environment:",
-    "  CONTEXT_MODE_DIR=/absolute/path      Override sessions/content storage root; empty is ignored, non-empty must be absolute",
+    "  QUIET_CONTEXT_DIR=/absolute/path      Override sessions/content storage root; empty is ignored, non-empty must be absolute",
   ].join("\n"));
 }
 
@@ -1956,7 +1956,7 @@ async function upgrade(opts?: { platform?: string }) {
       stdio: "inherit",
       timeout: 30000,
       cwd: pluginRoot,
-      env: { ...process.env, CONTEXT_MODE_PLATFORM: detection.platform },
+      env: { ...process.env, QUIET_CONTEXT_PLATFORM: detection.platform },
     });
   } catch {
     p.log.warn(

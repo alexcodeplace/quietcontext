@@ -29,11 +29,11 @@ const SENTINEL_FRESH_MS = 90_000;
 
 /**
  * Resolve the temp root — hardcoded /tmp on Unix to avoid TMPDIR mismatch.
- * Tests may override via CONTEXT_MODE_MCP_SENTINEL_DIR to isolate scan from
+ * Tests may override via QUIET_CONTEXT_MCP_SENTINEL_DIR to isolate scan from
  * leftover sentinels in the real /tmp.
  */
 export function sentinelDir() {
-  const override = process.env.CONTEXT_MODE_MCP_SENTINEL_DIR;
+  const override = process.env.QUIET_CONTEXT_MCP_SENTINEL_DIR;
   if (override && override.length > 0) return override;
   return process.platform === "win32" ? tmpdir() : "/tmp";
 }
