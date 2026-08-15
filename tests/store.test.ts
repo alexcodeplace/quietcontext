@@ -1209,6 +1209,145 @@ describe("Max Chunk Size", () => {
     store.close();
   });
 
+  test("splits a single oversized markdown paragraph to the byte cap", () => {
+    const store = createStore();
+    const content = `# One Paragraph\n\n${"oversized ".repeat(20_000)}`;
+
+    const result = store.index({ content, source: "single-oversized-paragraph" });
+    const chunks = store.getChunksBySource(result.sourceId);
+
+    assert.ok(chunks.length > 1);
+    for (const chunk of chunks) {
+      assert.ok(
+        Buffer.byteLength(chunk.content) <= 4096,
+        `Chunk exceeded byte cap: ${Buffer.byteLength(chunk.content)}`,
+      );
+    }
+    store.cleanup();
+  });
+
+  test("splits multi-megabyte lines in one forward pass", () => {
+    const store = createStore();
+    const content = "x".repeat(2 * 1024 * 1024);
+
+    const result = store.indexPlainText(content, "linear-long-line");
+    const chunks = store.getChunksBySource(result.sourceId);
+
+    assert.equal(chunks.length, 512);
+    for (const chunk of chunks) {
+      assert.ok(Buffer.byteLength(chunk.content) <= 4096);
+    }
+    store.cleanup();
+  });
+
+  test("rejects source content above the admission limit before indexing", () => {
+    const store = createStore();
+    const content = "x".repeat(8 * 1024 * 1024 + 1);
+
+    expect(() => store.indexPlainText(content, "oversized-source")).toThrow(
+      "Source exceeds 8388608-byte indexing limit",
+    );
+    assert.equal(store.getStats().sources, 0);
+    store.cleanup();
+  });
+
+  test("caps oversized JSON values and array items", () => {
+    const store = createStore();
+    const payload = JSON.stringify({ items: [{ id: 1, value: "x".repeat(20_000) }] });
+
+    const result = store.indexJSON(payload, "oversized-json");
+    const chunks = store.getChunksBySource(result.sourceId);
+
+    assert.ok(chunks.length > 1);
+    for (const chunk of chunks) {
+      assert.ok(Buffer.byteLength(chunk.content) <= 4096);
+    }
+    store.cleanup();
+  });
+
+  test("caps chunk titles independently of content", () => {
+    const store = createStore();
+    const heading = "界".repeat(300_000);
+
+    const result = store.index({
+      content: `# ${heading}\n\nbody`,
+      source: "oversized-title",
+    });
+    const chunks = store.getChunksBySource(result.sourceId);
+
+    assert.ok(chunks.length > 1);
+    for (const chunk of chunks) {
+      assert.ok(Buffer.byteLength(chunk.title) <= 256);
+      assert.ok(Buffer.byteLength(chunk.content) <= 4096);
+    }
+    store.cleanup();
+  });
+
+  test("supports tiny caps only when each code point fits", () => {
+    const store = createStore();
+
+    const result = store.indexPlainText("ascii", "one-byte-cap", 20, undefined, 1);
+    for (const chunk of store.getChunksBySource(result.sourceId)) {
+      assert.ok(Buffer.byteLength(chunk.content) <= 1);
+    }
+    expect(() =>
+      store.indexPlainText("😀", "invalid-byte-cap", 20, undefined, 1)
+    ).toThrow("maxChunkBytes cannot fit a 4-byte UTF-8 code point");
+    store.cleanup();
+  });
+
+  test("rejects sources that would exceed the chunk-count budget", () => {
+    const store = createStore();
+    const content = "😀".repeat(4097);
+
+    expect(() =>
+      store.indexPlainText(content, "excessive-chunks", 20, undefined, 4)
+    ).toThrow("Source exceeds 4096-chunk indexing limit");
+    assert.equal(store.getStats().sources, 0);
+    store.cleanup();
+  });
+
+  test("enforces the chunk budget across blank-line sections", () => {
+    const store = createStore();
+    const content = Array.from({ length: 200 }, () => "x".repeat(4996)).join("\n\n");
+
+    expect(() =>
+      store.indexPlainText(content, "section-chunk-budget", 20, undefined, 4)
+    ).toThrow("Source exceeds 4096-chunk indexing limit");
+    assert.equal(store.getStats().sources, 0);
+    store.cleanup();
+  });
+
+  test("rewraps oversized fenced code blocks within the byte cap", () => {
+    const store = createStore();
+    const content = `# Code\n\n\`\`\`typescript\n${"const value = 1;\n".repeat(1000)}\`\`\``;
+
+    const result = store.index({ content, source: "oversized-fenced-code" });
+    const chunks = store.getChunksBySource(result.sourceId);
+    const codeChunks = chunks.filter((chunk) => chunk.content.startsWith("```typescript"));
+
+    assert.ok(codeChunks.length > 1);
+    for (const chunk of codeChunks) {
+      assert.ok(chunk.content.endsWith("```"));
+      assert.ok(Buffer.byteLength(chunk.content) <= 4096);
+    }
+    store.cleanup();
+  });
+
+  test("indexes large compact JSON arrays with linear batching work", () => {
+    const store = createStore();
+    const payload = JSON.stringify(Array.from({ length: 200_000 }, (_, i) => i % 10));
+
+    const result = store.indexJSON(payload, "compact-json-array");
+    const chunks = store.getChunksBySource(result.sourceId);
+
+    assert.ok(chunks.length > 1);
+    for (const chunk of chunks) {
+      assert.ok(Buffer.byteLength(chunk.content) <= 4096);
+    }
+    store.cleanup();
+  });
+
   test("does not split chunks already under maxChunkBytes", () => {
     const store = createStore();
     const content = `# Small Section\n\nJust a few lines of text.\n\nAnother paragraph.`;
@@ -1771,39 +1910,22 @@ describe("mmap_size pragma", () => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// FTS5 Periodic Optimization
+// FTS5 lifecycle
 // ═══════════════════════════════════════════════════════════
 
-describe("FTS5 periodic optimize", () => {
-  test("search works correctly after OPTIMIZE_EVERY inserts", () => {
-    const dbPath = join(tmpdir(), `ctx-optimize-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+describe("FTS5 lifecycle", () => {
+  test("search and close work after many inserts", () => {
+    const dbPath = join(tmpdir(), `ctx-many-inserts-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     const store = new ContentStore(dbPath);
 
-    for (let i = 0; i < ContentStore.OPTIMIZE_EVERY + 5; i++) {
-      store.indexPlainText(`Document number ${i} about testing optimization`, `source-${i}`);
+    for (let i = 0; i < 55; i++) {
+      store.indexPlainText(`Document number ${i} about bounded indexing`, `source-${i}`);
     }
 
-    const results = store.search("testing optimization");
+    const results = store.search("bounded indexing");
     expect(results.length).toBeGreaterThan(0);
-    expect(results[0].content).toContain("testing optimization");
-
-    store.cleanup();
-  });
-
-  test("close() does not throw even after many inserts", () => {
-    const dbPath = join(tmpdir(), `ctx-optimize-close-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const store = new ContentStore(dbPath);
-
-    for (let i = 0; i < 10; i++) {
-      store.indexPlainText(`Content ${i}`, `src-${i}`);
-    }
-
+    expect(results[0].content).toContain("bounded indexing");
     expect(() => store.close()).not.toThrow();
-  });
-
-  test("OPTIMIZE_EVERY is a reasonable value", () => {
-    expect(ContentStore.OPTIMIZE_EVERY).toBeGreaterThanOrEqual(20);
-    expect(ContentStore.OPTIMIZE_EVERY).toBeLessThanOrEqual(200);
   });
 });
 
