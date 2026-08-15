@@ -387,6 +387,22 @@ print(f"most common: {c.most_common(2)}")
   });
 });
 
+describe("Child CPU priority (item 5 — execute-child CPU bounding)", () => {
+  test.skipIf(process.platform === "win32")(
+    "spawned shell child runs at lowered (nice ~10) OS scheduling priority",
+    async () => {
+      const r = await executor.execute({
+        language: "shell",
+        code: "ps -o ni= -p $$",
+      });
+      assert.equal(r.exitCode, 0);
+      const niceValue = Number(r.stdout.trim());
+      assert.ok(Number.isFinite(niceValue), `expected a numeric nice value, got: ${JSON.stringify(r.stdout)}`);
+      assert.ok(niceValue >= 10, `expected nice >= 10 (lowered priority), got ${niceValue}`);
+    },
+  );
+});
+
 describe("Shell Execution", () => {
   test("Shell: hello world", async () => {
     const r = await executor.execute({

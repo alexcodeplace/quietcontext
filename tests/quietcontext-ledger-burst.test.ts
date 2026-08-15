@@ -30,6 +30,25 @@ function seedSessionDb(dataDir: string, projectDir: string): string {
   return dbPath;
 }
 
+/**
+ * Poll `check` until it returns a truthy value or `timeoutMs` elapses.
+ * The ledger writes land via fire-and-forget setImmediate() in a separate
+ * process — a fixed sleep is a race under load; poll instead.
+ */
+async function waitFor<T>(check: () => T | undefined | null, timeoutMs = 5000, intervalMs = 25): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const result = check();
+      if (result) return result;
+    } catch {
+      // SQLITE_BUSY while the server process is mid-write — retry.
+    }
+    if (Date.now() >= deadline) throw new Error("waitFor: timed out");
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 const ROOT = resolve(import.meta.dirname, "..");
 
 function readResponse(child: ChildProcessWithoutNullStreams): Promise<Record<string, any>> {
@@ -120,25 +139,24 @@ describe("honest savings ledger + burst feedback (items 1+2)", () => {
       const third = await callExecute(4);
       expect(third).not.toContain(BURST_HINT_SUBSTRING);
 
-      // Let the fire-and-forget setImmediate() ledger writes land before
-      // we read the DB from a second process.
-      await new Promise((r) => setTimeout(r, 300));
-
       const Database = loadDatabase();
-      const db = new Database(dbPath, { readonly: true });
-      try {
-        const rows = db.prepare(
-          "SELECT tool, bytes_returned, counterfactual_bytes FROM tool_ledger WHERE tool = 'execute'",
-        ).all() as Array<{ tool: string; bytes_returned: number; counterfactual_bytes: number }>;
-        expect(rows.length).toBe(3);
-        for (const row of rows) {
-          expect(row.bytes_returned).toBeGreaterThan(0);
-          // raw output here is tiny (well under the 32KB truncation baseline),
-          // so counterfactual must equal the raw size, not the capped 2KB.
-          expect(row.counterfactual_bytes).toBe(row.bytes_returned);
+      const rows = await waitFor(() => {
+        const db = new Database(dbPath, { readonly: true });
+        try {
+          const found = db.prepare(
+            "SELECT tool, bytes_returned, counterfactual_bytes FROM tool_ledger WHERE tool = 'execute'",
+          ).all() as Array<{ tool: string; bytes_returned: number; counterfactual_bytes: number }>;
+          return found.length >= 3 ? found : undefined;
+        } finally {
+          db.close();
         }
-      } finally {
-        db.close();
+      });
+      expect(rows.length).toBe(3);
+      for (const row of rows) {
+        expect(row.bytes_returned).toBeGreaterThan(0);
+        // raw output here is tiny (well under the 32KB truncation baseline),
+        // so counterfactual must equal the raw size, not the capped 2KB.
+        expect(row.counterfactual_bytes).toBe(row.bytes_returned);
       }
     } finally {
       child.kill();
@@ -191,20 +209,20 @@ describe("honest savings ledger + burst feedback (items 1+2)", () => {
       });
       await readResponse(child);
 
-      await new Promise((r) => setTimeout(r, 300));
-
       const Database = loadDatabase();
-      const db = new Database(dbPath, { readonly: true });
-      try {
-        const row = db.prepare(
-          "SELECT bytes_returned, counterfactual_bytes FROM tool_ledger WHERE tool = 'execute' ORDER BY id DESC LIMIT 1",
-        ).get() as { bytes_returned: number; counterfactual_bytes: number };
-        expect(row).toBeDefined();
-        expect(row.counterfactual_bytes).toBe(2 * 1024);
-        expect(row.bytes_returned).toBeLessThan(row.counterfactual_bytes);
-      } finally {
-        db.close();
-      }
+      const row = await waitFor(() => {
+        const db = new Database(dbPath, { readonly: true });
+        try {
+          return db.prepare(
+            "SELECT bytes_returned, counterfactual_bytes FROM tool_ledger WHERE tool = 'execute' ORDER BY id DESC LIMIT 1",
+          ).get() as { bytes_returned: number; counterfactual_bytes: number } | undefined;
+        } finally {
+          db.close();
+        }
+      });
+      expect(row).toBeDefined();
+      expect(row.counterfactual_bytes).toBe(2 * 1024);
+      expect(row.bytes_returned).toBeLessThan(row.counterfactual_bytes);
     } finally {
       child.kill();
       rmSync(dataDir, { recursive: true, force: true });

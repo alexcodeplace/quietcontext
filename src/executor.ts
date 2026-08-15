@@ -1,7 +1,7 @@
 import { spawn, execSync, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, setPriority as osSetPriority } from "node:os";
 import {
   detectRuntimes,
   buildCommand,
@@ -463,6 +463,18 @@ export class PolyglotExecutor {
         proc = spawn(fullCmd, [], { ...commonOpts, shell: true });
       } else {
         proc = spawn(spawnCmd, spawnArgs, { ...commonOpts, shell: false });
+      }
+
+      // Item 5 — a heavy execute/exec-file/batch child otherwise contends
+      // for CPU on equal footing with the host process's own tool-response
+      // handling, stalling unrelated cheap calls (measured, not event-loop
+      // blocking — a CPU-scheduling effect). Lower priority (nice ~10
+      // equivalent) so the OS scheduler favors the host under contention.
+      // Linux/macOS: os.setPriority(pid) needs no privileges to LOWER
+      // priority. Best-effort — a spawn that raced to exit already, or a
+      // sandbox where setpriority is denied, must never fail the call.
+      if (proc.pid) {
+        try { osSetPriority(proc.pid, 10); } catch { /* best-effort */ }
       }
 
       let timedOut = false;
