@@ -14,7 +14,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -110,7 +110,6 @@ beforeAll(async () => {
     QUIET_CONTEXT_DAEMON_TOKEN_FILE: tokenFile,
     QUIET_CONTEXT_DIR: join(scratch, "data"),
   });
-  const { readFileSync } = await import("node:fs");
   token = readFileSync(tokenFile, "utf8").trim();
 }, 30_000);
 

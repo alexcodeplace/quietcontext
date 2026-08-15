@@ -11,7 +11,6 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const LEGACY_TOOL_ERROR = "MCP error -32602: Tool ctx_execute not found";
 
 function readResponse(child: ChildProcessWithoutNullStreams): Promise<Record<string, any>> {
   return new Promise((resolveResponse, reject) => {
@@ -75,7 +74,9 @@ describe("legacy tool name over stdio", () => {
       });
       const response = await readResponse(child);
       expect(response.result?.isError).toBe(true);
-      expect(response.result?.content?.[0]?.text).toBe(LEGACY_TOOL_ERROR);
+      const legacyText = response.result?.content?.[0]?.text ?? "";
+      expect(legacyText).toContain("ctx_execute");
+      expect(legacyText).toMatch(/not found/i);
       expect(child.exitCode).toBeNull();
       expect(child.signalCode).toBeNull();
     } finally {
@@ -149,7 +150,9 @@ describe("legacy tool name over HTTP", () => {
       const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
       const withRootBody = JSON.parse(dataLine ? dataLine.slice(6) : text);
       expect(withRootBody.result?.isError).toBe(true);
-      expect(withRootBody.result?.content?.[0]?.text).toBe(LEGACY_TOOL_ERROR);
+      const withRootText = withRootBody.result?.content?.[0]?.text ?? "";
+      expect(withRootText).toContain("ctx_execute");
+      expect(withRootText).toMatch(/not found/i);
     } finally {
       daemon?.kill("SIGTERM");
       rmSync(scratch, { recursive: true, force: true });

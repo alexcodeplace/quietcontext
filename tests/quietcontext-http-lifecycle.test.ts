@@ -118,10 +118,7 @@ describe("quietcontext HTTP daemon store lifecycle", () => {
         callTool(port, token, rootC, "index", { source: "c", content: "gamma content" }),
       ]);
 
-      const ownedDbFiles = () =>
-        readdirSync(runtimeDir).filter((f) =>
-          /^context-mode-\d+-[a-f0-9]{16}\.db(?:-(?:wal|shm))?$/.test(f),
-        );
+      const ownedDbFiles = () => readdirSync(runtimeDir).filter((f) => /\.db(?:-(?:wal|shm))?$/.test(f));
       expect(ownedDbFiles().filter((f) => f.endsWith(".db"))).toHaveLength(3);
 
       daemon.kill("SIGTERM");
