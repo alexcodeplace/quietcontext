@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -83,6 +83,67 @@ function resultText(response: Record<string, any>): string {
   return response.result?.content?.[0]?.text ?? "";
 }
 
+const httpDaemons: ChildProcessWithoutNullStreams[] = [];
+const httpScratchDirs: string[] = [];
+
+interface HttpHarness {
+  port: number;
+  token: string;
+  root: string;
+}
+
+async function startHttpHarness(): Promise<HttpHarness> {
+  const scratch = mkdtempSync(join(tmpdir(), "quietcontext-budget-http-"));
+  httpScratchDirs.push(scratch);
+  const root = join(scratch, "project-a");
+  mkdirSync(root, { recursive: true });
+  const tokenFile = join(scratch, "daemon.token");
+  const port = await new Promise<number>((resolvePort, reject) => {
+    const daemon = spawn(process.execPath, [join(ROOT, "start-http.mjs")], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        QUIET_CONTEXT_DAEMON_PORT: "0",
+        QUIET_CONTEXT_DAEMON_TOKEN_FILE: tokenFile,
+        QUIET_CONTEXT_DIR: join(scratch, "data"),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }) as ChildProcessWithoutNullStreams;
+    httpDaemons.push(daemon);
+    let stderr = "";
+    const onData = (chunk: Buffer) => {
+      stderr += chunk.toString();
+      const m = /listening on http:\/\/127\.0\.0\.1:(\d+)\/mcp/.exec(stderr);
+      if (m) {
+        daemon.stderr.off("data", onData);
+        resolvePort(Number(m[1]));
+      }
+    };
+    daemon.stderr.on("data", onData);
+    daemon.once("exit", (code) => reject(new Error(`daemon exited early (${code}): ${stderr}`)));
+    daemon.once("error", reject);
+  });
+  const token = readFileSync(tokenFile, "utf8").trim();
+  return { port, token, root };
+}
+
+async function httpToolsList(harness: HttpHarness): Promise<Array<Record<string, unknown>>> {
+  const res = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${harness.token}`,
+      "x-quietcontext-root": harness.root,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+  });
+  const text = await res.text();
+  const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
+  const body = JSON.parse(dataLine ? dataLine.slice(6) : text);
+  return body.result.tools;
+}
+
 afterEach(async () => {
   for (const server of httpServers.splice(0)) {
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
@@ -90,6 +151,12 @@ afterEach(async () => {
   for (const harness of harnesses.splice(0)) {
     harness.child.kill();
     rmSync(harness.dataDir, { recursive: true, force: true });
+  }
+  for (const daemon of httpDaemons.splice(0)) {
+    daemon.kill("SIGTERM");
+  }
+  for (const dir of httpScratchDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -108,6 +175,29 @@ describe("QuietContext token budgets", () => {
       "search",
     ]);
     expect(Buffer.byteLength(JSON.stringify(tools))).toBeLessThanOrEqual(4 * 1024);
+  });
+
+  test("serialized tools/list stays within 4 KiB over HTTP and matches stdio byte-for-byte", async () => {
+    const stdioHarness = await startHarness();
+    const stdioResponse = await stdioHarness.call("tools/list", {});
+    const stdioTools = stdioResponse.result?.tools ?? [];
+
+    const httpHarness = await startHttpHarness();
+    const httpTools = await httpToolsList(httpHarness);
+
+    expect(httpTools.map((tool: { name: string }) => tool.name).sort()).toEqual([
+      "batch",
+      "exec-file",
+      "execute",
+      "fetch-index",
+      "index",
+      "search",
+    ]);
+    expect(Buffer.byteLength(JSON.stringify(httpTools))).toBeLessThanOrEqual(4 * 1024);
+    // Both transports register from the same REGISTERED_CTX_TOOLS list and
+    // run the same strict-client schema pass — their wire schemas must be
+    // byte-identical, not just each independently under budget.
+    expect(JSON.stringify(httpTools)).toBe(JSON.stringify(stdioTools));
   });
 
   test("exec returns output without submitted source code", async () => {

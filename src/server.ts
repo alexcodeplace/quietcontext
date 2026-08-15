@@ -956,7 +956,7 @@ const sessionStats = {
   sessionStart: Date.now(),
 };
 
-type ToolResult = {
+export type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
 };
@@ -1015,7 +1015,7 @@ function healCacheMidSession(): void {
   } catch { /* best effort */ }
 }
 
-function trackResponse(toolName: string, response: ToolResult): ToolResult {
+export function trackResponse(toolName: string, response: ToolResult): ToolResult {
   // #854: a response is activity too — refresh the bridge-child idle clock so a
   // chatty/streaming call keeps its server alive even between inbound frames.
   noteMcpActivity();
@@ -1225,145 +1225,16 @@ function persistStats(): void {
   }
 }
 
-// ==============================================================================
-// Security: server-side deny firewall
-// ==============================================================================
-
-/**
- * Check a shell command against Bash deny patterns.
- * Returns an error ToolResult if denied, or null if allowed.
- */
-function checkDenyPolicy(
-  command: string,
-  toolName: string,
-): ToolResult | null {
-  try {
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-    const result = evaluateCommandDenyOnly(command, policies);
-    if (result.decision === "deny") {
-      return trackResponse(toolName, {
-        content: [{
-          type: "text" as const,
-          text: `Command blocked by security policy: matches deny pattern ${result.matchedPattern}`,
-        }],
-        isError: true,
-      });
-    }
-  } catch {
-    // Security check failed — allow through (fail-open for server,
-    // hooks are the primary enforcement layer)
-  }
-  return null;
-}
-
-/**
- * Check non-shell code for shell-escape calls against deny patterns.
- */
-function checkNonShellDenyPolicy(
-  code: string,
-  language: string,
-  toolName: string,
-): ToolResult | null {
-  try {
-    const commands = extractShellCommands(code, language);
-    if (commands.length === 0) return null;
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-    for (const cmd of commands) {
-      const result = evaluateCommandDenyOnly(cmd, policies);
-      if (result.decision === "deny") {
-        return trackResponse(toolName, {
-          content: [{
-            type: "text" as const,
-            text: `Command blocked by security policy: embedded shell command "${cmd}" matches deny pattern ${result.matchedPattern}`,
-          }],
-          isError: true,
-        });
-      }
-    }
-  } catch {
-    // Fail-open
-  }
-  return null;
-}
-
-/**
- * Issue #852 — project-boundary containment for `ctx_execute_file`.
- *
- * The harness sandbox (Claude Code, etc.) cannot inspect MCP input params, so a
- * user approving a `ctx_execute_file` call cannot see that its `path` escapes
- * the workspace. This guard refuses a `path` that resolves outside the project
- * root (absolute escape, `../` traversal, or symlink-out), restoring the
- * boundary the host believes it is enforcing.
- *
- * Escape hatch — NO bespoke opt-out env. A deliberate out-of-project read is
- * expressed in the SAME host config the user already maintains: a
- * `permissions.allow` rule like `Read(/var/log/**)`. This reuses the exact
- * mechanism Claude Code uses to whitelist a path outside its sandbox, so the
- * grant lives in one place and stays meaningful instead of rotting into a
- * context-mode-only env flag nobody sets.
- *
- * Fail-open on resolver failure (consistent with the other deny checks): if the
- * project root cannot be resolved, containment evaluates as "inside" and the
- * path is allowed through rather than spuriously blocking legitimate work.
- */
-function checkProjectBoundary(
-  filePath: string,
-  toolName: string,
-): ToolResult | null {
-  try {
-    const projectDir = getProjectDir();
-    const allowGlobs = readToolPermissionPatterns("Read", "allow", projectDir);
-    const verdict = evaluateProjectContainment(filePath, projectDir, allowGlobs);
-    if (verdict.allowed) return null;
-    return trackResponse(toolName, {
-      content: [{
-        type: "text" as const,
-        text:
-          `File access blocked: "${filePath}" resolves outside the project root ` +
-          `(${projectDir}). context-mode confines ${toolName} to the workspace so it ` +
-          `cannot be used to bypass the host's sandbox/permission controls (issue #852). ` +
-          `To intentionally process a file outside the project, add a host allow rule, ` +
-          `e.g. "permissions": { "allow": ["Read(${filePath})"] } in your settings.`,
-      }],
-      isError: true,
-    });
-  } catch {
-    // Fail-open — resolver failure must not block legitimate in-project work.
-  }
-  return null;
-}
-
-/**
- * Check a file path against Read deny patterns.
- * Returns an error ToolResult if denied, or null if allowed.
- */
-function checkFilePathDenyPolicy(
-  filePath: string,
-  toolName: string,
-): ToolResult | null {
-  try {
-    const projectDir = getProjectDir();
-    const denyGlobs = readToolDenyPatterns("Read", projectDir);
-    const result = evaluateFilePath(
-      filePath,
-      denyGlobs,
-      process.platform === "win32",
-      projectDir,
-    );
-    if (result.denied) {
-      return trackResponse(toolName, {
-        content: [{
-          type: "text" as const,
-          text: `File access blocked by security policy: path matches Read deny pattern ${result.matchedPattern}`,
-        }],
-        isError: true,
-      });
-    }
-  } catch {
-    // Fail-open
-  }
-  return null;
-}
+// Security: server-side deny firewall — moved to src/server/deny-policy.ts
+// (checkDenyPolicy, checkNonShellDenyPolicy, checkProjectBoundary,
+// checkFilePathDenyPolicy). Not part of the public surface; imported here
+// only for use by the tool bodies below.
+import {
+  checkDenyPolicy,
+  checkNonShellDenyPolicy,
+  checkProjectBoundary,
+  checkFilePathDenyPolicy,
+} from "./server/deny-policy.js";
 
 // Build description dynamically based on detected runtimes
 const langList = available.join(", ");
@@ -1371,318 +1242,43 @@ const bunNote = hasBunRuntime()
   ? " (Bun detected — JS/TS runs 3-5x faster)"
   : "";
 
-// ─────────────────────────────────────────────────────────
-// Helper: smart snippet extraction — returns windows around
-// matching query terms instead of dumb truncation
-//
-// When `highlighted` is provided (from FTS5 `highlight()` with
-// STX/ETX markers), match positions are derived from the markers.
-// This is the authoritative source — FTS5 uses the exact same
-// tokenizer that produced the BM25 match, so stemmed variants
-// like "configuration" matching query "configure" are found
-// correctly. Falls back to indexOf on raw terms when highlighted
-// is absent (non-FTS codepath).
-// ─────────────────────────────────────────────────────────
-
-const STX = "\x02";
-const ETX = "\x03";
-
-/**
- * Parse FTS5 highlight markers to find match positions in the
- * original (marker-free) text. Returns character offsets into the
- * stripped content where each matched token begins.
- */
-export function positionsFromHighlight(highlighted: string): number[] {
-  const positions: number[] = [];
-  let cleanOffset = 0;
-
-  let i = 0;
-  while (i < highlighted.length) {
-    if (highlighted[i] === STX) {
-      // Record position of this match in the clean text
-      positions.push(cleanOffset);
-      i++; // skip STX
-      // Advance through matched text until ETX
-      while (i < highlighted.length && highlighted[i] !== ETX) {
-        cleanOffset++;
-        i++;
-      }
-      if (i < highlighted.length) i++; // skip ETX
-    } else {
-      cleanOffset++;
-      i++;
-    }
-  }
-
-  return positions;
-}
-
-/** Strip STX/ETX markers to recover original content. */
-function stripMarkers(highlighted: string): string {
-  return highlighted.replaceAll(STX, "").replaceAll(ETX, "");
-}
-
-export function extractSnippet(
-  content: string,
-  query: string,
-  maxLen = 1500,
-  highlighted?: string,
-): string {
-  if (content.length <= maxLen) return content;
-
-  // Derive match positions from FTS5 highlight markers when available
-  const positions: number[] = [];
-
-  if (highlighted) {
-    for (const pos of positionsFromHighlight(highlighted)) {
-      positions.push(pos);
-    }
-  }
-
-  // Fallback: indexOf on raw query terms (non-FTS codepath)
-  if (positions.length === 0) {
-    const terms = query
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((t) => t.length > 2);
-    const lower = content.toLowerCase();
-
-    for (const term of terms) {
-      let idx = lower.indexOf(term);
-      while (idx !== -1) {
-        positions.push(idx);
-        idx = lower.indexOf(term, idx + 1);
-      }
-    }
-  }
-
-  // No matches at all — return prefix
-  if (positions.length === 0) {
-    return content.slice(0, maxLen) + "\n…";
-  }
-
-  // Sort positions, merge overlapping windows
-  positions.sort((a, b) => a - b);
-  const WINDOW = 300;
-  const windows: Array<[number, number]> = [];
-
-  for (const pos of positions) {
-    const start = Math.max(0, pos - WINDOW);
-    const end = Math.min(content.length, pos + WINDOW);
-    if (windows.length > 0 && start <= windows[windows.length - 1][1]) {
-      windows[windows.length - 1][1] = end;
-    } else {
-      windows.push([start, end]);
-    }
-  }
-
-  // Collect windows until maxLen
-  const parts: string[] = [];
-  let total = 0;
-  for (const [start, end] of windows) {
-    if (total >= maxLen) break;
-    const part = content.slice(start, Math.min(end, start + (maxLen - total)));
-    parts.push(
-      (start > 0 ? "…" : "") + part + (end < content.length ? "…" : ""),
-    );
-    total += part.length;
-  }
-
-  return parts.join("\n\n");
-}
-
-export type BatchQueryScope = "batch" | "global";
-
-export function formatBatchQueryResults(
-  store: ContentStore,
-  queries: string[],
-  source: string,
-  maxOutput = 12 * 1024,
-  scope: BatchQueryScope = "batch",
-): string[] {
-  const sections: string[] = [];
-  let outputSize = 0;
-  const emitted = new Set<string>();
-
-  // When scope is "global", searchWithFallback receives `undefined` for the
-  // source filter, which makes it query the entire persistent index instead
-  // of only the chunks just produced by this batch's commands. Default
-  // remains "batch" to preserve the historical behavior.
-  const searchSource = scope === "global" ? undefined : source;
-
-  for (const query of new Set(queries)) {
-    if (outputSize >= maxOutput) {
-      sections.push(`query: ${query}\n(output cap reached — use ctx_search(queries: ["${query}"]) for details)`);
-      continue;
-    }
-
-    const results = store.searchWithFallback(query, 2, searchSource, undefined, "exact");
-    sections.push(`query: ${query}`);
-    outputSize += Buffer.byteLength(`query: ${query}`);
-    if (results.length > 0) {
-      for (const result of results) {
-        const key = `${result.source}\u0000${result.title}\u0000${result.content}`;
-        if (emitted.has(key)) continue;
-        emitted.add(key);
-        const snippet = extractSnippet(result.content, query, 600, result.highlighted);
-        const section = `${result.title}\n${snippet}`;
-        if (outputSize + Buffer.byteLength(section) > maxOutput) break;
-        sections.push(section);
-        outputSize += Buffer.byteLength(section);
-      }
-      continue;
-    }
-
-    sections.push("No matching sections found.");
-  }
-
-  if (scope === "global") {
-    sections.push("scope: global index");
-  }
-
-  return sections;
-}
-
-// ─────────────────────────────────────────────────────────
-// batch_execute runner — used by ctx_batch_execute handler
-// ─────────────────────────────────────────────────────────
-
-export interface BatchCommand { label: string; command: string; }
-
-export interface BatchRunResult {
-  outputs: string[];
-  timedOut: boolean;
-}
-
-export interface BatchResponseSummary {
-  commandCount: number;
-  totalLines: number;
-  totalBytes: number;
-  indexedSections: number;
-  queryCount: number;
-  queryResults: string[];
-  timedOut: boolean;
-}
-
-export function formatBatchResponse(summary: BatchResponseSummary): string {
-  const commandWord = summary.commandCount === 1 ? "command" : "commands";
-  const queryWord = summary.queryCount === 1 ? "query" : "queries";
-  const timeout = summary.timedOut ? "; timed out" : "";
-  const headline = `${summary.commandCount} ${commandWord}; ${summary.totalLines} lines; ${(summary.totalBytes / 1024).toFixed(1)}KB; ${summary.indexedSections} sections indexed; ${summary.queryCount} ${queryWord}${timeout}.`;
-  const matches = summary.queryResults.filter((result) => result.trim().length > 0);
-  return [headline, ...matches].join("\n\n");
-}
-
-export interface BatchRunOptions {
-  /**
-   * Total budget (concurrency=1, shared) or per-command (concurrency>1).
-   * When `undefined`, no server-side timer fires — the MCP host's RPC
-   * timeout governs (Issue #406).
-   */
-  timeout: number | undefined;
-  concurrency: number;
-  nodeOptsPrefix: string;
-  cwd?: string;
-  onFsBytes?: (bytes: number) => void;
-}
-
-interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{ stdout: string; timedOut?: boolean }>;
-}
-
-function quotePosixSingle(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function quotePowerShellSingle(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-export function buildBatchNodeOptionsPrefix(shellPath: string, preloadPath: string): string {
-  const option = `--require ${preloadPath}`;
-  const shell = shellPath.toLowerCase();
-  const base = shell.split(/[\\/]/).pop() ?? shell;
-
-  if (shell.includes("powershell") || shell.includes("pwsh")) {
-    return `$env:NODE_OPTIONS=${quotePowerShellSingle(option)}; `;
-  }
-
-  if (base === "cmd" || base === "cmd.exe") {
-    return `set "NODE_OPTIONS=${option.replace(/"/g, '""')}" && `;
-  }
-
-  return `NODE_OPTIONS=${quotePosixSingle(option)} `;
-}
-
-/**
- * Per-section budget for the echoed `$ <command>` line so a 50KB heredoc
- * payload cannot dominate the response body. The full command always reaches
- * the executor — only the echo is clipped (Issues #717 + #736).
- */
-const COMMAND_ECHO_MAX = 500;
-
-function truncateCommandForEcho(command: string): string {
-  const cleaned = command.replace(/\s+/g, " ").trim();
-  if (cleaned.length <= COMMAND_ECHO_MAX) return cleaned;
-  return cleaned.slice(0, COMMAND_ECHO_MAX) + "…";
-}
-
-/**
- * Default execution timeout (ms) applied ONLY under Antigravity CLI (`agy`).
- * agy does not enforce an MCP RPC timeout, so a ctx_execute with a runaway or
- * blocking script hangs forever — the host never kills it and the user must
- * interrupt. Every other host enforces its own RPC timeout, so we keep the
- * no-server-timer behavior there (Issue #406 — long builds need an unbounded
- * run). A caller can still pass an explicit `timeout` to override on any host.
- */
-export const AGY_DEFAULT_EXEC_TIMEOUT_MS = 120_000;
-export function resolveExecTimeout(timeout: number | undefined): number | undefined {
-  if (timeout !== undefined) return timeout;
-  // Only agy gets a default — every other host enforces its own RPC timeout, so
-  // keep the unbounded behavior there. Detected via the env the agy bundle pins
-  // (QUIET_CONTEXT_PLATFORM=antigravity-cli). Tunable via QUIET_CONTEXT_AGY_EXEC_TIMEOUT_MS.
-  if (detectPlatform().platform !== "antigravity-cli") return undefined;
-  const override = Number(process.env.QUIET_CONTEXT_AGY_EXEC_TIMEOUT_MS);
-  return Number.isFinite(override) && override > 0 ? override : AGY_DEFAULT_EXEC_TIMEOUT_MS;
-}
-
-function buildExecuteEcho(_language: string, _code: string, _path?: string): string {
-  return "";
-}
-
-function formatCommandOutput(label: string, command: string, raw: string, onFsBytes?: (bytes: number) => void): string {
-  let output = raw || "(no output)";
-  const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
-  let cmdFsBytes = 0;
-  for (const m of fsMatches) cmdFsBytes += parseInt(m[1]);
-  if (cmdFsBytes > 0) {
-    onFsBytes?.(cmdFsBytes);
-    output = output.replace(/__CM_FS__:\d+\n?/g, "");
-  }
-  // Echo the executed command below the section heading so per-chunk
-  // indexed content retains provenance for later ctx_search hits
-  // (Issues #717 + #736).
-  const echoed = truncateCommandForEcho(command);
-  return `# ${label}\n\n$ ${echoed}\n\n${output}\n`;
-}
-
-function combineExecOutput(result: { stdout?: string; stderr?: string }): string {
-  const stdout = result.stdout || "";
-  const stderr = result.stderr || "";
-  if (!stderr) return stdout;
-  if (!stdout) return stderr;
-  return `${stdout}${stdout.endsWith("\n") ? "" : "\n"}${stderr}`;
-}
-
-function capUtf8(value: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  const bytes = Buffer.from(value);
-  if (bytes.length <= maxBytes) return value;
-  if (maxBytes < Buffer.byteLength("…")) return "";
-  let end = Math.max(0, maxBytes - Buffer.byteLength("…"));
-  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
-  return bytes.subarray(0, end).toString("utf8") + "…";
-}
+// Moved to src/server/format-utils.ts: positionsFromHighlight, extractSnippet,
+// formatBatchQueryResults/formatBatchResponse and their supporting types, plus
+// the batch-execute formatting helpers (buildBatchNodeOptionsPrefix,
+// resolveExecTimeout, formatCommandOutput, combineExecOutput, capUtf8).
+import {
+  positionsFromHighlight,
+  extractSnippet,
+  type BatchQueryScope,
+  formatBatchQueryResults,
+  type BatchCommand,
+  type BatchRunResult,
+  type BatchResponseSummary,
+  formatBatchResponse,
+  type BatchRunOptions,
+  type BatchExecutor,
+  buildBatchNodeOptionsPrefix,
+  AGY_DEFAULT_EXEC_TIMEOUT_MS,
+  resolveExecTimeout,
+  buildExecuteEcho,
+  formatCommandOutput,
+  combineExecOutput,
+  capUtf8,
+} from "./server/format-utils.js";
+export {
+  positionsFromHighlight,
+  extractSnippet,
+  type BatchQueryScope,
+  formatBatchQueryResults,
+  type BatchCommand,
+  type BatchRunResult,
+  type BatchResponseSummary,
+  formatBatchResponse,
+  type BatchRunOptions,
+  buildBatchNodeOptionsPrefix,
+  AGY_DEFAULT_EXEC_TIMEOUT_MS,
+  resolveExecTimeout,
+} from "./server/format-utils.js";
 
 /**
  * Execute batch commands. concurrency=1 preserves the legacy serial path
@@ -4624,242 +4220,20 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
 
 }
 
-// ── ctx_insight process helpers ──────────────────────────────────────────────
-// Cross-platform process helpers used by ctx_insight (below) and the dashboard
-// launcher in cli.ts. All entry points use argv arrays — never `sh -c <string>`
-// — so caller-derived values cannot escape into shell context. See issue #441.
-//
-// `browserOpenArgv` is duplicated as a private 16-LOC copy in cli.ts to avoid
-// pulling server.ts top-level boot side effects into the cli bundle.
-
-export type SpawnSyncFn = (
-  cmd: string,
-  args: readonly string[],
-  opts?: SpawnSyncOptions,
-) => SpawnSyncReturns<string | Buffer>;
-
-export type BrowserOpenResult =
-  | { ok: true; method: string }
-  | { ok: false; method: "none"; reason: string };
-
-export type KillResult = {
-  killedPids: string[];
-  attemptedPids: string[];
-  errors: string[];
-};
-
-// Hard upper bound on every helper-internal spawnSync call. Caps tail-latency
-// when an external binary hangs (xdg-open waiting for an X11 session, lsof
-// stalling on /proc, taskkill blocking on an unresponsive process, etc.) so
-// the MCP tool surfaces a diagnostic instead of blocking the agent loop.
-// 5s is comfortably above the 99th-percentile completion of every command we
-// invoke; anything past that is hung.
-const HELPER_SPAWN_TIMEOUT_MS = 5000;
-
-// Returns the argv attempts for opening `url` on `platform`, in fall-back order.
-// Pure data — no I/O.
-export function browserOpenArgv(
-  url: string,
-  platform: NodeJS.Platform,
-): readonly { cmd: string; args: readonly string[] }[] {
-  if (platform === "darwin") return [{ cmd: "open", args: [url] }];
-  if (platform === "win32") {
-    // `start` is a cmd.exe builtin; the empty title arg ("") prevents the URL
-    // from being consumed as the window title.
-    return [{ cmd: "cmd", args: ["/c", "start", "", url] }];
-  }
-  // linux/bsd: try xdg-open, then sensible-browser (Debian/Ubuntu).
-  return [
-    { cmd: "xdg-open", args: [url] },
-    { cmd: "sensible-browser", args: [url] },
-  ];
-}
-
-// Opens a browser synchronously, waiting for each attempt to complete.
-// Returns a structured result so callers can surface auto-open failures
-// to the user instead of falsely reporting success.
-export function openBrowserSync(
-  url: string,
-  platform: NodeJS.Platform = process.platform,
-  runner: SpawnSyncFn = spawnSync,
-): BrowserOpenResult {
-  const attempts = browserOpenArgv(url, platform);
-  const errors: string[] = [];
-  for (const { cmd, args } of attempts) {
-    try {
-      const r = runner(cmd, args, { stdio: "ignore", timeout: HELPER_SPAWN_TIMEOUT_MS });
-      // Treat signal-kill (status === null) and any non-zero status as failure
-      // so the next fallback fires.
-      if (!r.error && r.status === 0) return { ok: true, method: cmd };
-      const reason = r.error?.message ?? `status=${r.status === null ? "signaled" : r.status}`;
-      errors.push(`${cmd}: ${reason}`);
-    } catch (e) {
-      errors.push(`${cmd}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  return { ok: false, method: "none", reason: errors.join("; ") };
-}
-
-// Kills any process listening on `port`. Returns a structured result so
-// the caller can distinguish between (a) port was free, (b) kill succeeded,
-// (c) kill failed (perms, missing binary, or per-pid failure mid-loop).
-//
-// On Windows the netstat parser is locale-independent: the STATE column
-// ("LISTENING" / "ESTABLISHED" / ...) is translated on non-English Windows
-// (Windows-FR shows "À l'écoute", Windows-DE "ABHÖREN", etc.), but the REMOTE
-// ADDRESS column is not. A listening TCP socket always has remote
-// "0.0.0.0:0" (IPv4) or "[::]:0" (IPv6); a connected one has a real
-// addr:port. We therefore key off the remote column instead of the state
-// string. This also rules out the pre-fix bug where matching only the local
-// port number cross-matched a remote :port from an outbound connection and
-// taskkill'd an unrelated process.
-export function killProcessOnPort(
-  port: number,
-  platform: NodeJS.Platform = process.platform,
-  runner: SpawnSyncFn = spawnSync,
-): KillResult {
-  const result: KillResult = { killedPids: [], attemptedPids: [], errors: [] };
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    result.errors.push(`invalid port: ${port}`);
-    return result;
-  }
-
-  try {
-    if (platform === "win32") {
-      const r = runner("netstat", ["-ano"], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: HELPER_SPAWN_TIMEOUT_MS,
-      });
-      if (r.error) {
-        result.errors.push(`netstat: ${r.error.message}`);
-        return result;
-      }
-      if (r.status !== 0 || typeof r.stdout !== "string") return result;
-
-      const portSuffix = `:${port}`;
-      const pids = new Set<string>();
-      for (const rawLine of r.stdout.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        const tokens = line.split(/\s+/);
-        // netstat -ano LISTENING row (en-US): "TCP  0.0.0.0:4747  0.0.0.0:0  LISTENING  1234"
-        // The STATE column is locale-translated and may itself contain spaces
-        // (Windows-FR `À l'écoute` splits into two tokens), so we cannot index
-        // STATE by position. PID is always the trailing column; PROTO/LOCAL/
-        // REMOTE are the first three. We anchor on those + a remote-wildcard
-        // check that's locale-independent.
-        if (tokens.length < 5) continue;
-        const proto = tokens[0];
-        const local = tokens[1];
-        const remote = tokens[2];
-        const pid = tokens[tokens.length - 1];
-        if (proto !== "TCP") continue;
-        if (!local.endsWith(portSuffix)) continue;
-        // Listening sockets carry a wildcard remote; anything else is a
-        // connection (and matching it would kill an unrelated process).
-        if (remote !== "0.0.0.0:0" && remote !== "[::]:0") continue;
-        if (!/^\d+$/.test(pid)) continue;
-        pids.add(pid);
-      }
-      for (const pid of pids) {
-        result.attemptedPids.push(pid);
-        try {
-          const k = runner("taskkill", ["/F", "/PID", pid], {
-            stdio: "ignore",
-            timeout: HELPER_SPAWN_TIMEOUT_MS,
-          });
-          if (k.error || k.status !== 0) {
-            result.errors.push(
-              `taskkill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
-            );
-          } else {
-            result.killedPids.push(pid);
-          }
-        } catch (e) {
-          result.errors.push(`taskkill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-    } else {
-      const r = runner("lsof", ["-ti", `:${port}`], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: HELPER_SPAWN_TIMEOUT_MS,
-      });
-      if (r.error) {
-        // ENOENT (lsof not installed) is a real diagnostic; surface it.
-        result.errors.push(`lsof: ${r.error.message}`);
-        return result;
-      }
-      // lsof exits 1 with empty stdout when the port is free — not an error.
-      if (r.status !== 0 || typeof r.stdout !== "string") return result;
-
-      const pids = r.stdout.split(/\r?\n/).filter(p => /^\d+$/.test(p));
-      for (const pid of pids) {
-        result.attemptedPids.push(pid);
-        try {
-          const k = runner("kill", [pid], {
-            stdio: "ignore",
-            timeout: HELPER_SPAWN_TIMEOUT_MS,
-          });
-          if (k.error || k.status !== 0) {
-            result.errors.push(
-              `kill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
-            );
-          } else {
-            result.killedPids.push(pid);
-          }
-        } catch (e) {
-          result.errors.push(`kill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-    }
-  } catch (e) {
-    result.errors.push(e instanceof Error ? e.message : String(e));
-  }
-  return result;
-}
-
-// ── ctx-insight: open the hosted Insight dashboard ───────────────────────────
-// Insight pivoted from a locally-built dashboard to the hosted B2B product at
-// context-mode.com/insight (the landing page is the single source of truth).
-// The tool now simply opens that URL in the user default browser via the same
-// cross-platform helper (openBrowserSync) used elsewhere.
-function registerLegacyInsightTool(): void {
-const INSIGHT_URL = "https://context-mode.com/insight";
-
-server.registerTool(
-  "ctx_insight",
-  {
-    title: "Open Insight Dashboard",
-    // #846: opens a hosted dashboard URL in the browser — an external side
-    // effect (open world), not a read-only query; safe to repeat.
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: true,
-    },
-    description:
-      "Opens the context-mode Insight dashboard (https://context-mode.com/insight) in your " +
-      "default browser — a dashboard launcher for the hosted analytics layer, not a Q&A engine. " +
-      "Insight surfaces per-engineer productive rate, retry waste, blocker detection, and " +
-      "role-narrowed views for CTO, EM, IC, CISO, FinOps, and DevOps. " +
-      "For natural-language queries over your indexed content, use ctx_search.",
-    inputSchema: z.object({}),
-  },
-  async () => {
-    const open = openBrowserSync(INSIGHT_URL);
-    const text = open.ok
-      ? `Opening Insight in your browser: ${INSIGHT_URL}`
-      : `Could not auto-open your browser (${open.reason}).\nOpen Insight manually: ${INSIGHT_URL}`;
-    return trackResponse("ctx_insight", {
-      content: [{ type: "text" as const, text }],
-    });
-  },
-);
-
-}
+// Moved to src/server/legacy-insight.ts: SpawnSyncFn/BrowserOpenResult/
+// KillResult types, browserOpenArgv/openBrowserSync/killProcessOnPort helpers,
+// and the dead registerLegacyInsightTool() (never called — see
+// docs/legacy-tools-dormant-boundary.md). Only killProcessOnPort is still
+// referenced here (by the live-in-place ctx_upgrade dead-code body above).
+import { killProcessOnPort } from "./server/legacy-insight.js";
+export {
+  type SpawnSyncFn,
+  type BrowserOpenResult,
+  type KillResult,
+  browserOpenArgv,
+  openBrowserSync,
+  killProcessOnPort,
+} from "./server/legacy-insight.js";
 
 // ─────────────────────────────────────────────────────────
 // Server startup

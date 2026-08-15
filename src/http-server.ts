@@ -28,6 +28,7 @@ import {
 import {
   REGISTERED_CTX_TOOLS,
   VERSION,
+  installStrictClientSchemaCompat,
   resolveSessionIdFromSessionDB,
   withProjectDirOverride,
 } from "./server.js";
@@ -152,6 +153,10 @@ function buildRequestServer(projectDir: string | null): McpServer {
       scopedHandler,
     );
   }
+  // Reuse the same schema-shaping pass the stdio path installs on `server`
+  // (module-init, src/server.ts) so both transports emit byte-identical
+  // tools/list schemas — same strict-client sanitizer, one implementation.
+  installStrictClientSchemaCompat(mcp);
   return mcp;
 }
 
