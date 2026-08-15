@@ -4,7 +4,8 @@ Description=QuietContext shared MCP daemon (Streamable HTTP on 127.0.0.1)
 [Service]
 Type=exec
 Environment=QUIET_CONTEXT_DAEMON_PORT=48619
-ExecStart=/usr/bin/node %h/Projects/quietmode/start-http.mjs
+WorkingDirectory=%h/.claude/plugins/sources/quietmode
+ExecStart=/usr/bin/node %h/.claude/plugins/sources/quietmode/start-http.mjs
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15
