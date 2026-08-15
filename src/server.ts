@@ -67,7 +67,7 @@ import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
-const VERSION: string = (() => {
+export const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
     const p = resolve(__pkg_dir, rel);
     if (existsSync(p)) {
@@ -655,8 +655,10 @@ writeFileSync(
 // snippets under /tmp when the host process exits.
 process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
+// Lazy per-working-root stores — no DB overhead unless index/search is used.
+// Keyed by the resolved project dir: a shared HTTP daemon serves many
+// concurrent roots; the stdio child resolves one root, so it keeps one entry.
+const _stores = new Map<string, ContentStore>();
 
 /**
  * Build the FK-attribution object passed to every ContentStore.index*() call
@@ -895,8 +897,12 @@ function getStorePath(): string {
 }
 
 function getStore(): ContentStore {
-  if (!_store) {
-    _store = new ContentStore();
+  const storeRoot = getProjectDir();
+  const existing = _stores.get(storeRoot);
+  if (existing) return existing;
+  {
+    const _store = new ContentStore();
+    _stores.set(storeRoot, _store);
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
@@ -921,8 +927,18 @@ function getStore(): ContentStore {
     try {
       _store.cleanupStaleSources(14);
     } catch { /* best-effort */ }
+    return _store;
   }
-  return _store;
+}
+
+/** Shared shutdown path for the stdio child and the HTTP daemon. */
+export function releaseProcessResources(): void {
+  executor.cleanupBackgrounded();
+  for (const store of _stores.values()) {
+    try { store.cleanup(); } catch { /* best effort */ }
+  }
+  _stores.clear();
+  try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -4542,9 +4558,13 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     try {
       storePathForPurge = getStorePath();
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
-    if (_store) {
-      try { _store.cleanup(); } catch { /* best effort */ }
-      _store = null;
+    {
+      const purgeRoot = getProjectDir();
+      const purgeStore = _stores.get(purgeRoot);
+      if (purgeStore) {
+        try { purgeStore.cleanup(); } catch { /* best effort */ }
+        _stores.delete(purgeRoot);
+      }
     }
 
     // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
@@ -4857,9 +4877,7 @@ async function main() {
 
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
-    executor.cleanupBackgrounded();
-    if (_store) _store.cleanup();
-    try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
+    releaseProcessResources();
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
     // #844: stop refreshing the sentinel mtime on shutdown.

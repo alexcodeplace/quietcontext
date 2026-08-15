@@ -1,8 +1,12 @@
 {
   "mcpServers": {
     "quietcontext": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/start.mjs"]
+      "type": "http",
+      "url": "http://127.0.0.1:48619/mcp",
+      "headers": {
+        "X-QuietContext-Root": "${PWD}"
+      },
+      "headersHelper": "node ${CLAUDE_PLUGIN_ROOT}/daemon-headers.mjs"
     }
   }
 }
