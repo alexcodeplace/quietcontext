@@ -1275,6 +1275,7 @@ export {
   type BatchResponseSummary,
   formatBatchResponse,
   type BatchRunOptions,
+  buildBatchNodeOptionsPrefix,
   AGY_DEFAULT_EXEC_TIMEOUT_MS,
   resolveExecTimeout,
 } from "./server/format-utils.js";
