@@ -651,6 +651,45 @@ describe("Delete Session", () => {
     // "delete" session should be gone
     assert.equal(db.getEventCount("delete"), 0);
   });
+
+  test("deleteSession removes tool_calls, tool_ledger, and tool_burst_events rows", () => {
+    const db = createTestDB();
+    const sid = "sess-tool-calls";
+
+    db.ensureSession(sid, "/project");
+    db.incrementToolCall(sid, "execute", 1024);
+    db.recordToolLedger(sid, "execute", "/project", 1024, 2048);
+    db.recordBurstEvent(sid, "/project", 3, 4.2);
+
+    assert.equal(db.getToolCallStats(sid).totalCalls, 1);
+    assert.ok(db.getToolLedgerSummary(sid).execute !== undefined);
+    assert.equal(db.getBurstEvents(sid).length, 1);
+
+    db.deleteSession(sid);
+
+    assert.equal(db.getToolCallStats(sid).totalCalls, 0);
+    assert.deepEqual(db.getToolLedgerSummary(sid), {});
+    assert.equal(db.getBurstEvents(sid).length, 0);
+  });
+
+  test("pruneOrphanedToolCalls removes tool_calls rows with no matching session_meta row", () => {
+    const db = createTestDB();
+
+    db.ensureSession("kept", "/project");
+    db.incrementToolCall("kept", "execute", 100);
+
+    // Simulate a legacy orphan: tool_calls row with no session_meta row
+    // (e.g. written before deleteSession() covered this table).
+    db.incrementToolCall("orphaned", "search", 200);
+
+    assert.equal(db.getToolCallStats("orphaned").totalCalls, 1);
+
+    const removed = db.pruneOrphanedToolCalls();
+
+    assert.equal(removed, 1);
+    assert.equal(db.getToolCallStats("orphaned").totalCalls, 0);
+    assert.equal(db.getToolCallStats("kept").totalCalls, 1);
+  });
 });
 
 // ════════════════════════════════════════════

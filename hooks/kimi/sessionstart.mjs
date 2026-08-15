@@ -97,6 +97,7 @@ try {
     // duplicated schema knowledge in the hook and would silently drift if
     // `session_events` ever renamed its FK column.
     db.pruneOrphanedEvents();
+    db.pruneOrphanedToolCalls();
 
     const sessionId = getSessionId(input, OPTS);
     db.ensureSession(sessionId, projectDir);

@@ -689,6 +689,13 @@ const S = {
   getToolCallTotals: "getToolCallTotals",
   getToolCallByTool: "getToolCallByTool",
   getEventBytesSummary: "getEventBytesSummary",
+  deleteToolCalls: "deleteToolCalls",
+  insertToolLedger: "insertToolLedger",
+  deleteToolLedger: "deleteToolLedger",
+  getToolLedgerSummary: "getToolLedgerSummary",
+  insertBurstEvent: "insertBurstEvent",
+  deleteBurstEvents: "deleteBurstEvents",
+  getBurstEvents: "getBurstEvents",
 } as const;
 
 // ─────────────────────────────────────────────────────────
@@ -886,6 +893,29 @@ export class SessionDB extends SQLiteBase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+
+      CREATE TABLE IF NOT EXISTS tool_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        working_root TEXT NOT NULL,
+        bytes_returned INTEGER NOT NULL DEFAULT 0,
+        counterfactual_bytes INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tool_ledger_session ON tool_ledger(session_id);
+
+      CREATE TABLE IF NOT EXISTS tool_burst_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        working_root TEXT NOT NULL,
+        calls_in_burst INTEGER NOT NULL,
+        seconds_span REAL NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tool_burst_events_session ON tool_burst_events(session_id);
     `);
 
     // Migration: add per-event attribution columns for existing DBs.
@@ -1131,6 +1161,33 @@ export class SessionDB extends SQLiteBase {
       `SELECT COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
        FROM session_events WHERE session_id = ?`);
+
+    p(S.deleteToolCalls, `DELETE FROM tool_calls WHERE session_id = ?`);
+
+    // ── Honest savings ledger (execute/exec-file/batch/search) ──
+    p(S.insertToolLedger,
+      `INSERT INTO tool_ledger (session_id, tool, working_root, bytes_returned, counterfactual_bytes)
+       VALUES (?, ?, ?, ?, ?)`);
+
+    p(S.deleteToolLedger, `DELETE FROM tool_ledger WHERE session_id = ?`);
+
+    p(S.getToolLedgerSummary,
+      `SELECT tool,
+              COUNT(*) AS calls,
+              COALESCE(SUM(bytes_returned), 0) AS bytes_returned,
+              COALESCE(SUM(counterfactual_bytes), 0) AS counterfactual_bytes
+       FROM tool_ledger WHERE session_id = ? GROUP BY tool`);
+
+    // ── Burst feedback ──
+    p(S.insertBurstEvent,
+      `INSERT INTO tool_burst_events (session_id, working_root, calls_in_burst, seconds_span)
+       VALUES (?, ?, ?, ?)`);
+
+    p(S.deleteBurstEvents, `DELETE FROM tool_burst_events WHERE session_id = ?`);
+
+    p(S.getBurstEvents,
+      `SELECT working_root, calls_in_burst, seconds_span, created_at
+       FROM tool_burst_events WHERE session_id = ? ORDER BY id ASC`);
   }
 
   // ═══════════════════════════════════════════
@@ -1688,18 +1745,140 @@ export class SessionDB extends SQLiteBase {
   }
 
   // ═══════════════════════════════════════════
+  // Honest savings ledger (execute/exec-file/batch/search)
+  // ═══════════════════════════════════════════
+
+  /**
+   * Record one call's true byte accounting: what the model actually
+   * received (`bytesReturned`) against what raw, untruncated output
+   * would have cost the model had quietcontext not been in the path
+   * (`counterfactualBytes`). Callers MUST cap `counterfactualBytes` at
+   * the host's own truncation baseline before calling this — a >32KB
+   * raw payload the host would have shown as a 2KB preview anyway is
+   * NOT a genuine savings baseline of the full raw size.
+   */
+  recordToolLedger(
+    sessionId: string,
+    tool: string,
+    workingRoot: string,
+    bytesReturned: number,
+    counterfactualBytes: number,
+  ): void {
+    const safeReturned = Number.isFinite(bytesReturned) && bytesReturned > 0 ? Math.round(bytesReturned) : 0;
+    const safeCounterfactual = Number.isFinite(counterfactualBytes) && counterfactualBytes > 0
+      ? Math.round(counterfactualBytes)
+      : 0;
+    try {
+      this.stmt(S.insertToolLedger).run(sessionId, tool, workingRoot, safeReturned, safeCounterfactual);
+    } catch {
+      // best-effort: ledger must never throw and break the parent call
+    }
+  }
+
+  /**
+   * Aggregated per-tool ledger totals for `sessionId`. Savings is derived
+   * here (counterfactual - returned), not stored precomputed, so a raw
+   * payload smaller than what was actually returned shows as genuinely
+   * negative rather than being silently clamped to zero.
+   */
+  getToolLedgerSummary(sessionId: string): Record<string, {
+    calls: number;
+    bytesReturned: number;
+    counterfactualBytes: number;
+    bytesSaved: number;
+  }> {
+    try {
+      const rows = this.stmt(S.getToolLedgerSummary).all(sessionId) as Array<{
+        tool: string;
+        calls: number;
+        bytes_returned: number;
+        counterfactual_bytes: number;
+      }>;
+      const byTool: Record<string, { calls: number; bytesReturned: number; counterfactualBytes: number; bytesSaved: number }> = {};
+      for (const row of rows) {
+        byTool[row.tool] = {
+          calls: row.calls,
+          bytesReturned: row.bytes_returned,
+          counterfactualBytes: row.counterfactual_bytes,
+          bytesSaved: row.counterfactual_bytes - row.bytes_returned,
+        };
+      }
+      return byTool;
+    } catch {
+      return {};
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // Burst feedback ledger
+  // ═══════════════════════════════════════════
+
+  /** Record one closed burst window: N calls to the same working root within the burst gap. */
+  recordBurstEvent(sessionId: string, workingRoot: string, callsInBurst: number, secondsSpan: number): void {
+    const safeCalls = Number.isFinite(callsInBurst) && callsInBurst > 0 ? Math.round(callsInBurst) : 0;
+    const safeSpan = Number.isFinite(secondsSpan) && secondsSpan >= 0 ? secondsSpan : 0;
+    if (safeCalls === 0) return;
+    try {
+      this.stmt(S.insertBurstEvent).run(sessionId, workingRoot, safeCalls, safeSpan);
+    } catch {
+      // best-effort: burst ledger must never throw and break the parent call
+    }
+  }
+
+  getBurstEvents(sessionId: string): Array<{
+    workingRoot: string;
+    callsInBurst: number;
+    secondsSpan: number;
+    createdAt: string;
+  }> {
+    try {
+      const rows = this.stmt(S.getBurstEvents).all(sessionId) as Array<{
+        working_root: string;
+        calls_in_burst: number;
+        seconds_span: number;
+        created_at: string;
+      }>;
+      return rows.map((r) => ({
+        workingRoot: r.working_root,
+        callsInBurst: r.calls_in_burst,
+        secondsSpan: r.seconds_span,
+        createdAt: r.created_at,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  // ═══════════════════════════════════════════
   // Lifecycle
   // ═══════════════════════════════════════════
 
   /**
-   * Delete all data for a session (events, meta, resume).
+   * Delete all data for a session (events, meta, resume, tool_calls,
+   * tool_ledger, tool_burst_events). Every table keyed by session_id
+   * belongs here — a table left out orphans rows on every deletion.
    */
   deleteSession(sessionId: string): void {
     this.db.transaction(() => {
       this.stmt(S.deleteEvents).run(sessionId);
       this.stmt(S.deleteResume).run(sessionId);
       this.stmt(S.deleteMeta).run(sessionId);
+      this.stmt(S.deleteToolCalls).run(sessionId);
+      this.stmt(S.deleteToolLedger).run(sessionId);
+      this.stmt(S.deleteBurstEvents).run(sessionId);
     })();
+  }
+
+  /**
+   * Delete tool_calls rows whose session_id has no matching session_meta
+   * row. One-shot sweep for rows orphaned before deleteSession() covered
+   * this table (see #deleteSession). Mirrors pruneOrphanedEvents().
+   */
+  pruneOrphanedToolCalls(): number {
+    const result = this.db
+      .prepare(`DELETE FROM tool_calls WHERE session_id NOT IN (SELECT session_id FROM session_meta)`)
+      .run();
+    return Number(result.changes ?? 0);
   }
 
   /**
