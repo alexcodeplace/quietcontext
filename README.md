@@ -17,6 +17,13 @@ Measured on a workstation running dozens of concurrent agent sessions (all numbe
 
 Claude Code v2.1.221+ caches discovery for HTTP servers and connects on first tool use; the daemon supports that cached-discovery / connect-on-first-use behavior for remote servers.
 
+## Starting the daemon
+
+Linux: `systemd/quietcontext-daemon.service` (user unit).
+
+Windows: `windows/Install-QuietContextDaemon.ps1` registers an equivalent
+per-user logon task — see [windows/README.md](windows/README.md).
+
 ## Concurrency and isolation
 
 Multiple sessions in different working directories are served concurrently by one daemon, with per-working-root store isolation — verified with two simultaneous real sessions receiving correct per-root answers through a single daemon PID.
