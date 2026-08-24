@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "vitest";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer, type Server } from "node:net";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +10,7 @@ import {
   PLUGIN_KEY,
   claudeConfigDir,
   isPortInUse,
+  isQuietContextHealthy,
   pluginRootFromCacheScan,
   pluginRootFromManifest,
   readPort,
@@ -54,6 +56,28 @@ function listenOnEphemeralPort(): Promise<{ port: number; server: Server }> {
       const address = server.address();
       if (address === null || typeof address === "string") {
         reject(new Error("expected a TCP address"));
+        return;
+      }
+      resolve({ port: address.port, server });
+    });
+  });
+}
+
+function listenHealthServer(body: string, statusCode = 200): Promise<{ port: number; server: HttpServer }> {
+  return new Promise((resolve, reject) => {
+    const server = createHttpServer((req, res) => {
+      if (req.url !== "/healthz") {
+        res.writeHead(404).end();
+        return;
+      }
+      res.writeHead(statusCode, { "content-type": "application/json" });
+      res.end(body);
+    });
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        reject(new Error("expected an HTTP address"));
         return;
       }
       resolve({ port: address.port, server });
@@ -172,5 +196,38 @@ describe("isPortInUse", () => {
     await new Promise((done) => server.close(done));
 
     await expect(isPortInUse(port)).resolves.toBe(false);
+  });
+});
+
+
+describe("isQuietContextHealthy", () => {
+  test("accepts the QuietContext health identity", async () => {
+    const { port, server } = await listenHealthServer(
+      JSON.stringify({ ok: true, name: "quietcontext", version: "test", pid: process.pid }),
+    );
+    try {
+      await expect(isQuietContextHealthy(port)).resolves.toBe(true);
+    } finally {
+      await new Promise((done) => server.close(done));
+    }
+  });
+
+  test("rejects a foreign service on the daemon port", async () => {
+    const { port, server } = await listenHealthServer(JSON.stringify({ ok: true, name: "not-quietcontext" }));
+    try {
+      await expect(isPortInUse(port)).resolves.toBe(true);
+      await expect(isQuietContextHealthy(port)).resolves.toBe(false);
+    } finally {
+      await new Promise((done) => server.close(done));
+    }
+  });
+
+  test("rejects malformed health responses", async () => {
+    const { port, server } = await listenHealthServer("not json");
+    try {
+      await expect(isQuietContextHealthy(port)).resolves.toBe(false);
+    } finally {
+      await new Promise((done) => server.close(done));
+    }
   });
 });

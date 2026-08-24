@@ -3,6 +3,7 @@
 // Scheduler. Resolves the installed plugin's current version directory on
 // every start, so a plugin update does not strand the registered task on a
 // version path that no longer exists.
+import { get as httpGet } from "node:http";
 import { createConnection } from "node:net";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -82,6 +83,41 @@ export function isPortInUse(port, host = "127.0.0.1", timeoutMs = 1500) {
   });
 }
 
+export function isQuietContextHealthy(port, host = "127.0.0.1", timeoutMs = 1500) {
+  return new Promise((settle) => {
+    let settled = false;
+    let request;
+    const finish = (healthy) => {
+      if (settled) return;
+      settled = true;
+      request?.destroy();
+      settle(healthy);
+    };
+
+    request = httpGet(
+      { host, port, path: "/healthz", headers: { accept: "application/json" } },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          if (body.length < 4096) body += chunk;
+        });
+        response.on("end", () => {
+          if (response.statusCode !== 200) return finish(false);
+          try {
+            const health = JSON.parse(body);
+            finish(health?.ok === true && health?.name === "quietcontext");
+          } catch {
+            finish(false);
+          }
+        });
+      },
+    );
+    request.on("error", () => finish(false));
+    request.setTimeout(timeoutMs, () => finish(false));
+  });
+}
+
 export function readPort(env = process.env) {
   const raw = env.QUIET_CONTEXT_DAEMON_PORT;
   if (raw === undefined || raw === "") return DEFAULT_PORT;
@@ -102,8 +138,12 @@ export async function main() {
   }
 
   if (await isPortInUse(port)) {
-    console.error(`[quietcontext-launcher] 127.0.0.1:${port} already serving — nothing to start`);
-    return 0;
+    if (await isQuietContextHealthy(port)) {
+      console.error(`[quietcontext-launcher] QuietContext already serving on 127.0.0.1:${port} — nothing to start`);
+      return 0;
+    }
+    console.error(`[quietcontext-launcher] 127.0.0.1:${port} is occupied by another service — refusing to report success`);
+    return 1;
   }
 
   const configDir = claudeConfigDir();

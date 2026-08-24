@@ -28,7 +28,9 @@ exiting non-zero when the daemon is down.
   token file.
 - `quietcontext-daemon.mjs` — resolves the installed plugin's current version
   directory from `installed_plugins.json` (falling back to a cache scan) and
-  imports its `start-http.mjs`. Exits early when the port is already served.
+  imports its `start-http.mjs`. If the port is already bound, it verifies the
+  `/healthz` identity and fails rather than treating an unrelated listener as
+  QuietContext.
 
 ## Task settings
 
@@ -47,10 +49,10 @@ user requires storing that user's password. A logon task needs neither.
 
 ## Version churn
 
-The registered action points at `windows/quietcontext-daemon.vbs` in this
-checkout, not at a version-pinned plugin cache path. The launcher re-resolves
-the plugin directory on every start, so a plugin update does not strand the
-task.
+The installer copies the small VBS/JS scheduler bootstrap to
+`%LOCALAPPDATA%\QuietContext` and registers the task against that stable path.
+The JS launcher re-resolves the current plugin directory on every start, so
+removing an old versioned plugin cache does not strand the task.
 
 ## Uninstall
 
@@ -58,5 +60,6 @@ task.
 powershell -ExecutionPolicy Bypass -File .\windows\Install-QuietContextDaemon.ps1 -Uninstall
 ```
 
-Removes the task only. State under `~/.local/state/quietcontext` and
-`~/.claude/context-mode` is left in place.
+Removes the task and the stable bootstrap under `%LOCALAPPDATA%\QuietContext`.
+State under `~/.local/state/quietcontext` and `~/.claude/context-mode` is left
+in place.

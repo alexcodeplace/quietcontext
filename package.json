@@ -62,6 +62,7 @@
     "daemon-headers.mjs",
     "http-server.bundle.mjs",
     "systemd",
+    "windows",
     "scripts/postinstall.mjs",
     "scripts/heal-better-sqlite3.mjs",
     "scripts/heal-installed-plugins.mjs",

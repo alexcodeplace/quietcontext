@@ -39,10 +39,13 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$vbsPath = Join-Path $scriptDir "quietcontext-daemon.vbs"
-$launcherPath = Join-Path $scriptDir "quietcontext-daemon.mjs"
+$sourceVbsPath = Join-Path $scriptDir "quietcontext-daemon.vbs"
+$sourceLauncherPath = Join-Path $scriptDir "quietcontext-daemon.mjs"
+$runtimeDir = Join-Path $env:LOCALAPPDATA "QuietContext"
+$runtimeVbsPath = Join-Path $runtimeDir "quietcontext-daemon.vbs"
+$runtimeLauncherPath = Join-Path $runtimeDir "quietcontext-daemon.mjs"
 $logPath = Join-Path $env:USERPROFILE ".local\state\quietcontext\daemon.log"
-$userId = "$env:USERDOMAIN\$env:USERNAME"
+$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 function Get-DaemonTask {
     Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -50,17 +53,28 @@ function Get-DaemonTask {
 
 function Get-ListeningProcessId {
     param([int]$OnPort)
-    $connection = Get-NetTCPConnection -LocalPort $OnPort -State Listen -ErrorAction SilentlyContinue |
+    $connection = Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort $OnPort -State Listen -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($connection) { return $connection.OwningProcess }
     return $null
 }
 
+function Test-QuietContextHealth {
+    param([int]$OnPort)
+    try {
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$OnPort/healthz" -Method Get -TimeoutSec 2 -ErrorAction Stop
+        return ($health.ok -eq $true -and $health.name -eq "quietcontext")
+    }
+    catch {
+        return $false
+    }
+}
+
 function Stop-DaemonProcess {
     param([int]$OnPort)
-    # Task Scheduler does not reap the daemon through the wscript -> cmd -> node
-    # chain, so stopping the task leaves the listener bound. Walk the chain and
-    # stop every process that is demonstrably ours.
+    # Task Scheduler does not reliably reap the daemon through the
+    # wscript -> cmd -> node chain. Walk the chain and stop only processes
+    # whose command line demonstrates that they belong to this launcher.
     $daemonPid = Get-ListeningProcessId -OnPort $OnPort
     if (-not $daemonPid) { return $false }
 
@@ -105,8 +119,16 @@ if ($Status) {
     }
 
     $daemonPid = Get-ListeningProcessId -OnPort $Port
-    if ($daemonPid) { Write-Host "daemon  : listening on 127.0.0.1:$Port (pid $daemonPid)" }
-    else { Write-Host "daemon  : not listening on 127.0.0.1:$Port" }
+    $healthy = Test-QuietContextHealth -OnPort $Port
+    if ($healthy) {
+        Write-Host "daemon  : QuietContext healthy on 127.0.0.1:$Port (pid $daemonPid)"
+    }
+    elseif ($daemonPid) {
+        Write-Host "daemon  : unhealthy/foreign listener on 127.0.0.1:$Port (pid $daemonPid)"
+    }
+    else {
+        Write-Host "daemon  : not listening on 127.0.0.1:$Port"
+    }
 
     if (Test-Path -LiteralPath $logPath) {
         Write-Host "log     : $logPath"
@@ -116,31 +138,64 @@ if ($Status) {
         Write-Host "log     : $logPath (absent)"
     }
 
-    if ($daemonPid) { exit 0 } else { exit 1 }
+    if ($healthy) { exit 0 } else { exit 1 }
 }
 
 if ($Uninstall) {
     $task = Get-DaemonTask
-    if (-not $task) {
-        Write-Host "Task '$TaskName' is not registered — nothing to remove."
-        exit 0
+    if ($task) {
+        if ($task.State -eq "Running") {
+            Stop-ScheduledTask -TaskName $TaskName
+            Start-Sleep -Milliseconds 250
+        }
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "Removed scheduled task '$TaskName'."
     }
-    if ($task.State -eq "Running") { Stop-ScheduledTask -TaskName $TaskName }
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    else {
+        Write-Host "Task '$TaskName' is not registered."
+    }
+
     if (Stop-DaemonProcess -OnPort $Port) { Write-Host "Stopped the daemon on 127.0.0.1:$Port." }
-    Write-Host "Removed scheduled task '$TaskName'. Daemon state under ~/.local/state/quietcontext was left in place."
+    foreach ($runtimePath in @($runtimeVbsPath, $runtimeLauncherPath)) {
+        Remove-Item -LiteralPath $runtimePath -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $runtimeDir) {
+        $remaining = Get-ChildItem -LiteralPath $runtimeDir -Force -ErrorAction SilentlyContinue
+        if (-not $remaining) { Remove-Item -LiteralPath $runtimeDir -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Host "Daemon state under ~/.local/state/quietcontext was left in place."
     exit 0
 }
 
-foreach ($required in @($vbsPath, $launcherPath)) {
+foreach ($required in @($sourceVbsPath, $sourceLauncherPath)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "missing file: $required" }
 }
 
 $nodeExe = Resolve-NodeExe
 
+# Reinstall cleanly: stop an existing scheduled instance and its descendant
+# daemon before replacing the task. Otherwise the replacement task can exit
+# immediately against the old listener and leave that daemon unsupervised.
+$existingTask = Get-DaemonTask
+if ($existingTask) {
+    if ($existingTask.State -eq "Running") {
+        Stop-ScheduledTask -TaskName $TaskName
+        Start-Sleep -Milliseconds 250
+    }
+    Stop-DaemonProcess -OnPort $Port | Out-Null
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+}
+
+# The plugin cache is versioned and old versions may be deleted during an
+# upgrade. Keep the tiny scheduler bootstrap in a stable per-user location;
+# the JS launcher itself resolves the current plugin version on every start.
+New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+Copy-Item -LiteralPath $sourceVbsPath -Destination $runtimeVbsPath -Force
+Copy-Item -LiteralPath $sourceLauncherPath -Destination $runtimeLauncherPath -Force
+
 $action = New-ScheduledTaskAction `
     -Execute (Join-Path $env:SystemRoot "System32\wscript.exe") `
-    -Argument ('"{0}" "{1}" "{2}"' -f $vbsPath, $nodeExe, $Port)
+    -Argument ('"{0}" "{1}" "{2}"' -f $runtimeVbsPath, $nodeExe, $Port)
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
 
@@ -155,8 +210,6 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -MultipleInstances IgnoreNew
 
-if (Get-DaemonTask) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
-
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
@@ -166,6 +219,7 @@ Register-ScheduledTask `
     -Description "Shared QuietContext MCP daemon on 127.0.0.1:$Port" | Out-Null
 
 Write-Host "Registered scheduled task '$TaskName' (node: $nodeExe, port: $Port)."
+Write-Host "Runtime bootstrap: $runtimeDir"
 
 if ($NoStart) {
     Write-Host "Skipped start (-NoStart). It will run at next logon."
@@ -177,13 +231,19 @@ Start-ScheduledTask -TaskName $TaskName
 $deadline = (Get-Date).AddSeconds(20)
 do {
     Start-Sleep -Milliseconds 500
-    $daemonPid = Get-ListeningProcessId -OnPort $Port
-} while (-not $daemonPid -and (Get-Date) -lt $deadline)
+    $healthy = Test-QuietContextHealth -OnPort $Port
+} while (-not $healthy -and (Get-Date) -lt $deadline)
 
-if ($daemonPid) {
-    Write-Host "Daemon listening on 127.0.0.1:$Port (pid $daemonPid)."
+$daemonPid = Get-ListeningProcessId -OnPort $Port
+if ($healthy) {
+    Write-Host "QuietContext healthy on 127.0.0.1:$Port (pid $daemonPid)."
     exit 0
 }
 
-Write-Warning "Task started but nothing is listening on 127.0.0.1:$Port after 20s. Check $logPath"
+if ($daemonPid) {
+    Write-Warning "Task started but 127.0.0.1:$Port is not a healthy QuietContext daemon (pid $daemonPid). Check $logPath"
+}
+else {
+    Write-Warning "Task started but nothing is listening on 127.0.0.1:$Port after the startup wait. Check $logPath"
+}
 exit 1
