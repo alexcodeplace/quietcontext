@@ -7,7 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -123,6 +123,11 @@ afterAll(() => {
 });
 
 describe("quietcontext shared HTTP daemon", () => {
+  test("Linux user unit pins the daemon to Claude Code storage", () => {
+    const unit = readFileSync(join(ROOT, "systemd", "quietcontext-daemon.service"), "utf8");
+    expect(unit).toContain("Environment=QUIET_CONTEXT_PLATFORM=claude-code");
+  });
+
   test("healthz answers without auth", async () => {
     const res = await fetch(`http://127.0.0.1:${port}/healthz`);
     expect(res.status).toBe(200);
