@@ -12,7 +12,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs } from "../src/store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs, checkpointRetainedContentWALs } from "../src/store.js";
 import {
   withRetry,
   closeDB,
@@ -1182,6 +1182,37 @@ describe("DB Cleanup", () => {
     expect(cleanupStaleContentDBs(contentDir, 14)).toBe(1);
     expect(existsSync(stale)).toBe(false);
     expect(existsSync(active)).toBe(true);
+    fs.rmSync(contentDir, { recursive: true, force: true });
+  });
+
+  test("startup WAL maintenance truncates a retained high-water file", () => {
+    const contentDir = join(tmpdir(), `ctx-content-wal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(contentDir, { recursive: true });
+    const dbPath = join(contentDir, "retained.db");
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { timeout: 30000 });
+    applyWALPragmas(db);
+    db.pragma("wal_autocheckpoint = 0");
+    db.pragma("journal_size_limit = -1");
+    db.exec("CREATE TABLE payloads (value BLOB)");
+    const insert = db.prepare("INSERT INTO payloads(value) VALUES (?)");
+    const payload = Buffer.alloc(16 * 1024, 7);
+    const tx = db.transaction(() => {
+      for (let i = 0; i < 32; i++) insert.run(payload);
+    });
+    tx();
+    // Reset the logical WAL while retaining its allocated file as a high-water
+    // mark. The startup helper must reclaim that physical allocation.
+    db.pragma("wal_checkpoint(PASSIVE)");
+    const before = fs.statSync(dbPath + "-wal").size;
+    expect(before).toBeGreaterThan(32 * 1024);
+
+    expect(checkpointRetainedContentWALs(contentDir, 32 * 1024)).toBe(1);
+    const after = fs.existsSync(dbPath + "-wal") ? fs.statSync(dbPath + "-wal").size : 0;
+    expect(after).toBeLessThanOrEqual(32 * 1024);
+
+    db.close();
     fs.rmSync(contentDir, { recursive: true, force: true });
   });
 

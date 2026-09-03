@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, createProcessStorePath, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, createProcessStorePath, cleanupStaleContentDBs, checkpointRetainedContentWALs, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -710,6 +710,7 @@ export function setDaemonMode(active: boolean): void {
     try {
       const contentDir = ensureWritableStorageDir(resolveContentStorageDir(getDefaultSessionDir));
       cleanupStaleContentDBs(contentDir, 14);
+      checkpointRetainedContentWALs(contentDir);
     } catch { /* retention must never block daemon startup */ }
     startStoreEvictionSweep();
   } else {

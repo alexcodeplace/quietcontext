@@ -234,6 +234,43 @@ export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): 
   return cleaned;
 }
 
+/**
+ * Reclaim retained WAL high-water files for durable content DBs that are not
+ * currently open in this process. A previous daemon crash or older build can
+ * leave a very large checkpointed WAL on disk indefinitely; journal_size_limit
+ * only takes effect after a checkpoint. Startup calls this before opening any
+ * project stores, so TRUNCATE safely checkpoints valid frames and releases the
+ * historical allocation. Busy/in-use DBs are skipped best-effort.
+ */
+export function checkpointRetainedContentWALs(contentDir: string, minWalBytes: number = 64 * 1024 * 1024): number {
+  let checkpointed = 0;
+  try {
+    if (!existsSync(contentDir)) return 0;
+    const Database = loadDatabase();
+    const files = readdirSync(contentDir).filter((file) => file.endsWith(".db"));
+    for (const file of files) {
+      const dbPath = join(contentDir, file);
+      const walPath = `${dbPath}-wal`;
+      let walBytes = 0;
+      try { walBytes = statSync(walPath).size; } catch { continue; }
+      if (walBytes <= minWalBytes) continue;
+
+      let db: DatabaseInstance | undefined;
+      try {
+        db = new Database(dbPath, { timeout: 30000 });
+        applyWALPragmas(db);
+        db.pragma("wal_checkpoint(TRUNCATE)");
+        checkpointed++;
+      } catch {
+        // Another process may have the DB busy; never block daemon startup.
+      } finally {
+        try { db?.close(); } catch { /* best effort */ }
+      }
+    }
+  } catch { /* ignore directory/driver errors */ }
+  return checkpointed;
+}
+
 // ── Proximity helpers (pure functions) ──
 
 /** Find all positions of a term in text. */
