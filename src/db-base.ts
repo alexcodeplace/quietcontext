@@ -33,6 +33,8 @@ export interface PreparedStatement {
   get(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
   iterate(...params: unknown[]): IterableIterator<unknown>;
+  /** bun:sqlite owns native statement resources until finalize/DB close. */
+  finalize?(): void;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -393,6 +395,11 @@ export function loadDatabase(): typeof DatabaseConstructor {
 export function applyWALPragmas(db: DatabaseInstance): void {
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
+  // Keep a checkpointed WAL from retaining an arbitrarily large historical
+  // high-water mark. SQLite reuses WAL files after reset; without an explicit
+  // limit, a single large transaction can leave a multi-GB file allocated for
+  // the lifetime of a long-running daemon even when only a few frames are live.
+  try { db.pragma("journal_size_limit = 67108864"); } catch { /* unsupported runtime */ }
   // Memory-map the DB file for read-heavy FTS5 search workloads.
   // Eliminates read() syscalls — the kernel serves pages directly from
   // the page cache. 256MB is a safe upper bound (SQLite only maps up to

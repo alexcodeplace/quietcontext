@@ -248,7 +248,11 @@ export class PolyglotExecutor {
     projectRoot?: string | (() => string);
     runtimes?: RuntimeMap;
   }) {
-    this.#hardCapBytes = opts?.hardCapBytes ?? 100 * 1024 * 1024; // 100MB
+    // Keep process capture aligned with ContentStore admission. There is no value
+    // retaining 100MB in anonymous Buffers only for the 8MiB index boundary to
+    // reject it later. The executor kills the producer and returns an explicit
+    // cap diagnostic, so oversized output is never silently truncated.
+    this.#hardCapBytes = opts?.hardCapBytes ?? 8 * 1024 * 1024;
     const pr = opts?.projectRoot;
     if (typeof pr === "function") {
       this.#projectRootResolver = pr;

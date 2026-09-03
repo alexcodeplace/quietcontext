@@ -1,12 +1,10 @@
 /**
  * HTTP daemon store-isolation and shutdown invariants beyond what
  * quietcontext-http.test.ts already pins (per-root isolation, auth,
- * root validation). getStore() in src/server.ts creates one ephemeral,
- * process-scoped ContentStore per root (ContentStore.cleanup() deletes
- * its own db/-wal/-shm files); the daemon calls releaseProcessResources()
- * on SIGTERM/SIGINT (start-http.mjs), which must close and delete every
- * root's store with zero leaks even when several roots are active at
- * once in the same daemon process.
+ * root validation). The shared daemon owns one durable per-project ContentStore
+ * while stdio fallback children remain ephemeral. Daemon shutdown must close
+ * every root cleanly without deleting durable project indexes, and idle-store
+ * eviction must close/reopen a handle without data loss.
  */
 import { afterAll, describe, expect, test } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -90,7 +88,7 @@ function waitForExit(
 
 describe("quietcontext HTTP daemon store lifecycle", () => {
   test(
-    "shutdown purges every active root's ephemeral store with zero leaks, and the daemon exits cleanly",
+    "shutdown closes every active durable root without deleting project indexes",
     async () => {
       const scratch = mkdtempSync(join(tmpdir(), "qc-http-lifecycle-"));
       const runtimeDir = mkdtempSync(join(tmpdir(), "qc-http-lifecycle-runtime-"));
@@ -118,14 +116,17 @@ describe("quietcontext HTTP daemon store lifecycle", () => {
         callTool(port, token, rootC, "index", { source: "c", content: "gamma content" }),
       ]);
 
-      const ownedDbFiles = () => readdirSync(runtimeDir).filter((f) => /\.db(?:-(?:wal|shm))?$/.test(f));
-      expect(ownedDbFiles().filter((f) => f.endsWith(".db"))).toHaveLength(3);
+      const contentDir = join(scratch, "data", "content");
+      const durableDbFiles = () => readdirSync(contentDir).filter((f) => f.endsWith(".db"));
+      expect(durableDbFiles()).toHaveLength(3);
+      // Daemon content stores no longer live under TMPDIR.
+      expect(readdirSync(runtimeDir).filter((f) => f.endsWith(".db"))).toEqual([]);
 
       daemon.kill("SIGTERM");
       const exitResult = await waitForExit(daemon, 10_000);
       expect(exitResult).not.toBe("TIMEOUT");
       expect((exitResult as { code: number | null }).code).toBe(0);
-      expect(ownedDbFiles()).toEqual([]);
+      expect(durableDbFiles()).toHaveLength(3);
     },
     30_000,
   );
@@ -160,13 +161,15 @@ describe("quietcontext HTTP daemon store lifecycle", () => {
           content: "the eviction survivor marker is quetzal-hologram-7734",
         });
 
-        const ownedDbFiles = () => readdirSync(runtimeDir).filter((f) => f.endsWith(".db"));
-        expect(ownedDbFiles()).toHaveLength(1);
+        const contentDir = join(scratch, "data", "content");
+        const durableDbFiles = () => readdirSync(contentDir).filter((f) => f.endsWith(".db"));
+        expect(durableDbFiles()).toHaveLength(1);
+        expect(readdirSync(runtimeDir).filter((f) => f.endsWith(".db"))).toEqual([]);
 
         // Sit idle for several sweep cycles beyond the idle threshold —
         // the store MUST be closed (not unlinked) by the time this returns.
         await new Promise((r) => setTimeout(r, 500));
-        expect(ownedDbFiles()).toHaveLength(1); // close-only: file survives eviction
+        expect(durableDbFiles()).toHaveLength(1); // close-only: durable file survives eviction
 
         // Touch again: getStore() must reopen the SAME file and find the
         // content indexed before eviction, not start from an empty store.

@@ -12,7 +12,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { ContentStore, cleanupStaleDBs } from "../src/store.js";
+import { ContentStore, cleanupStaleDBs, cleanupStaleContentDBs } from "../src/store.js";
 import {
   withRetry,
   closeDB,
@@ -1162,6 +1162,29 @@ describe("DB Cleanup", () => {
     try { require("fs").unlinkSync(myPath); } catch {}
   });
 
+  test("durable content cleanup uses newest DB/WAL/SHM mtime", () => {
+    const contentDir = join(tmpdir(), `ctx-content-retention-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(contentDir, { recursive: true });
+    const stale = join(contentDir, "stale.db");
+    const active = join(contentDir, "active.db");
+    for (const base of [stale, active]) {
+      writeFileSync(base, "db");
+      writeFileSync(base + "-wal", "wal");
+    }
+    const old = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(stale, old, old);
+    fs.utimesSync(stale + "-wal", old, old);
+    fs.utimesSync(active, old, old);
+    // A fresh sidecar means this DB is active/recent and must survive.
+    fs.utimesSync(active + "-wal", new Date(), new Date());
+
+    expect(cleanupStaleContentDBs(contentDir, 14)).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(active)).toBe(true);
+    fs.rmSync(contentDir, { recursive: true, force: true });
+  });
+
   test("store.cleanup() removes own DB and WAL/SHM files", () => {
     const store = createStore();
     // Index something to generate WAL activity
@@ -1374,6 +1397,35 @@ describe("Max Chunk Size", () => {
       "Code block should be intact with opening fence",
     );
     store.close();
+  });
+  test("large sources keep porter recall while skipping bounded trigram indexing", () => {
+    const dbPath = join(tmpdir(), `ctx-trigram-budget-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath, { maxTrigramSourceBytes: 1024 });
+    const content = `needle-trigram-budget\n${"ordinary searchable content ".repeat(200)}`;
+
+    const result = store.indexPlainText(content, "large-secondary-index");
+    expect(result.trigramIndexed).toBe(false);
+    expect(store.search("needle-trigram-budget", 3, "large-secondary-index").length).toBeGreaterThan(0);
+    expect(store.searchTrigram("needle-trigram-budget", 3, "large-secondary-index")).toHaveLength(0);
+    store.cleanup();
+  });
+
+  test("derived vocabulary releases terms when a source is replaced", () => {
+    const dbPath = join(tmpdir(), `ctx-vocab-lifecycle-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+    store.indexPlainText("zephyr zephyr searchable material", "replace-me");
+
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    const hasZephyr = () => Number((db.prepare(
+      "SELECT COUNT(*) AS n FROM vocabulary WHERE term = 'zephyr'",
+    ).get() as { n: number }).n);
+    expect(hasZephyr()).toBeGreaterThan(0);
+
+    store.indexPlainText("quartz quartz replacement material", "replace-me");
+    expect(hasZephyr()).toBe(0);
+    db.close();
+    store.cleanup();
   });
 });
 
@@ -1897,6 +1949,20 @@ describe("ContentStore — corrupt DB recovery", () => {
 // ═══════════════════════════════════════════════════════════
 // mmap_size pragma
 // ═══════════════════════════════════════════════════════════
+
+describe("WAL size policy", () => {
+  test("applyWALPragmas caps retained WAL high-water size at 64 MiB", () => {
+    const dbPath = join(tmpdir(), `ctx-wal-limit-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const Database = loadDatabase();
+    const db = new Database(dbPath);
+    applyWALPragmas(db);
+    expect(Number(db.pragma("journal_size_limit"))).toBe(64 * 1024 * 1024);
+    closeDB(db);
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
+  });
+});
 
 describe("mmap_size pragma", () => {
   test("mmap_size is set on new ContentStore", () => {

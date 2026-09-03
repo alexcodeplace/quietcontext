@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, createProcessStorePath, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, createProcessStorePath, cleanupStaleContentDBs, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -675,6 +675,8 @@ interface StoreEntry {
   store: ContentStore | null;
   dbPath: string;
   lastTouchedAt: number;
+  /** Durable daemon stores survive process shutdown; stdio stores are ephemeral. */
+  persistent: boolean;
 }
 const _storeEntries = new Map<string, StoreEntry>();
 
@@ -692,6 +694,7 @@ const _rootInFlight = new Map<string, number>();
 const STORE_IDLE_EVICT_MS = Number(process.env.QUIET_CONTEXT_STORE_IDLE_EVICT_MS) || 30 * 60 * 1000;
 const STORE_EVICT_SWEEP_INTERVAL_MS = Number(process.env.QUIET_CONTEXT_STORE_EVICT_SWEEP_MS) || 5 * 60 * 1000;
 let _storeEvictionTimer: NodeJS.Timeout | null = null;
+let _daemonMode = false;
 
 /**
  * Enable idle-store eviction. The stdio child MUST NEVER call this — it
@@ -700,8 +703,29 @@ let _storeEvictionTimer: NodeJS.Timeout | null = null;
  * Only the shared HTTP daemon (many roots, long-lived process) calls it.
  */
 export function setDaemonMode(active: boolean): void {
-  if (active) startStoreEvictionSweep();
-  else stopStoreEvictionSweep();
+  _daemonMode = active;
+  if (active) {
+    // Reclaim abandoned durable project databases before opening any handles.
+    // Use newest DB/WAL/SHM activity so a recently checkpointed store survives.
+    try {
+      const contentDir = ensureWritableStorageDir(resolveContentStorageDir(getDefaultSessionDir));
+      cleanupStaleContentDBs(contentDir, 14);
+    } catch { /* retention must never block daemon startup */ }
+    startStoreEvictionSweep();
+  } else {
+    stopStoreEvictionSweep();
+  }
+}
+
+/** Low-frequency retention/WAL maintenance for currently-open daemon stores. */
+export function maintainContentStores(maxAgeDays: number = 14): number {
+  let deleted = 0;
+  for (const [root, entry] of _storeEntries.entries()) {
+    if (!entry.store || !entry.persistent) continue;
+    if ((_rootInFlight.get(root) ?? 0) > 0) continue;
+    try { deleted += entry.store.maintain(maxAgeDays); } catch { /* best effort */ }
+  }
+  return deleted;
 }
 
 function startStoreEvictionSweep(): void {
@@ -1017,13 +1041,19 @@ function getStore(): ContentStore {
     return reopened;
   }
 
-  // dbPath is server-owned (not ContentStore's internal default) so item 3
-  // can close the handle on idle eviction and reopen the SAME file later —
-  // ContentStore's own no-arg default picks a fresh random path every call.
-  const dbPath = createProcessStorePath();
+  // The shared HTTP daemon owns one durable per-project database; stdio
+  // fallback children remain process-local and ephemeral. Idle eviction may
+  // close either handle, but reopening always uses the same recorded dbPath.
+  const persistent = _daemonMode;
+  const dbPath = persistent ? getStorePath() : createProcessStorePath();
   const _store = new ContentStore(dbPath);
   configureStore(_store);
-  _storeEntries.set(storeRoot, { store: _store, dbPath, lastTouchedAt: Date.now() });
+  _storeEntries.set(storeRoot, {
+    store: _store,
+    dbPath,
+    lastTouchedAt: Date.now(),
+    persistent,
+  });
   return _store;
 }
 
@@ -1033,12 +1063,15 @@ export function releaseProcessResources(): void {
   stopStoreEvictionSweep();
   for (const entry of _storeEntries.values()) {
     if (entry.store) {
-      try { entry.store.cleanup(); } catch { /* best effort */ }
-    } else {
-      // Already evicted (closed, not unlinked) — the process is exiting
-      // for real now, so the ephemeral files can finally go.
+      try {
+        if (entry.persistent) entry.store.close();
+        else entry.store.cleanup();
+      } catch { /* best effort */ }
+    } else if (!entry.persistent) {
+      // Already idle-evicted stdio store: process exit owns its temp files.
       try { deleteDBFiles(entry.dbPath); } catch { /* best effort */ }
     }
+    // Durable daemon stores deliberately remain on disk for the next process.
   }
   _storeEntries.clear();
   try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
@@ -2989,10 +3022,10 @@ async function fetchWithManualRedirect(initialUrl) {
 // Subprocess response-body size cap. A malicious or unexpectedly large
 // endpoint reachable through ctx_fetch_and_index would otherwise stream
 // gigabytes into resp.text(), then into outputPath, then into the parent
-// MCP server's heap via readFileSync. 50 MB is far above typical web
-// page / API response sizes (~1-5 MB) but bounded enough to keep parent
-// heap survivable. Cap both early via Content-Length and after the read.
-const MAX_FETCH_BYTES = 50 * 1024 * 1024;
+// MCP server's heap via readFileSync. Keep this aligned with ContentStore's
+// 8 MiB source admission: accepting more only to reject it after materializing
+// the parent string wastes memory in the long-running daemon.
+const MAX_FETCH_BYTES = 8 * 1024 * 1024;
 async function safeText(resp) {
   const cl = parseInt(resp.headers.get('content-length') || '0', 10);
   if (cl > MAX_FETCH_BYTES) {
@@ -3272,7 +3305,7 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
       // but a torn write (subprocess killed mid-write, fs cache desync,
       // etc.) could still leave an oversized file. Bail before slurping
       // multiple gigabytes into the long-running MCP server's heap.
-      const MAX_FETCH_OUTPUT_BYTES = 50 * 1024 * 1024;
+      const MAX_FETCH_OUTPUT_BYTES = 8 * 1024 * 1024;
       const fileSize = statSync(outputPath).size;
       if (fileSize > MAX_FETCH_OUTPUT_BYTES) {
         return { kind: "fetch_error", url, error: `subprocess output ${fileSize} bytes exceeds cap ${MAX_FETCH_OUTPUT_BYTES}`, reason: "read" };

@@ -29,6 +29,7 @@ import {
   REGISTERED_CTX_TOOLS,
   VERSION,
   installStrictClientSchemaCompat,
+  maintainContentStores,
   resolveSessionIdFromSessionDB,
   setDaemonMode,
   withProjectDirOverride,
@@ -244,13 +245,24 @@ export async function startHttpDaemon(opts: HttpDaemonOptions = {}): Promise<Htt
   });
   const bound = httpServer.address();
   const boundPort = typeof bound === "object" && bound !== null ? bound.port : port;
+
+  // Ordinary SQLite auto-checkpointing handles live frames. This low-frequency
+  // pass only performs retention and truncates a reset WAL high-water file; it
+  // skips stores with in-flight requests in server.ts.
+  const maintenanceTimer = setInterval(() => {
+    maintainContentStores(14);
+  }, 6 * 60 * 60 * 1000);
+  maintenanceTimer.unref();
+
   console.error(`[quietcontext-daemon] v${VERSION} listening on http://${host}:${boundPort}/mcp`);
   return {
     port: boundPort,
-    close: () =>
-      new Promise<void>((resolvePromise, reject) => {
-        setDaemonMode(false);
+    close: () => {
+      clearInterval(maintenanceTimer);
+      setDaemonMode(false);
+      return new Promise<void>((resolvePromise, reject) => {
         httpServer.close((err) => (err ? reject(err) : resolvePromise()));
-      }),
+      });
+    },
   };
 }

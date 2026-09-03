@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -151,9 +151,15 @@ function maxEditDistance(wordLength: number): number {
 // length normalization and produce unwieldy search results. Split at paragraph
 // boundaries when a chunk exceeds this cap.
 const MAX_CHUNK_BYTES = 4096;
-const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+export const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_CHUNK_TITLE_BYTES = 256;
 const MAX_CHUNKS_PER_SOURCE = 4096;
+// Trigram indexing is excellent for fuzzy/substring recall but has much higher
+// write and disk amplification than the porter index. Large sources keep full
+// porter search while skipping the secondary trigram copy.
+export const MAX_TRIGRAM_SOURCE_BYTES = 1 * 1024 * 1024;
+const MAX_FUZZY_CANDIDATES = 4096;
+const MAX_DISTINCTIVE_TERMS_TRACKED = 20_000;
 
 // Blank-line sectioning is used only for output that is *naturally* sectioned:
 // at least a few sections, not an unbounded explosion, and no single section so
@@ -199,62 +205,32 @@ export function cleanupStaleDBs(): number {
 }
 
 /**
- * Check if a PID is still alive (not a zombie holding a WAL lock).
- * Returns true if the process exists, false if it's dead.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Clean up stale per-project content store DBs older than maxAgeDays.
- * Scans the given directory for *.db files and checks mtime.
- * Also detects zombie processes holding WAL locks — if a WAL file exists
- * but the owning PID is dead, the DB files are cleaned up regardless of age.
+ * Remove durable content-store DBs that have not been touched within the
+ * retention window. The newest mtime across DB/WAL/SHM wins, so an active or
+ * recently checkpointed database is never removed because its main file is old.
+ * Call only before opening daemon stores, not as a live connection sweeper.
  */
 export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): number {
   let cleaned = 0;
   try {
     if (!existsSync(contentDir)) return 0;
     const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    const files = readdirSync(contentDir).filter(f => f.endsWith(".db"));
+    const files = readdirSync(contentDir).filter((file) => file.endsWith(".db"));
     for (const file of files) {
+      const base = join(contentDir, file);
       try {
-        const filePath = join(contentDir, file);
-        const mtime = statSync(filePath).mtimeMs;
-        let shouldClean = mtime < cutoff;
-
-        // Detect zombie processes holding WAL locks:
-        // If a WAL file exists, try to read the WAL header to extract the PID.
-        // WAL files from dead processes can block new connections.
-        if (!shouldClean) {
-          const walPath = filePath + "-wal";
-          if (existsSync(walPath)) {
-            try {
-              const walStat = statSync(walPath);
-              // If WAL file is non-empty and DB hasn't been modified in >1 hour,
-              // the owning process may be dead — check via mtime staleness
-              if (walStat.size > 0 && (Date.now() - walStat.mtimeMs) > 3600_000) {
-                shouldClean = true;
-              }
-            } catch { /* ignore WAL check errors */ }
-          }
+        let latestMtime = 0;
+        for (const suffix of ["", "-wal", "-shm"]) {
+          try { latestMtime = Math.max(latestMtime, statSync(base + suffix).mtimeMs); } catch { /* absent sidecar */ }
         }
-
-        if (shouldClean) {
-          for (const suffix of ["", "-wal", "-shm"]) {
-            try { unlinkSync(filePath + suffix); } catch { /* ignore */ }
-          }
-          cleaned++;
+        if (latestMtime === 0 || latestMtime >= cutoff) continue;
+        for (const suffix of ["", "-wal", "-shm"]) {
+          try { unlinkSync(base + suffix); } catch { /* ignore */ }
         }
-      } catch { /* ignore per-file errors */ }
+        cleaned++;
+      } catch { /* ignore one damaged/inaccessible entry */ }
     }
-  } catch { /* ignore readdir errors */ }
+  } catch { /* ignore directory read errors */ }
   return cleaned;
 }
 
@@ -370,7 +346,6 @@ export class ContentStore {
   #stmtInsertSource!: PreparedStatement;
   #stmtInsertChunk!: PreparedStatement;
   #stmtInsertChunkTrigram!: PreparedStatement;
-  #stmtInsertVocab!: PreparedStatement;
 
   // Dedup path (delete previous source with same label before re-indexing)
   #stmtDeleteChunksByLabel!: PreparedStatement;
@@ -391,6 +366,7 @@ export class ContentStore {
   #stmtSearchTrigramContentType!: PreparedStatement;
   #stmtSearchTrigramFilteredContentType!: PreparedStatement;
   #stmtSearchTrigramExactContentType!: PreparedStatement;
+  #stmtFuzzyExactVocab!: PreparedStatement;
 
   // Read path
   #stmtListSources!: PreparedStatement;
@@ -399,22 +375,32 @@ export class ContentStore {
   #stmtChunkContent!: PreparedStatement;
   #stmtStats!: PreparedStatement;
   #stmtSourceMeta!: PreparedStatement;
+  #stmtIndexState!: PreparedStatement;
+  #stmtFileBackedSources!: PreparedStatement;
 
   // Cleanup path
   #stmtCleanupChunks!: PreparedStatement;
   #stmtCleanupChunksTrigram!: PreparedStatement;
   #stmtCleanupSources!: PreparedStatement;
 
-  // Fuzzy correction cache (process-local LRU). fuzzyCorrect() hits the vocab
-  // DB and runs levenshtein against every candidate within length tolerance,
-  // which is CPU-linear in |candidates|. Repeated queries ("erro", "erro" …)
-  // recompute the same answer. The vocabulary table is insert-only, so cache
-  // entries only become stale when new words enter — we clear on actual insert.
+  // Fuzzy correction cache (process-local LRU). Candidates come from an
+  // fts5vocab view over the porter index, so deleted/evicted sources disappear
+  // automatically and no second insert-only vocabulary corpus can grow forever.
   #fuzzyCache = new Map<string, string | null>();
+  #maxTrigramSourceBytes: number;
   static readonly FUZZY_CACHE_SIZE = 256;
+  // Kept for API compatibility with integrations that introspect this member;
+  // full-index synchronous optimize is intentionally no longer scheduled.
   static readonly OPTIMIZE_EVERY = 50;
 
-  constructor(dbPath?: string) {
+  constructor(dbPath?: string, options?: {
+    maxTrigramSourceBytes?: number;
+  }) {
+    const maxTrigramSourceBytes = options?.maxTrigramSourceBytes ?? MAX_TRIGRAM_SOURCE_BYTES;
+    if (!Number.isSafeInteger(maxTrigramSourceBytes) || maxTrigramSourceBytes < 0) {
+      throw new RangeError("maxTrigramSourceBytes must be a non-negative integer");
+    }
+    this.#maxTrigramSourceBytes = maxTrigramSourceBytes;
     const Database = loadDatabase();
     this.#dbPath = dbPath ?? createProcessStorePath();
     cleanOrphanedWALFiles(this.#dbPath);
@@ -465,7 +451,9 @@ export class ContentStore {
         code_chunk_count INTEGER NOT NULL DEFAULT 0,
         indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
         file_path TEXT,
-        content_hash TEXT
+        content_hash TEXT,
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        trigram_indexed INTEGER NOT NULL DEFAULT 1
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
@@ -492,11 +480,8 @@ export class ContentStore {
         tokenize='trigram'
       );
 
-      CREATE TABLE IF NOT EXISTS vocabulary (
-        word TEXT PRIMARY KEY
-      );
-
       CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
+      CREATE INDEX IF NOT EXISTS idx_sources_indexed_at ON sources(indexed_at, id);
     `);
 
     // FTS5 schema migration: old schema (4 cols) → new schema (8 cols).
@@ -507,9 +492,15 @@ export class ContentStore {
     //   2. Old schema (4 cols) → DROP + CREATE new
     //   3. New schema (8 cols) → do nothing
     try {
-      const cols = this.#db.prepare(
+      const schemaStmt = this.#db.prepare(
         "SELECT name FROM pragma_table_xinfo('chunks')"
-      ).all() as Array<{ name: string }>;
+      );
+      let cols: Array<{ name: string }>;
+      try {
+        cols = schemaStmt.all() as Array<{ name: string }>;
+      } finally {
+        (schemaStmt as unknown as PreparedStatement).finalize?.();
+      }
       const colNames = new Set(cols.map(c => c.name));
       if (cols.length > 0 && !colNames.has("source_category")) {
         // Old schema detected — drop both FTS5 tables and re-create with new columns
@@ -542,27 +533,44 @@ export class ContentStore {
       }
     } catch { /* pragma_table_xinfo may fail if table doesn't exist yet — safe to ignore */ }
 
-    // Stale detection columns — safe for existing DBs (ALTER is O(1) in SQLite)
+    // Source metadata columns — safe for existing DBs (ALTER is O(1) in SQLite).
     try { this.#db.exec("ALTER TABLE sources ADD COLUMN file_path TEXT"); } catch { /* already exists */ }
     try { this.#db.exec("ALTER TABLE sources ADD COLUMN content_hash TEXT"); } catch { /* already exists */ }
+    try { this.#db.exec("ALTER TABLE sources ADD COLUMN byte_size INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
+    try { this.#db.exec("ALTER TABLE sources ADD COLUMN trigram_indexed INTEGER NOT NULL DEFAULT 1"); } catch { /* already exists */ }
+    try { this.#db.exec("CREATE INDEX IF NOT EXISTS idx_sources_indexed_at ON sources(indexed_at, id)"); } catch { /* best effort */ }
+    // Replace the old insert-only vocabulary table with a zero-copy fts5vocab
+    // view over the porter index. Terms now follow FTS insert/delete lifecycle,
+    // so stale-source cleanup and cache eviction reclaim vocabulary naturally.
+    let vocabSql = "";
+    const vocabSchemaStmt = this.#db.prepare(
+      "SELECT sql FROM sqlite_schema WHERE name = 'vocabulary'",
+    );
+    try {
+      const row = vocabSchemaStmt.get() as { sql?: string | null } | undefined;
+      vocabSql = row?.sql ?? "";
+    } finally {
+      (vocabSchemaStmt as unknown as PreparedStatement).finalize?.();
+    }
+    if (!/USING\s+fts5vocab\s*\(/i.test(vocabSql)) {
+      this.#db.exec("DROP TABLE IF EXISTS vocabulary");
+      this.#db.exec("CREATE VIRTUAL TABLE vocabulary USING fts5vocab(chunks, 'row')");
+    }
   }
 
   #prepareStatements(): void {
     // Write path
     this.#stmtInsertSourceEmpty = this.#db.prepare(
-      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, 0, 0, ?, ?)",
+      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash, byte_size, trigram_indexed) VALUES (?, 0, 0, ?, ?, ?, ?)",
     );
     this.#stmtInsertSource = this.#db.prepare(
-      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash, byte_size, trigram_indexed) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunk = this.#db.prepare(
       "INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunkTrigram = this.#db.prepare(
       "INSERT INTO chunks_trigram (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    );
-    this.#stmtInsertVocab = this.#db.prepare(
-      "INSERT OR IGNORE INTO vocabulary (word) VALUES (?)",
     );
 
     // Dedup path: delete previous source with same label before re-indexing
@@ -775,7 +783,12 @@ export class ContentStore {
 
     // Fuzzy path
     this.#stmtFuzzyVocab = this.#db.prepare(
-      "SELECT word FROM vocabulary WHERE length(word) BETWEEN ? AND ?",
+      `SELECT term AS word FROM vocabulary
+       WHERE length(term) BETWEEN ? AND ?
+       LIMIT ${MAX_FUZZY_CANDIDATES}`,
+    );
+    this.#stmtFuzzyExactVocab = this.#db.prepare(
+      "SELECT 1 AS found FROM vocabulary WHERE term = ? LIMIT 1",
     );
 
     // Read path
@@ -797,6 +810,12 @@ export class ContentStore {
     );
     this.#stmtSourceMeta = this.#db.prepare(
       "SELECT label, chunk_count, code_chunk_count, indexed_at, file_path, content_hash FROM sources WHERE label = ?",
+    );
+    this.#stmtIndexState = this.#db.prepare(
+      "SELECT COALESCE(SUM(chunk_count), 0) AS total_chunks, COUNT(*) AS total_sources, MAX(indexed_at) AS last_indexed_at FROM sources",
+    );
+    this.#stmtFileBackedSources = this.#db.prepare(
+      "SELECT label, file_path, content_hash, indexed_at FROM sources WHERE file_path IS NOT NULL",
     );
     this.#stmtStats = this.#db.prepare(`
       SELECT
@@ -855,6 +874,47 @@ export class ContentStore {
     chunks.push(chunk);
   }
 
+  /** Read a regular file without ever allocating beyond the source admission cap. */
+  #readBoundedFile(filePath: string): string {
+    const fd = openSync(filePath, "r");
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile()) {
+        throw new Error(`refusing to index ${filePath}: not a regular file`);
+      }
+      if (st.size > MAX_SOURCE_BYTES) {
+        throw new RangeError(
+          `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${st.size} bytes)`,
+        );
+      }
+      const readBuffer = Buffer.allocUnsafe(
+        Math.min(Math.max(st.size, 4096), 64 * 1024),
+      );
+      const parts: Buffer[] = [];
+      let bytesRead = 0;
+      while (bytesRead <= MAX_SOURCE_BYTES) {
+        const count = readSync(
+          fd,
+          readBuffer,
+          0,
+          Math.min(readBuffer.length, MAX_SOURCE_BYTES + 1 - bytesRead),
+          null,
+        );
+        if (count === 0) break;
+        parts.push(Buffer.from(readBuffer.subarray(0, count)));
+        bytesRead += count;
+      }
+      if (bytesRead > MAX_SOURCE_BYTES) {
+        throw new RangeError(
+          `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${bytesRead}+ bytes)`,
+        );
+      }
+      return Buffer.concat(parts, bytesRead).toString("utf-8");
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   index(options: {
     content?: string;
     path?: string;
@@ -891,43 +951,7 @@ export class ContentStore {
     if (hasContent) {
       text = content!;
     } else {
-      const fd = openSync(path!, "r");
-      try {
-        const st = fstatSync(fd);
-        if (!st.isFile()) {
-          throw new Error(`refusing to index ${path}: not a regular file`);
-        }
-        if (st.size > MAX_SOURCE_BYTES) {
-          throw new RangeError(
-            `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${st.size} bytes)`,
-          );
-        }
-        const readBuffer = Buffer.allocUnsafe(
-          Math.min(Math.max(st.size, 4096), 64 * 1024),
-        );
-        const parts: Buffer[] = [];
-        let bytesRead = 0;
-        while (bytesRead <= MAX_SOURCE_BYTES) {
-          const count = readSync(
-            fd,
-            readBuffer,
-            0,
-            Math.min(readBuffer.length, MAX_SOURCE_BYTES + 1 - bytesRead),
-            null,
-          );
-          if (count === 0) break;
-          parts.push(Buffer.from(readBuffer.subarray(0, count)));
-          bytesRead += count;
-        }
-        if (bytesRead > MAX_SOURCE_BYTES) {
-          throw new RangeError(
-            `Source exceeds ${MAX_SOURCE_BYTES}-byte indexing limit (${bytesRead}+ bytes)`,
-          );
-        }
-        text = Buffer.concat(parts, bytesRead).toString("utf-8");
-      } finally {
-        closeSync(fd);
-      }
+      text = this.#readBoundedFile(path!);
     }
     const label = source ?? path ?? "untitled";
     this.#assertSourceSize(text);
@@ -1077,9 +1101,8 @@ export class ContentStore {
   // ── Shared DB Insertion ──
 
   /**
-   * Shared DB insertion logic for all index methods. Inserts chunks
-   * into both FTS5 tables within a transaction and extracts vocabulary.
-   * Uses cached prepared statements from #prepareStatements().
+   * Shared DB insertion logic for all index methods. Porter indexing is always
+   * complete; trigram indexing is admitted only for bounded-size sources.
    */
   #insertChunks(
     chunks: Chunk[],
@@ -1099,45 +1122,54 @@ export class ContentStore {
       title: this.#byteCappedPrefix(chunk.title, MAX_CHUNK_TITLE_BYTES),
     }));
     const codeChunks = boundedChunks.filter((c) => c.hasCode).length;
+    const sourceBytes = Buffer.byteLength(text);
+    const trigramIndexed = sourceBytes <= this.#maxTrigramSourceBytes;
     // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
     // "not-null but unattributed" sentinel used by legacy rows.
     const sessionIdCol = attribution?.sessionId ?? "";
     const eventIdCol = attribution?.eventId ?? "";
 
-    // Atomic dedup + insert: delete previous source with same label,
-    // then insert new content — all within a single transaction.
-    // Prevents stale results in iterative workflows. (See: GitHub issue #67)
+    // Atomic dedup + insert. Re-indexing a label replaces its old FTS rows
+    // rather than accumulating generations of transient build/test output.
     const transaction = this.#db.transaction(() => {
       this.#stmtDeleteChunksByLabel.run(label);
       this.#stmtDeleteChunksTrigramByLabel.run(label);
       this.#stmtDeleteSourcesByLabel.run(label);
 
       if (boundedChunks.length === 0) {
-        const info = this.#stmtInsertSourceEmpty.run(label, filePath ?? null, contentHash ?? null);
+        const info = this.#stmtInsertSourceEmpty.run(
+          label, filePath ?? null, contentHash ?? null, sourceBytes, trigramIndexed ? 1 : 0,
+        );
         return Number(info.lastInsertRowid);
       }
 
-      const info = this.#stmtInsertSource.run(label, boundedChunks.length, codeChunks, filePath ?? null, contentHash ?? null);
+      const info = this.#stmtInsertSource.run(
+        label, boundedChunks.length, codeChunks, filePath ?? null, contentHash ?? null,
+        sourceBytes, trigramIndexed ? 1 : 0,
+      );
       const sourceId = Number(info.lastInsertRowid);
 
       const now = new Date().toISOString();
       for (const chunk of boundedChunks) {
         const ct = chunk.hasCode ? "code" : "prose";
         this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
-        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        if (trigramIndexed) {
+          this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        }
       }
 
       return sourceId;
     });
 
     const sourceId = transaction();
-    if (text) this.#extractAndStoreVocabulary(text);
+    this.#fuzzyCache.clear();
 
     return {
       sourceId,
       label,
       totalChunks: boundedChunks.length,
       codeChunks,
+      trigramIndexed,
     };
   }
 
@@ -1256,6 +1288,8 @@ export class ContentStore {
       return cached;
     }
 
+    if (this.#stmtFuzzyExactVocab.get(word)) return null;
+
     const maxDist = maxEditDistance(word.length);
 
     const candidates = this.#stmtFuzzyVocab.all(
@@ -1265,13 +1299,8 @@ export class ContentStore {
 
     let bestWord: string | null = null;
     let bestDist = maxDist + 1;
-    let exactMatch = false;
 
     for (const { word: candidate } of candidates) {
-      if (candidate === word) {
-        exactMatch = true;
-        break;
-      }
       const dist = levenshtein(word, candidate);
       if (dist < bestDist) {
         bestDist = dist;
@@ -1279,7 +1308,7 @@ export class ContentStore {
       }
     }
 
-    const result = exactMatch ? null : bestDist <= maxDist ? bestWord : null;
+    const result = bestDist <= maxDist ? bestWord : null;
 
     // Evict the oldest entry before insert if we hit the size cap.
     if (this.#fuzzyCache.size >= ContentStore.FUZZY_CACHE_SIZE) {
@@ -1466,9 +1495,9 @@ export class ContentStore {
    */
   #refreshStaleSources(): void {
     this.lastRefreshCount = 0;
-    const sources = this.#db.prepare(
-      "SELECT label, file_path, content_hash, indexed_at FROM sources WHERE file_path IS NOT NULL",
-    ).all() as Array<{ label: string; file_path: string; content_hash: string; indexed_at: string }>;
+    const sources = this.#stmtFileBackedSources.all() as Array<{
+      label: string; file_path: string; content_hash: string; indexed_at: string;
+    }>;
 
     for (const src of sources) {
       try {
@@ -1485,15 +1514,7 @@ export class ContentStore {
         // mtime advanced — fd-bound read for hash + indexing in one go.
         // Open once, fstat, read from fd. Closes the swap-mid-flight
         // window between hash read and re-index. #442 round-3.
-        const fd = openSync(src.file_path, "r");
-        let newContent: string;
-        try {
-          const st = fstatSync(fd);
-          if (!st.isFile()) continue; // skip non-regular targets
-          newContent = readFileSync(fd, "utf-8");
-        } finally {
-          closeSync(fd);
-        }
+        const newContent = this.#readBoundedFile(src.file_path);
         const newHash = createHash("sha256").update(newContent).digest("hex");
         if (newHash === src.content_hash) continue; // content identical — skip
 
@@ -1532,13 +1553,11 @@ export class ContentStore {
    * round trip instead of inferring it from snapshot diffs.
    */
   getIndexState(): { totalChunks: number; totalSources: number; lastIndexedAt?: string } {
-    const row = (this.#db
-      .prepare("SELECT COALESCE(SUM(chunk_count), 0) AS total_chunks, COUNT(*) AS total_sources, MAX(indexed_at) AS last_indexed_at FROM sources")
-      .get() as {
-        total_chunks: number;
-        total_sources: number;
-        last_indexed_at: string | null;
-      });
+    const row = this.#stmtIndexState.get() as {
+      total_chunks: number;
+      total_sources: number;
+      last_indexed_at: string | null;
+    };
     return {
       totalChunks: row.total_chunks ?? 0,
       totalSources: row.total_sources ?? 0,
@@ -1592,7 +1611,11 @@ export class ContentStore {
           .filter((w) => w.length >= 3 && !STOPWORDS.has(w)),
       );
       for (const word of words) {
-        docFreq.set(word, (docFreq.get(word) ?? 0) + 1);
+        if (docFreq.has(word)) {
+          docFreq.set(word, (docFreq.get(word) ?? 0) + 1);
+        } else if (docFreq.size < MAX_DISTINCTIVE_TERMS_TRACKED) {
+          docFreq.set(word, 1);
+        }
       }
     }
 
@@ -1644,7 +1667,19 @@ export class ContentStore {
       return this.#stmtCleanupSources.run(days);
     });
     const info = cleanup(maxAgeDays);
+    if (info.changes > 0) this.#fuzzyCache.clear();
     return info.changes;
+  }
+
+  /**
+   * Low-frequency maintenance for the long-running shared daemon. TRUNCATE is
+   * safe here because each project has one ContentStore connection owned by the
+   * daemon and JavaScript cannot interleave another synchronous SQLite call.
+   */
+  maintain(maxAgeDays: number = 14): number {
+    const deleted = this.cleanupStaleSources(maxAgeDays);
+    try { this.#db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* best effort */ }
+    return deleted;
   }
 
   /** Get DB file size in bytes. */
@@ -1658,30 +1693,6 @@ export class ContentStore {
 
   close(): void {
     closeDB(this.#db);
-  }
-
-  // ── Vocabulary Extraction ──
-
-  #extractAndStoreVocabulary(content: string): void {
-    const words = content
-      .toLowerCase()
-      .split(/[^\p{L}\p{N}_-]+/u)
-      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
-
-    const unique = [...new Set(words)];
-
-    let inserted = 0;
-    this.#db.transaction(() => {
-      for (const word of unique) {
-        const info = this.#stmtInsertVocab.run(word);
-        inserted += info.changes;
-      }
-    })();
-
-    // Invalidate fuzzy cache when new vocab words actually land. INSERT OR
-    // IGNORE reports changes=0 for duplicates, so re-indexing identical
-    // content does not thrash the cache during iterative workflows.
-    if (inserted > 0) this.#fuzzyCache.clear();
   }
 
   // ── Chunking ──

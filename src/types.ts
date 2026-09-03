@@ -78,6 +78,8 @@ export interface IndexResult {
   label: string;
   totalChunks: number;
   codeChunks: number;
+  /** False when a large source intentionally skipped the high-amplification trigram index. */
+  trigramIndexed?: boolean;
 }
 
 /**

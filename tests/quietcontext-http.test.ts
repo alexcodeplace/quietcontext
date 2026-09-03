@@ -19,6 +19,7 @@ let token = "";
 let scratch = "";
 let rootA = "";
 let rootB = "";
+let daemonEnv: Record<string, string> = {};
 
 function startDaemon(env: Record<string, string>): Promise<number> {
   return new Promise((resolvePort, reject) => {
@@ -103,10 +104,13 @@ beforeAll(async () => {
   writeFileSync(join(rootA, "marker-a.txt"), "alpha-marker-content-8271\n");
   writeFileSync(join(rootB, "marker-b.txt"), "beta-marker-content-9382\n");
   const tokenFile = join(scratch, "daemon.token");
-  port = await startDaemon({
+  daemonEnv = {
+    HOME: scratch,
+    CLAUDE_CONFIG_DIR: join(scratch, "claude-config"),
     QUIET_CONTEXT_DAEMON_PORT: "0",
     QUIET_CONTEXT_DAEMON_TOKEN_FILE: tokenFile,
-  });
+  };
+  port = await startDaemon(daemonEnv);
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   token = (require("node:fs") as typeof import("node:fs"))
     .readFileSync(tokenFile, "utf8")
@@ -198,5 +202,22 @@ describe("quietcontext shared HTTP daemon", () => {
     const missText = toolText(missB);
     expect(missText).not.toContain("zebra-pineapple-4417");
     expect(missText).not.toMatch(/\[r:\d+\]/);
+  }, 30_000);
+
+  test("durable project index survives daemon restart", async () => {
+    const exited = new Promise<void>((resolveExit) => daemon.once("exit", () => resolveExit()));
+    daemon.kill("SIGTERM");
+    await exited;
+    port = await startDaemon(daemonEnv);
+
+    const hit = await callTool(
+      "search",
+      { queries: ["zebra-pineapple"], preview: true },
+      { root: rootA },
+    );
+    expect(toolText(hit)).toContain("zebra-pineapple-4417");
+
+    const miss = await callTool("search", { queries: ["zebra-pineapple"] }, { root: rootB });
+    expect(toolText(miss)).not.toContain("zebra-pineapple-4417");
   }, 30_000);
 });
