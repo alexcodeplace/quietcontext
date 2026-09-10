@@ -21,6 +21,17 @@ let rootA = "";
 let rootB = "";
 let daemonEnv: Record<string, string> = {};
 
+async function stopDaemon(child: ChildProcessWithoutNullStreams | undefined): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+  child.kill("SIGTERM");
+  await Promise.race([closed, new Promise<void>((resolveWait) => setTimeout(resolveWait, 5000))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([closed, new Promise<void>((resolveWait) => setTimeout(resolveWait, 2000))]);
+  }
+}
+
 function startDaemon(env: Record<string, string>): Promise<number> {
   return new Promise((resolvePort, reject) => {
     daemon = spawn(process.execPath, [join(ROOT, "start-http.mjs")], {
@@ -117,9 +128,9 @@ beforeAll(async () => {
     .trim();
 }, 30_000);
 
-afterAll(() => {
-  daemon?.kill("SIGTERM");
-  rmSync(scratch, { recursive: true, force: true });
+afterAll(async () => {
+  await stopDaemon(daemon);
+  rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe("quietcontext shared HTTP daemon", () => {

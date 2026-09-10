@@ -41,12 +41,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache better-sqlite3 native addon
-        uses: actions/cache@v4
-        with:
-          path: node_modules/better-sqlite3/build
-          key: better-sqlite3-${{ runner.os }}-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
-
       - name: Cache OpenClaw binary
         id: cache-openclaw
         uses: actions/cache@v4
