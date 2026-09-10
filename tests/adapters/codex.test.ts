@@ -329,8 +329,8 @@ describe("CodexAdapter", () => {
       expect(config.PreToolUse[0]?.matcher).toMatch(/(^|\|)mcp__$/);
       expect(config.PreToolUse[0]?.matcher).not.toMatch(/(^|\|)Read(\||$)/);
       expect(config.PreToolUse[0]?.matcher).not.toContain("mcp__plugin_context-mode_context-mode__");
-      expect(config.PreCompact[0]?.hooks[0]?.command).toBe("context-mode hook codex precompact");
-      expect(config.UserPromptSubmit[0]?.hooks[0]?.command).toBe("context-mode hook codex userpromptsubmit");
+      expect(config.PreCompact[0]?.hooks[0]?.command).toBe("qc hook codex precompact");
+      expect(config.UserPromptSubmit[0]?.hooks[0]?.command).toBe("qc hook codex userpromptsubmit");
     });
   });
 
@@ -358,8 +358,8 @@ describe("CodexAdapter", () => {
       expect(written.hooks.PreToolUse[0]?.matcher).toMatch(/(^|\|)mcp__$/);
       expect(written.hooks.PreToolUse[0]?.matcher).not.toMatch(/(^|\|)Read(\||$)/);
       expect(written.hooks.PreToolUse[0]?.matcher).not.toContain("mcp__plugin_context-mode_context-mode__");
-      expect(written.hooks.PreCompact[0]?.hooks[0]?.command).toBe("context-mode hook codex precompact");
-      expect(written.hooks.Stop[0]?.hooks[0]?.command).toBe("context-mode hook codex stop");
+      expect(written.hooks.PreCompact[0]?.hooks[0]?.command).toBe("qc hook codex precompact");
+      expect(written.hooks.Stop[0]?.hooks[0]?.command).toBe("qc hook codex stop");
       expect(readFileSync(join(codexDir, "config.toml"), "utf-8")).toContain("hooks = true");
     });
 
@@ -494,9 +494,9 @@ describe("CodexAdapter", () => {
       };
 
       expect(written.hooks.PreToolUse).toHaveLength(1);
-      expect(written.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("context-mode hook codex pretooluse");
+      expect(written.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("qc hook codex pretooluse");
       expect(written.hooks.SessionStart).toHaveLength(1);
-      expect(written.hooks.SessionStart[0]?.hooks[0]?.command).toBe("context-mode hook codex sessionstart");
+      expect(written.hooks.SessionStart[0]?.hooks[0]?.command).toBe("qc hook codex sessionstart");
       expect(changes.some((c) => c.includes("Removed duplicate"))).toBe(true);
     });
 
@@ -524,9 +524,9 @@ describe("CodexAdapter", () => {
       };
 
       expect(written.hooks.PreToolUse).toHaveLength(1);
-      expect(written.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("context-mode hook codex pretooluse");
+      expect(written.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("qc hook codex pretooluse");
       expect(written.hooks.PostToolUse).toHaveLength(1);
-      expect(written.hooks.PostToolUse[0]?.hooks[0]?.command).toBe("context-mode hook codex posttooluse");
+      expect(written.hooks.PostToolUse[0]?.hooks[0]?.command).toBe("qc hook codex posttooluse");
     });
 
     it("dedups plugin-cache legacy entry left by /ctx-upgrade with canonical entry (#603)", () => {
@@ -550,9 +550,9 @@ describe("CodexAdapter", () => {
       };
 
       expect(written.hooks.UserPromptSubmit).toHaveLength(1);
-      expect(written.hooks.UserPromptSubmit[0]?.hooks[0]?.command).toBe("context-mode hook codex userpromptsubmit");
+      expect(written.hooks.UserPromptSubmit[0]?.hooks[0]?.command).toBe("qc hook codex userpromptsubmit");
       expect(written.hooks.Stop).toHaveLength(1);
-      expect(written.hooks.Stop[0]?.hooks[0]?.command).toBe("context-mode hook codex stop");
+      expect(written.hooks.Stop[0]?.hooks[0]?.command).toBe("qc hook codex stop");
     });
   });
 

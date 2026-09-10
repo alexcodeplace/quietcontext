@@ -67,11 +67,24 @@ qc status
 qc doctor
 ```
 
-`context-mode` remains an executable compatibility alias for pre-existing platform hook configurations; new user-facing local workflows should use `quietcontext` or `qc`.
+`context-mode` remains an executable compatibility alias for pre-existing platform hook configurations. New hook configurations use `qc hook <platform> <event>`; new user-facing local workflows use `qc`.
 
 `qc run -- ...` executes argv directly through the same native filtering engine used by supported MCP shell commands. It preserves the child exit code. When filtering omits raw text, QuietContext retains bounded exact evidence and indexes searchable text so `search` can recover an omitted line. `qc repo` exposes the same native repository map/symbol/reference/outline engine as the MCP `repo` tool. `qc index` and `qc search` are local front doors to QuietContext's project-scoped FTS5 store; `qc index --stdin` accepts at most the normal per-source indexing cap and rejects invalid UTF-8 instead of silently indexing binary data.
 
 The existing Claude/Codex `PreToolUse` hook contains an opt-in `qc` routing branch and **does not enable it automatically**. Run `qc routing enable` to activate it (or `qc routing disable` to remove the marker). `QUIET_CONTEXT_QC_BASH_ROUTING=0` is an emergency bypass. When active, simple noisy commands are routed through `qc`; uncertain shell syntax passes through unchanged. Modern Codex can rewrite transparently, while current Claude Code uses an enforceable deny with an exact `qc run -- ...` retry because its Bash hook does not honor command substitution.
+
+When the Codex adapter installs its user-level hook, the canonical entry is `qc hook codex pretooluse` with the exact supported matcher:
+
+```json
+{
+  "PreToolUse": [{
+    "matcher": "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__",
+    "hooks": [{ "type": "command", "command": "qc hook codex pretooluse" }]
+  }]
+}
+```
+
+The packaged Codex plugin keeps its automatic hook manifest empty; installation into a user's `hooks.json` remains an explicit adapter/setup action. Legacy `context-mode hook ...` entries are recognized and replaced rather than duplicated.
 
 ## Token budgets
 

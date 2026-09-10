@@ -70,6 +70,25 @@ describe("qc local content-store front door", () => {
     expect(full.stdout).toContain("second line kept in full output");
   });
 
+  test("dispatches platform hooks through the qc front door without enabling routing", () => {
+    const root = scratch("qc-cli-hook-");
+    const project = join(root, "project");
+    mkdirSync(project);
+    const env = { ...baseEnv(root), QUIET_CONTEXT_QC_BASH_ROUTING: "0" };
+    const input = JSON.stringify({
+      session_id: "qc-cli-hook",
+      tool_name: "Bash",
+      tool_input: { command: "cargo test" },
+      cwd: project,
+    });
+
+    const result = runQc(["hook", "codex", "pretooluse"], { cwd: project, env, input });
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout.trim());
+    expect(output.hookSpecificOutput?.hookEventName).toBe("PreToolUse");
+    expect(output.hookSpecificOutput?.permissionDecision).not.toBe("deny");
+  });
+
   test("accepts --label as a compatibility alias and rejects unsafe stdin", () => {
     const root = scratch("qc-cli-compat-");
     const project = join(root, "project");

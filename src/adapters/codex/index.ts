@@ -99,12 +99,12 @@ const PRE_TOOL_USE_MATCHER_PATTERN =
   "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__";
 
 const CODEX_HOOK_COMMANDS = {
-  PreToolUse: "context-mode hook codex pretooluse",
-  PostToolUse: "context-mode hook codex posttooluse",
-  SessionStart: "context-mode hook codex sessionstart",
-  PreCompact: "context-mode hook codex precompact",
-  UserPromptSubmit: "context-mode hook codex userpromptsubmit",
-  Stop: "context-mode hook codex stop",
+  PreToolUse: "qc hook codex pretooluse",
+  PostToolUse: "qc hook codex posttooluse",
+  SessionStart: "qc hook codex sessionstart",
+  PreCompact: "qc hook codex precompact",
+  UserPromptSubmit: "qc hook codex userpromptsubmit",
+  Stop: "qc hook codex stop",
 } as const;
 
 const LEGACY_HOOK_PATH_SUFFIXES: Record<keyof typeof CODEX_HOOK_COMMANDS, string[]> = {
@@ -1181,10 +1181,14 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
     const expectedCliCommand = this.normalizeCommand(
       CODEX_HOOK_COMMANDS[hookName as keyof typeof CODEX_HOOK_COMMANDS] ?? "",
     );
+    const legacyCliCommand = this.normalizeCommand(
+      expectedCliCommand.replace(/^qc hook /, "context-mode hook "),
+    );
     const legacySuffixes = LEGACY_HOOK_PATH_SUFFIXES[hookName as keyof typeof LEGACY_HOOK_PATH_SUFFIXES] ?? [];
 
     return normalizedCommands.some((command) =>
       command.includes(expectedCliCommand)
+      || command.includes(legacyCliCommand)
       || legacySuffixes.some((suffix) => command.includes(suffix)),
     );
   }

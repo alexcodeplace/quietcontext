@@ -22,6 +22,7 @@ function help() {
     "  qc repo outline <file> [--root <path>]",
     "  qc index <path> | --stdin --source <label> [--project <path>]",
     "  qc search <query...> [--project <path>] [--source <label>] [--full]",
+    "  qc hook <platform> <event>",
     "  qc doctor",
     "  qc status",
     "  qc routing status|enable|disable",
@@ -128,6 +129,13 @@ async function main() {
   }
   if (args[0] === "repo") {
     return runRepo(args.slice(1));
+  }
+  if (args[0] === "hook") {
+    if (args.length !== 3) {
+      process.stderr.write("qc: hook requires exactly <platform> <event>\n");
+      return 2;
+    }
+    return runContextModeCli(args);
   }
   if (args[0] === "index" || args[0] === "search") {
     return runContextModeCli(args);
