@@ -33,11 +33,21 @@ echo "→ context-mode plugin installer"
 echo "  plugin root : $PLUGIN_ROOT"
 echo "  openclaw    : $OPENCLAW_STATE_DIR"
 
-# 1. Build TypeScript + rebuild native bindings for system Node
+# 1. Build TypeScript + rebuild native bindings for system Node. This repository
+# is pnpm-owned; running npm install over it can corrupt/partially traverse the
+# pnpm dependency graph (and currently trips npm Arborist in CI).
 echo "→ building..."
-npm --prefix "$PLUGIN_ROOT" install --silent
-npm --prefix "$PLUGIN_ROOT" run build
-npm --prefix "$PLUGIN_ROOT" rebuild better-sqlite3
+if command -v pnpm >/dev/null 2>&1; then
+  PM=(pnpm)
+elif command -v corepack >/dev/null 2>&1; then
+  PM=(corepack pnpm)
+else
+  echo "✗ pnpm (or corepack) is required to build this plugin" >&2
+  exit 1
+fi
+"${PM[@]}" --dir "$PLUGIN_ROOT" install --no-frozen-lockfile --silent
+"${PM[@]}" --dir "$PLUGIN_ROOT" run build
+"${PM[@]}" --dir "$PLUGIN_ROOT" rebuild better-sqlite3
 
 # 2. Create global extension dir (real directory — OpenClaw does NOT follow dir symlinks)
 echo "→ installing extension into $EXT_DIR..."

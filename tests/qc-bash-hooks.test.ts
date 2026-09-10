@@ -29,6 +29,8 @@ function fixture(codexVersion?: string) {
       HOME: home,
       CLAUDE_CONFIG_DIR: join(home, ".claude"),
       TMPDIR: tmp,
+      TEMP: tmp,
+      TMP: tmp,
       PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
       QUIET_CONTEXT_QC_BASH_ROUTING: "1",
     },
