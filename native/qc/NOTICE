@@ -1,11 +1,22 @@
-ft
-Copyright 2026 fewtok contributors
+QuietContext native engine — third-party notices
 
-This product includes code derived from RTK (Rust Token Killer),
-originally developed by rtk-ai and licensed under the Apache License 2.0.
+Portions of this native engine were migrated from Fewtok.
+Copyright (c) 2026 fewtok contributors
+License: MIT
+License text: LICENSES/Fewtok-MIT.txt
 
+The command-output filtering implementation includes code derived from
+RTK (Rust Token Killer), originally developed by rtk-ai.
+Copyright 2024 rtk-ai and rtk-ai Labs
 Source: https://github.com/rtk-ai/rtk
+Source license snapshot: commit 805caf7d069e93370a316682b36aad59d562de2e
 License: Apache License, Version 2.0
+License text: LICENSES/Apache-2.0.txt
 
-Specifically, command output filter logic in ft/src/filter/ is derived
-from RTK's src/cmds/ modules, adapted and extended for the ft architecture.
+The RTK-derived portions entered QuietContext through Fewtok's
+ft/src/filter/ implementation and now live under native/qc/src/filter/,
+with subsequent QuietContext-specific adaptations.
+
+These notices and license texts apply to the incorporated portions above.
+QuietContext's overall project license is stated in the repository root
+LICENSE file.
