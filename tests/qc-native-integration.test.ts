@@ -38,7 +38,7 @@ suite("qc-native real integration", () => {
     const env = envFor(root);
     const status = await verifyQcNative({ env });
     expect(status.product).toBe("QuietContext");
-    const receipt = await runQcNative(shellCommand(process.platform === "win32" ? "<nul set /p =out & <nul set /p =err 1>&2 & exit /b 7" : "printf out; printf err >&2; exit 7"), { env, cwd: root });
+    const receipt = await runQcNative(shellCommand(process.platform === "win32" ? 'set /p "=out" <nul & set /p "=err" <nul 1>&2 & exit /b 7' : "printf out; printf err >&2; exit 7"), { env, cwd: root });
     expect(receipt.exitCode).toBe(7);
     expect(readFileSync(receipt.stdout.rawPath, "utf8")).toBe("out");
     expect(readFileSync(receipt.stderr.rawPath, "utf8")).toBe("err");
