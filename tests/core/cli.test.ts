@@ -1153,6 +1153,11 @@ describe("Bin entry uses cli.bundle.mjs", () => {
     expect(pkg.bin["context-mode"]).toBe("./cli.bundle.mjs");
   });
 
+  it("ships ft as a temporary executable alias to qc", () => {
+    expect(pkg.bin["qc"]).toBe("./bin/qc.mjs");
+    expect(pkg.bin["ft"]).toBe("./bin/qc.mjs");
+  });
+
   it("package.json exports ./cli points to cli.bundle.mjs", () => {
     expect(pkg.exports["./cli"]).toBe("./cli.bundle.mjs");
   });

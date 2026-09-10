@@ -45,7 +45,8 @@
   "bin": {
     "quietcontext": "./cli.bundle.mjs",
     "context-mode": "./cli.bundle.mjs",
-    "qc": "./bin/qc.mjs"
+    "qc": "./bin/qc.mjs",
+    "ft": "./bin/qc.mjs"
   },
   "files": [
     "build",

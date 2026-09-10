@@ -156,6 +156,22 @@ nativeSuite("qc repo CLI", () => {
     expect(outline.status, outline.stderr).toBe(0);
     expect(outline.stdout).toContain("CliNeedle");
 
+    const legacyMap = runQc(["map"], { cwd: project, env });
+    expect(legacyMap.status, legacyMap.stderr).toBe(0);
+    expect(legacyMap.stdout).toContain("CliNeedle");
+
+    const legacySym = runQc(["sym", "CliNeedle"], { cwd: project, env });
+    expect(legacySym.status, legacySym.stderr).toBe(0);
+    expect(legacySym.stdout).toContain("src/app.ts");
+
+    const legacyRefs = runQc(["refs", "CliNeedle"], { cwd: project, env });
+    expect(legacyRefs.status, legacyRefs.stderr).toBe(0);
+    expect(legacyRefs.stdout).toContain("CliNeedle()");
+
+    const legacyOutline = runQc(["outline", "src/app.ts"], { cwd: project, env });
+    expect(legacyOutline.status, legacyOutline.stderr).toBe(0);
+    expect(legacyOutline.stdout).toContain("CliNeedle");
+
     // The native repo daemon must remain project scoped. Its PID is only a
     // cleanup hint here; the daemon itself is tested more deeply elsewhere.
     const pidFile = join(root, "native-state", "repomap", "repomap-v2.pid");

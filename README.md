@@ -67,7 +67,7 @@ qc status
 qc doctor
 ```
 
-`context-mode` remains an executable compatibility alias for pre-existing platform hook configurations. New hook configurations use `qc hook <platform> <event>`; new user-facing local workflows use `qc`.
+`context-mode` remains an executable compatibility alias for pre-existing platform hook configurations. `ft` is also shipped as a temporary executable alias to `qc` for Fewtok cutovers; its old repository-navigation spellings (`ft map`, `ft sym`, `ft refs`, `ft outline`) are accepted directly. New hook configurations use `qc hook <platform> <event>`; new user-facing local workflows use `qc`.
 
 `qc run -- ...` executes argv directly through the same native filtering engine used by supported MCP shell commands. It preserves the child exit code. When filtering omits raw text, QuietContext retains bounded exact evidence and indexes searchable text so `search` can recover an omitted line. `qc repo` exposes the same native repository map/symbol/reference/outline engine as the MCP `repo` tool. `qc index` and `qc search` are local front doors to QuietContext's project-scoped FTS5 store; `qc index --stdin` accepts at most the normal per-source indexing cap and rejects invalid UTF-8 instead of silently indexing binary data.
 

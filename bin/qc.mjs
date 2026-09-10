@@ -20,6 +20,7 @@ function help() {
     "  qc repo symbol <name> [--root <path>]",
     "  qc repo references <name> [--root <path>]",
     "  qc repo outline <file> [--root <path>]",
+    "  qc map|sym|refs|outline ...          Compatibility aliases for an ft -> qc symlink",
     "  qc index <path> | --stdin --source <label> [--project <path>]",
     "  qc search <query...> [--project <path>] [--source <label>] [--full]",
     "  qc hook <platform> <event>",
@@ -129,6 +130,9 @@ async function main() {
   }
   if (args[0] === "repo") {
     return runRepo(args.slice(1));
+  }
+  if (["map", "sym", "refs", "outline"].includes(args[0])) {
+    return runRepo(args);
   }
   if (args[0] === "hook") {
     if (args.length !== 3) {
