@@ -172,6 +172,7 @@ describe("QuietContext token budgets", () => {
       "execute",
       "fetch-index",
       "index",
+      "repo",
       "search",
     ]);
     expect(Buffer.byteLength(JSON.stringify(tools))).toBeLessThanOrEqual(4 * 1024);
@@ -191,6 +192,7 @@ describe("QuietContext token budgets", () => {
       "execute",
       "fetch-index",
       "index",
+      "repo",
       "search",
     ]);
     expect(Buffer.byteLength(JSON.stringify(httpTools))).toBeLessThanOrEqual(4 * 1024);

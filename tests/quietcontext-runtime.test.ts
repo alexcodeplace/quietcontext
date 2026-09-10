@@ -99,6 +99,7 @@ describe("quietcontext MCP runtime", () => {
         "execute",
         "fetch-index",
         "index",
+        "repo",
         "search",
       ]);
       send(child, {

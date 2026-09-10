@@ -38,3 +38,7 @@ context-mode-guidance-*/
 .throwaway-codex/
 .throwaway-codex-data/
 test-workspace/
+/native/qc/target/
+/vendor/qc-native/*/qc-native
+/vendor/qc-native/*/qc-native.exe
+/vendor/qc-native/*/manifest.json

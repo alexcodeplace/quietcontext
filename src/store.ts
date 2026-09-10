@@ -962,8 +962,12 @@ export class ContentStore {
      * chunks fall back to empty-string columns (legacy behaviour).
      */
     attribution?: { sessionId?: string; eventId?: string };
+    /** Stable category for provenance-aware consumers (e.g. command-output). */
+    sourceCategory?: string;
+    /** SHA-256 of the original inline source when the caller already computed it. */
+    contentHash?: string;
   }): IndexResult {
-    const { content, path, source, attribution } = options;
+    const { content, path, source, attribution, sourceCategory, contentHash: suppliedContentHash } = options;
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -996,9 +1000,18 @@ export class ContentStore {
 
     // Stale detection: store file_path + SHA-256 for file-backed sources
     const filePath = path ?? undefined;
-    const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
+    const contentHash = suppliedContentHash
+      ?? (filePath ? createHash("sha256").update(text).digest("hex") : undefined);
 
-    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+    return withRetry(() => this.#insertChunks(
+      chunks,
+      label,
+      text,
+      filePath,
+      contentHash,
+      attribution,
+      sourceCategory,
+    ));
   }
 
   // ── Index Directory (#687) ──
@@ -1148,6 +1161,7 @@ export class ContentStore {
     filePath?: string,
     contentHash?: string,
     attribution?: { sessionId?: string; eventId?: string },
+    sourceCategory?: string,
   ): IndexResult {
     if (chunks.length > MAX_CHUNKS_PER_SOURCE) {
       throw new RangeError(
@@ -1189,9 +1203,9 @@ export class ContentStore {
       const now = new Date().toISOString();
       for (const chunk of boundedChunks) {
         const ct = chunk.hasCode ? "code" : "prose";
-        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, sourceCategory ?? null, sessionIdCol, eventIdCol, now);
         if (trigramIndexed) {
-          this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+          this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, sourceCategory ?? null, sessionIdCol, eventIdCol, now);
         }
       }
 

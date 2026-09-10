@@ -9,7 +9,7 @@ for (const forbidden of ["TOKEN_SAVING_TOOLS", "PUBLIC_TOOL_NAMES", ").registerT
 }
 
 const registrations = [...server.matchAll(/registerQuietTool\(\s*"([^"]+)"/g)].map((match) => match[1]);
-const expected = ["execute", "exec-file", "index", "search", "fetch-index", "batch"];
+const expected = ["repo", "execute", "exec-file", "index", "search", "fetch-index", "batch"];
 if (JSON.stringify(registrations) !== JSON.stringify(expected)) {
   failures.push(`quiet tool registrations: ${registrations.join(", ")}`);
 }

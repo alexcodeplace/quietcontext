@@ -143,11 +143,11 @@ describe("quietcontext shared HTTP daemon", () => {
     expect(wrong.status).toBe(401);
   });
 
-  test("exposes exactly the six public quiet tools", async () => {
+  test("exposes exactly the seven public quiet tools", async () => {
     const r = await rpc("tools/list", {});
     expect(r.status).toBe(200);
     const names = (r.body?.result?.tools ?? []).map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["batch", "exec-file", "execute", "fetch-index", "index", "search"]);
+    expect(names).toEqual(["batch", "exec-file", "execute", "fetch-index", "index", "repo", "search"]);
   });
 
   test("tools/call without a working-root header is rejected", async () => {

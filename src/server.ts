@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore, createProcessStorePath, cleanupStaleContentDBs, checkpointRetainedContentWALs, type SearchResult, type IndexResult } from "./store.js";
+import { ContentStore, MAX_SOURCE_BYTES, createProcessStorePath, cleanupStaleContentDBs, checkpointRetainedContentWALs, type SearchResult, type IndexResult } from "./store.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -30,6 +30,9 @@ import {
   hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
+import { repoQcNative, runQcNative, QcNativeError, type QcNativeRunReceipt } from "./native-qc.js";
+import { archiveNativeRunEvidence, type NativeEvidenceReceipt } from "./native-evidence.js";
+import { classifyQcBashRewrite } from "./qc-bash.js";
 import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "./lifecycle.js";
 import { charSafePrefix } from "./truncate.js";
 import {
@@ -273,12 +276,13 @@ export function registerEmptyToolsListHandler(target: McpServer = server): void 
 
 const nativeRegisterTool = server.registerTool.bind(server);
 const QUIET_TOOL_DESCRIPTIONS: Record<string, string> = {
-  execute: "Run sandboxed code; long programs return reusable refs.",
-  "exec-file": "Process one file; reuse cached programs across paths.",
-  index: "Index content, files, or directories into FTS5.",
-  search: "Search titles+refs; opt into previews or retrieve refs.",
-  "fetch-index": "Fetch and index URLs; return metadata only.",
-  batch: "Run commands, index output, return bounded matches.",
+  execute: "Run code.",
+  "exec-file": "Process file.",
+  index: "Index content into FTS5.",
+  search: "Search indexed content.",
+  "fetch-index": "Fetch and index URLs.",
+  batch: "Run and search commands.",
+  repo: "Repo navigation.",
 };
 const quietLanguage = z.enum([
   "javascript",
@@ -352,6 +356,10 @@ const QUIET_TOOL_SCHEMAS: Record<string, z.ZodType> = {
     query_scope: z.enum(["batch", "global"]).optional(),
     max_bytes: z.number().optional(),
   }),
+  repo: z.object({
+    action: z.enum(["map", "symbol", "references", "outline"]),
+    target: z.string().optional(),
+  }),
 };
 
 interface CachedScript {
@@ -414,6 +422,7 @@ const QUIET_RESPONSE_LIMITS: Record<string, number> = {
   "exec-file": 8 * 1024,
   search: 8 * 1024,
   batch: 12 * 1024,
+  repo: 8 * 1024,
 };
 
 function quietResponseBudget(name: string, requested: unknown): number | undefined {
@@ -1058,6 +1067,56 @@ function getStore(): ContentStore {
   return _store;
 }
 
+function getNativeEvidenceRoot(): string {
+  const contentDir = ensureWritableStorageDir(resolveContentStorageDir(getDefaultSessionDir));
+  return join(contentDir, "evidence", hashProjectDirCanonical(getProjectDir()));
+}
+
+function archiveNativeEvidence(receipt: QcNativeRunReceipt): NativeEvidenceReceipt {
+  return archiveNativeRunEvidence(receipt, {
+    store: getStore(),
+    evidenceRoot: getNativeEvidenceRoot(),
+    projectId: hashProjectDirCanonical(getProjectDir()),
+    attribution: currentAttribution(),
+  });
+}
+
+function nativeShellEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    // ContentStore's admission cap is the recoverability contract. The child
+    // may continue producing beyond it, but native will mark rawComplete=false
+    // rather than claim evidence QuietContext cannot ingest exactly.
+    QUIET_CONTEXT_NATIVE_RAW_MAX_BYTES: String(MAX_SOURCE_BYTES),
+  };
+}
+
+interface NativeShellResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  evidence: NativeEvidenceReceipt;
+}
+
+async function tryNativeShellCommand(
+  code: string,
+  options: { cwd?: string; timeout?: number },
+): Promise<NativeShellResult | null> {
+  const decision = classifyQcBashRewrite(code);
+  if (!decision.rewrite || !decision.argv) return null;
+  const receipt = await runQcNative(decision.argv, {
+    cwd: options.cwd ?? getProjectDir(),
+    timeoutMs: options.timeout,
+    env: nativeShellEnv(),
+  });
+  return {
+    stdout: receipt.stdout.compact,
+    stderr: receipt.stderr.compact,
+    exitCode: receipt.exitCode,
+    evidence: archiveNativeEvidence(receipt),
+  };
+}
+
 /** Shared shutdown path for the stdio child and the HTTP daemon. */
 export function releaseProcessResources(): void {
   executor.cleanupBackgrounded();
@@ -1592,13 +1651,19 @@ export async function runBatchCommands(
         }
         perCmdTimeout = remaining;
       }
-      const result = await executor.execute({
+      const native = opts.nativeRun
+        ? await opts.nativeRun(cmd.command, perCmdTimeout, cwd)
+        : null;
+      const result = native ?? await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
         cwd,
       });
-      outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
+      const evidenceNote = "evidenceNote" in result && typeof result.evidenceNote === "string"
+        ? result.evidenceNote
+        : "";
+      outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes) + evidenceNote);
       if (result.timedOut) {
         timedOut = true;
         for (let j = i + 1; j < commands.length; j++) {
@@ -1615,7 +1680,10 @@ export async function runBatchCommands(
   // throw isolation (Promise.allSettled semantics), and order preservation.
   const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
     run: async () => {
-      const result = await executor.execute({
+      const native = opts.nativeRun
+        ? await opts.nativeRun(cmd.command, timeout, cwd)
+        : null;
+      const result = native ?? await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
@@ -1623,7 +1691,10 @@ export async function runBatchCommands(
       });
       // Always route partial output through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
-      const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes);
+      const evidenceNote = "evidenceNote" in result && typeof result.evidenceNote === "string"
+        ? result.evidenceNote
+        : "";
+      const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes) + evidenceNote;
       const output = result.timedOut
         ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout ?? "?"}ms)\n`
         : formatted;
@@ -1647,6 +1718,52 @@ export async function runBatchCommands(
   }
   return { outputs, timedOut };
 }
+
+// ─────────────────────────────────────────────────────────
+// Tool: repository navigation (native structural index)
+// ─────────────────────────────────────────────────────────
+
+registerQuietTool(
+  "repo",
+  {
+    title: "Navigate repository structure",
+    inputSchema: z.object({
+      action: z.enum(["map", "symbol", "references", "outline"]),
+      target: z.string().optional(),
+    }).superRefine((value, ctx) => {
+      if (value.action !== "map" && !value.target?.trim()) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["target"], message: "target is required for this action" });
+      }
+    }),
+  },
+  async ({ action, target }) => {
+    const projectRoot = getProjectDir();
+    try {
+      const request = action === "map"
+        ? { action: "map" as const, root: projectRoot }
+        : action === "symbol"
+          ? { action: "symbol" as const, query: String(target), root: projectRoot }
+          : action === "references"
+            ? { action: "references" as const, query: String(target), root: projectRoot }
+            : { action: "outline" as const, path: String(target), root: projectRoot };
+      const receipt = await repoQcNative(request, {
+        cwd: projectRoot,
+        timeoutMs: 5_000,
+      });
+      const text = receipt.exitCode === 0 ? receipt.stdout : receipt.stderr || receipt.stdout;
+      return trackResponse("repo", {
+        content: [{ type: "text" as const, text: text || `(no ${action} result)` }],
+        ...(receipt.exitCode === 0 ? {} : { isError: true }),
+      });
+    } catch (error) {
+      const detail = error instanceof QcNativeError ? `${error.code}: ${error.message}` : (error instanceof Error ? error.message : String(error));
+      return trackResponse("repo", {
+        content: [{ type: "text" as const, text: `Repository navigation unavailable: ${detail}` }],
+        isError: true,
+      });
+    }
+  },
+);
 
 // ─────────────────────────────────────────────────────────
 // Tool: execute
@@ -1827,7 +1944,13 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 })(typeof require!=='undefined'?require:null);`;
       }
       const effTimeout = resolveExecTimeout(timeout);
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
+      const nativeShell = language === "shell" && !background
+        ? await tryNativeShellCommand(code, { cwd, timeout: effTimeout })
+        : null;
+      const result = nativeShell
+        ? { stdout: nativeShell.stdout, stderr: nativeShell.stderr, exitCode: nativeShell.exitCode, timedOut: false, backgrounded: false }
+        : await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
+      const nativeEvidenceNote = nativeShell?.evidence.note ?? "";
 
       // Echo the executed source code before stdout so users can audit
       // and tooling can block command patterns (Issues #717 + #736).
@@ -1917,7 +2040,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         });
       }
 
-      const stdout = result.stdout || "(no output)";
+      const stdout = (result.stdout || "(no output)") + nativeEvidenceNote;
 
       // Intent-driven search: if intent provided and output is large enough
       if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
@@ -3717,6 +3840,24 @@ Supports sequential or parallel execution; keep concurrency at 1 for stateful co
           nodeOptsPrefix,
           cwd,
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
+          nativeRun: async (command, commandTimeout, commandCwd) => {
+            try {
+              const native = await tryNativeShellCommand(command, { cwd: commandCwd, timeout: commandTimeout });
+              if (!native) return null;
+              return {
+                stdout: native.stdout,
+                stderr: native.stderr,
+                exitCode: native.exitCode,
+                timedOut: false,
+                evidenceNote: native.evidence.note,
+              };
+            } catch (error) {
+              if (error instanceof QcNativeError && error.code === "timeout") {
+                return { stdout: "", stderr: error.message, exitCode: 124, timedOut: true, evidenceNote: "" };
+              }
+              throw error;
+            }
+          },
         },
         executor,
       );

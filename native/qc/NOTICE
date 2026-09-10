@@ -1,0 +1,11 @@
+ft
+Copyright 2026 fewtok contributors
+
+This product includes code derived from RTK (Rust Token Killer),
+originally developed by rtk-ai and licensed under the Apache License 2.0.
+
+Source: https://github.com/rtk-ai/rtk
+License: Apache License, Version 2.0
+
+Specifically, command output filter logic in ft/src/filter/ is derived
+from RTK's src/cmds/ modules, adapted and extended for the ft architecture.

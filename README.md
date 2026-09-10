@@ -1,8 +1,8 @@
 # QuietContext
 
-QuietContext is a quiet, token-saving fork of [mksglu/context-mode](https://github.com/mksglu/context-mode): an MCP server for keeping raw data outside model context. The six-tool surface is a deliberately leaner, more token-efficient way of doing what context-mode does — stripping the prompt injection, session-memory narration, analytics, and other context waste that had accumulated in a plugin whose whole purpose is saving tokens.
+QuietContext is a quiet, token-saving fork of [mksglu/context-mode](https://github.com/mksglu/context-mode): an MCP server for keeping raw data outside model context. The seven-tool surface is a deliberately leaner, more token-efficient way of doing what context-mode does — stripping the prompt injection, session-memory narration, analytics, and other context waste that had accumulated in a plugin whose whole purpose is saving tokens.
 
-No prompt injection. No session-memory narration. No analytics tools. Six tools only, pinned by contract tests.
+No prompt injection. No session-memory narration. No analytics tools. Seven tools only, pinned by contract tests.
 
 Served over the stateless operation mode of the MCP Streamable HTTP transport (August 2026 spec revision): one shared local daemon replaces per-session server processes.
 
@@ -38,11 +38,12 @@ The stdio path still ships and works. Rollback is two steps: stop the daemon, re
 
 ## Tools
 
-Small on purpose: six tools, and the surface is pinned by contract tests (29 contract+HTTP tests, 131 store tests).
+Small on purpose: seven tools, with the surface and byte budget pinned by contract tests.
 
 | Tool | Contract |
 |---|---|
 | `batch` | Run related shell commands, index raw output, return bounded query matches. |
+| `repo` | Map a repository or find symbols, references, and file outlines without dumping source files into context. |
 | `execute` | Run code in sandbox; reuse long programs through short script references. |
 | `exec-file` | Process workspace files; reuse one cached program across paths. |
 | `index` | Index content, files, or bounded directories into FTS5. |
@@ -50,6 +51,27 @@ Small on purpose: six tools, and the surface is pinned by contract tests (29 con
 | `fetch-index` | Fetch and index URLs without returning raw pages. |
 
 Public names above are canonical. Do not use inherited `ctx_*` names.
+
+
+## Local `qc` command
+
+The package also ships a small local front door for Bash/tool-hook use:
+
+```sh
+qc run -- rg -n "needle" src
+qc repo map
+qc repo symbol MyType
+printf '%s\n' "large reusable context" | qc index --stdin --source notes/demo --project "$PWD"
+qc search reusable --project "$PWD" --full
+qc status
+qc doctor
+```
+
+`context-mode` remains an executable compatibility alias for pre-existing platform hook configurations; new user-facing local workflows should use `quietcontext` or `qc`.
+
+`qc run -- ...` executes argv directly through the same native filtering engine used by supported MCP shell commands. It preserves the child exit code. When filtering omits raw text, QuietContext retains bounded exact evidence and indexes searchable text so `search` can recover an omitted line. `qc repo` exposes the same native repository map/symbol/reference/outline engine as the MCP `repo` tool. `qc index` and `qc search` are local front doors to QuietContext's project-scoped FTS5 store; `qc index --stdin` accepts at most the normal per-source indexing cap and rejects invalid UTF-8 instead of silently indexing binary data.
+
+The existing Claude/Codex `PreToolUse` hook contains an opt-in `qc` routing branch and **does not enable it automatically**. Run `qc routing enable` to activate it (or `qc routing disable` to remove the marker). `QUIET_CONTEXT_QC_BASH_ROUTING=0` is an emergency bypass. When active, simple noisy commands are routed through `qc`; uncertain shell syntax passes through unchanged. Modern Codex can rewrite transparently, while current Claude Code uses an enforceable deny with an exact `qc run -- ...` retry because its Bash hook does not honor command substitution.
 
 ## Token budgets
 

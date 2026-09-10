@@ -28,6 +28,7 @@ await runHook(async () => {
   const { readStdin } = await import("./core/stdin.mjs");
   const { routePreToolUse, initSecurity } = await import("./core/routing.mjs");
   const { formatDecision } = await import("./core/formatters.mjs");
+  const { classifyQcBashRewrite, qcBashRoutingEnabled } = await import("../build/qc-bash.js");
   const { parseStdin, getInputProjectDir, getSessionId, resolveConfigDir } = await import("./session-helpers.mjs");
 
   // ─── Manual recursive copy (avoids cpSync libuv crash on non-ASCII paths, Windows + Node 24) ───
@@ -167,9 +168,23 @@ await runHook(async () => {
   const isSubagentContext = input.agent_id != null || input.agent_type != null;
 
   // ─── Route and format response ───
-  const decision = routePreToolUse(tool, toolInput, projectDir, "claude-code", getSessionId(input), {
+  let decision = routePreToolUse(tool, toolInput, projectDir, "claude-code", getSessionId(input), {
     mcpToolsAvailable: !isSubagentContext,
   });
+  if (
+    qcBashRoutingEnabled() &&
+    tool === "Bash" &&
+    (!decision || decision.action === "context") &&
+    typeof toolInput.command === "string"
+  ) {
+    const qcRoute = classifyQcBashRewrite(toolInput.command);
+    if (qcRoute.rewrite && qcRoute.rewrittenCommand) {
+      decision = {
+        action: "deny",
+        reason: `QuietContext: retry this command through the token-saving runtime: ${qcRoute.rewrittenCommand}`,
+      };
+    }
+  }
   const response = formatDecision("claude-code", decision);
 
   // ─── Write latency marker for cross-hook timing (Category 27) ───

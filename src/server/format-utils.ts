@@ -214,6 +214,17 @@ export interface BatchRunOptions {
   nodeOptsPrefix: string;
   cwd?: string;
   onFsBytes?: (bytes: number) => void;
+  nativeRun?: (
+    command: string,
+    timeout: number | undefined,
+    cwd: string | undefined,
+  ) => Promise<null | {
+    stdout: string;
+    stderr?: string;
+    exitCode: number;
+    timedOut?: boolean;
+    evidenceNote?: string;
+  }>;
 }
 
 export interface BatchExecutor {

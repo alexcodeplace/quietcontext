@@ -39,7 +39,7 @@ import {
   StorageDirectoryError,
   type ResolvedStorageDir,
 } from "./session/db.js";
-import { ContentStore } from "./store.js";
+import { ContentStore, MAX_SOURCE_BYTES } from "./store.js";
 import { readToolDenyPatterns, evaluateFilePath } from "./security.js";
 // v1.0.128 — Issue #559 sibling MCP kill helpers (see PR-559-560-FIX-DESIGN.md).
 import { discoverSiblingMcpPids, killSiblingMcpServers } from "./util/sibling-mcp.js";
@@ -195,6 +195,7 @@ function printHelp(): void {
     "Usage:",
     "  context-mode                         Start MCP server (stdio)",
     "  context-mode index <path>            Index a file or directory into the FTS5 knowledge base",
+    "  context-mode index --stdin           Index bounded UTF-8 stdin into the FTS5 knowledge base",
     "  context-mode search <query...>       Search the current project's FTS5 knowledge base",
     "  context-mode doctor                  Diagnose runtime issues, hooks, FTS5, version",
     "  context-mode upgrade                 Fix hooks, permissions, and settings",
@@ -202,7 +203,8 @@ function printHelp(): void {
     "  context-mode statusline              Print Claude Code status line",
     "",
     "Index options:",
-    "  --source <label>                     Source label (default: project:<directory-name> or path)",
+    "  --source <label>                     Source label (required with --stdin; --label is a compatibility alias)",
+    "  --stdin                              Read bounded UTF-8 content from stdin instead of a path",
     "  --project <path>                     Project identity for the content DB (default: indexed dir or cwd)",
     "  --max-depth <n>                      Directory recursion depth (default: 5)",
     "  --max-files <n>                      Directory file cap (default: 200)",
@@ -217,6 +219,7 @@ function printHelp(): void {
     "  --source <label>                     Filter to a source label (partial match)",
     "  --limit <n>                          Results to show (default: 3)",
     "  --type <code|prose>                  Filter by content type",
+    "  --full                               Print full matching chunks instead of 500-character previews",
     "",
     "Environment:",
     "  QUIET_CONTEXT_DIR=/absolute/path      Override sessions/content storage root; empty is ignored, non-empty must be absolute",
@@ -521,16 +524,56 @@ function assertReadAllowed(path: string, projectDir: string): void {
   }
 }
 
+async function readBoundedUtf8Stdin(maxBytes: number = MAX_SOURCE_BYTES): Promise<string> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buf.length;
+    if (bytes > maxBytes) {
+      throw new RangeError(`stdin exceeds ${maxBytes}-byte indexing limit (${bytes}+ bytes)`);
+    }
+    chunks.push(buf);
+  }
+  const raw = Buffer.concat(chunks, bytes);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  } catch {
+    throw new Error("stdin must be valid UTF-8 text");
+  }
+}
+
 async function indexCommand(argv: string[]): Promise<number> {
   try {
     const parsed = parseFlags(argv);
     const target = parsed.positional[0];
-    if (!target || target === "-h" || target === "--help") {
-      console.log("Usage: context-mode index <path> [--source label] [--project path] [--max-files n] [--max-depth n] [--ext .ts,.md]");
+    const stdinMode = boolFlag(parsed.flags, "stdin");
+    if (parsed.positional.length > 1) throw new Error("index accepts exactly one path");
+    if (stdinMode && target) throw new Error("index accepts either <path> or --stdin, not both");
+    if ((!target && !stdinMode) || target === "-h" || target === "--help") {
+      console.log("Usage: context-mode index <path> | --stdin --source <label> [--project path] [--max-files n] [--max-depth n] [--ext .ts,.md]");
       return target ? 0 : 1;
     }
 
-    const absPath = isAbsolute(target) ? resolve(target) : resolve(process.cwd(), target);
+    if (stdinMode) {
+      const source = stringFlag(parsed.flags, "source") ?? stringFlag(parsed.flags, "label");
+      if (!source) throw new Error("--stdin requires --source <label> (or compatibility alias --label <label>)");
+      const projectDir = resolveCliProjectDir(stringFlag(parsed.flags, "project"), process.cwd());
+      const content = await readBoundedUtf8Stdin();
+      const { store, dbPath } = await openCliContentStore(projectDir);
+      try {
+        const result = store.index({ content, source });
+        console.log(`Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from stdin`);
+        console.log(`Source: ${source}`);
+        console.log(`Project: ${projectDir}`);
+        console.log(`DB: ${dbPath}`);
+        return 0;
+      } finally {
+        store.close();
+      }
+    }
+
+    const absPath = isAbsolute(target!) ? resolve(target!) : resolve(process.cwd(), target!);
     if (!existsSync(absPath)) throw new Error(`Path does not exist: ${absPath}`);
 
     const st = statSync(absPath);
@@ -538,7 +581,7 @@ async function indexCommand(argv: string[]): Promise<number> {
       stringFlag(parsed.flags, "project"),
       st.isDirectory() ? absPath : dirname(absPath),
     );
-    const source = stringFlag(parsed.flags, "source") ?? defaultSourceForPath(absPath);
+    const source = stringFlag(parsed.flags, "source") ?? stringFlag(parsed.flags, "label") ?? defaultSourceForPath(absPath);
     const { store, dbPath } = await openCliContentStore(projectDir);
 
     try {
@@ -613,9 +656,10 @@ async function searchCommand(argv: string[]): Promise<number> {
         console.log(`DB: ${dbPath}`);
         return 0;
       }
+      const full = boolFlag(parsed.flags, "full");
       for (const [i, r] of results.entries()) {
-        const content = r.content.replace(/\s+/g, " ").trim();
-        const snippet = content.length > 500 ? `${content.slice(0, 500)}...` : content;
+        const content = full ? r.content.trim() : r.content.replace(/\s+/g, " ").trim();
+        const snippet = !full && content.length > 500 ? `${content.slice(0, 500)}...` : content;
         console.log(`## ${i + 1}. ${r.title}`);
         console.log(`Source: ${r.source}`);
         console.log(`Type: ${r.contentType}`);

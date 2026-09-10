@@ -1,9 +1,9 @@
 {
   "name": "quietcontext",
-  "version": "1.0.169",
+  "version": "1.1.0-rc.2",
   "type": "module",
   "description": "Quiet MCP tools for sandboxed execution, indexing, and search.",
-  "author": "Mert Koseo\u011flu",
+  "author": "Mert Koseoğlu",
   "license": "Elastic-2.0",
   "keywords": [
     "mcp",
@@ -43,7 +43,9 @@
     "./cli": "./cli.bundle.mjs"
   },
   "bin": {
-    "quietcontext": "./cli.bundle.mjs"
+    "quietcontext": "./cli.bundle.mjs",
+    "context-mode": "./cli.bundle.mjs",
+    "qc": "./bin/qc.mjs"
   },
   "files": [
     "build",
@@ -68,7 +70,11 @@
     "scripts/heal-installed-plugins.mjs",
     "scripts/plugin-cache-integrity.mjs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "vendor/qc-native",
+    "native/qc/NOTICE",
+    "native/qc/PROVENANCE.md",
+    "native/qc/LICENSES"
   ],
   "scripts": {
     "build": "tsc && node -e \"if(process.platform!=='win32'){require('fs').chmodSync('build/cli.js',0o755)}\" && npm run bundle && npm run assert-bundle && npm run assert-asymmetric-drift",
@@ -83,7 +89,7 @@
     "doctor": "npx tsx src/cli.ts doctor",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
-    "test": "vitest run tests/quietcontext-runtime.test.ts tests/quietcontext-surface.test.ts tests/quietcontext-token-budget.test.ts tests/quietcontext-http.test.ts tests/quietcontext-http-golden.test.ts tests/quietcontext-http-lifecycle.test.ts tests/quietcontext-legacy-negative.test.ts tests/quietcontext-ledger-burst.test.ts tests/quietcontext-windows-daemon.test.ts",
+    "test": "vitest run tests/quietcontext-runtime.test.ts tests/quietcontext-surface.test.ts tests/quietcontext-token-budget.test.ts tests/quietcontext-http.test.ts tests/quietcontext-http-golden.test.ts tests/quietcontext-http-lifecycle.test.ts tests/quietcontext-legacy-negative.test.ts tests/quietcontext-ledger-burst.test.ts tests/quietcontext-windows-daemon.test.ts tests/qc-bash.test.ts tests/native-qc.test.ts tests/native-evidence.test.ts tests/qc-bash-hooks.test.ts tests/qc-cli.test.ts",
     "test:legacy": "vitest run",
     "test:watch": "vitest",
     "lint": "node scripts/lint-quiet.mjs",
@@ -93,7 +99,9 @@
     "test:compare": "npx tsx tests/context-comparison.ts",
     "test:ecosystem": "npx tsx tests/ecosystem-benchmark.ts",
     "install:openclaw": "node -e \"if(process.platform==='win32'){console.error('OpenClaw install requires bash (Git Bash or WSL)');process.exit(1)}else{require('child_process').execSync('bash scripts/install-openclaw-plugin.sh',{stdio:'inherit'})}\"",
-    "postinstall": "node scripts/postinstall.mjs"
+    "postinstall": "node scripts/postinstall.mjs",
+    "native:stage": "node scripts/stage-qc-native.mjs",
+    "test:native": "vitest run tests/qc-native-integration.test.ts tests/qc-native-http.test.ts tests/qc-native-fidelity.test.ts tests/qc-native-repo-corpus.test.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.0.1",

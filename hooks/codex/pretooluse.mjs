@@ -17,6 +17,7 @@ import { readStdin, parseStdin, getInputProjectDir, getSessionId, CODEX_OPTS } f
 import { routePreToolUse, initSecurity } from "../core/routing.mjs";
 import { formatDecision } from "../core/formatters.mjs";
 import { codexSupportsUpdatedInput } from "../core/codex-caps.mjs";
+import { classifyQcBashRewrite, qcBashRoutingEnabled } from "../../build/qc-bash.js";
 
 const __hookDir = dirname(fileURLToPath(import.meta.url));
 await initSecurity(resolve(__hookDir, "..", "..", "build"));
@@ -27,14 +28,33 @@ const tool = input.tool_name ?? "";
 const toolInput = input.tool_input ?? {};
 const projectDir = getInputProjectDir(input, CODEX_OPTS);
 
-const decision = routePreToolUse(tool, toolInput, projectDir, "codex", getSessionId(input, CODEX_OPTS));
+let decision = routePreToolUse(tool, toolInput, projectDir, "codex", getSessionId(input, CODEX_OPTS));
+let codexSupportsRewrite;
+if (
+  qcBashRoutingEnabled() &&
+  tool === "Bash" &&
+  (!decision || decision.action === "context") &&
+  typeof toolInput.command === "string"
+) {
+  const qcRoute = classifyQcBashRewrite(toolInput.command);
+  if (qcRoute.rewrite && qcRoute.rewrittenCommand) {
+    codexSupportsRewrite = codexSupportsUpdatedInput();
+    decision = codexSupportsRewrite
+      ? { action: "modify", updatedInput: { ...toolInput, command: qcRoute.rewrittenCommand } }
+      : {
+          action: "deny",
+          reason: `QuietContext: retry this command through the token-saving runtime: ${qcRoute.rewrittenCommand}`,
+        };
+  }
+}
 // #845: only modify/context depend on Codex's rewrite capability. Detection is
 // cached, but skip the probe entirely for deny / ask / passthrough decisions.
 const needsCaps = decision && (decision.action === "modify" || decision.action === "context");
+if (needsCaps && codexSupportsRewrite === undefined) codexSupportsRewrite = codexSupportsUpdatedInput();
 const response = formatDecision(
   "codex",
   decision,
-  needsCaps ? { codexSupportsRewrite: codexSupportsUpdatedInput() } : {},
+  needsCaps ? { codexSupportsRewrite } : {},
 );
 const output = response ?? {
   hookSpecificOutput: { hookEventName: "PreToolUse" },

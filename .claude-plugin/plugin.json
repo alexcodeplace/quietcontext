@@ -1,9 +1,9 @@
 {
   "name": "quietcontext",
-  "version": "1.0.169",
+  "version": "1.1.0-rc.2",
   "description": "Quiet MCP tools for sandboxed execution, indexing, and search.",
   "author": {
-    "name": "Mert Koseo\u011flu",
+    "name": "Mert Koseoğlu",
     "url": "https://github.com/mksglu"
   },
   "homepage": "https://github.com/mksglu/context-mode#readme",

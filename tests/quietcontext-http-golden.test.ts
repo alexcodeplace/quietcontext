@@ -131,7 +131,7 @@ afterAll(async () => {
 });
 
 describe("quietcontext HTTP golden per-tool behavior", () => {
-  test("tools/list over HTTP exposes exactly six canonical names with no ctx_ substring", async () => {
+  test("tools/list over HTTP exposes exactly seven canonical names with no ctx_ substring", async () => {
     const r = await rpc("tools/list", {});
     const tools = r.body?.result?.tools ?? [];
     expect(tools.map((t: { name: string }) => t.name).sort()).toEqual([
@@ -140,6 +140,7 @@ describe("quietcontext HTTP golden per-tool behavior", () => {
       "execute",
       "fetch-index",
       "index",
+      "repo",
       "search",
     ]);
     expect(JSON.stringify(tools)).not.toMatch(/ctx_/);
