@@ -278,12 +278,26 @@ mod tests {
     #[test]
     fn preserves_exit_code_and_raw_bytes() {
         let tmp = tempfile::tempdir().unwrap();
-        let args = vec![
-            OsString::from("-c"),
-            OsString::from("printf hello; printf err >&2; exit 7"),
-        ];
+        #[cfg(windows)]
+        let (binary, args) = (
+            OsString::from("cmd.exe"),
+            vec![
+                OsString::from("/d"),
+                OsString::from("/s"),
+                OsString::from("/c"),
+                OsString::from("<nul set /p =hello & <nul set /p =err 1>&2 & exit /b 7"),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (binary, args) = (
+            OsString::from("sh"),
+            vec![
+                OsString::from("-c"),
+                OsString::from("printf hello; printf err >&2; exit 7"),
+            ],
+        );
         let result = run_command_with_policy(
-            OsStr::new("sh"),
+            binary.as_os_str(),
             &args,
             CapturePolicy {
                 spool_dir: tmp.path().to_path_buf(),
@@ -300,12 +314,27 @@ mod tests {
     #[test]
     fn large_output_is_not_killed_or_reported_success_artificially() {
         let tmp = tempfile::tempdir().unwrap();
-        let args = vec![
-            OsString::from("-c"),
-            OsString::from("head -c 10000 /dev/zero; exit 23"),
-        ];
+        #[cfg(windows)]
+        let (binary, args) = (
+            OsString::from("powershell.exe"),
+            vec![
+                OsString::from("-NoLogo"),
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from("[Console]::Out.Write(('x' * 10000)); exit 23"),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (binary, args) = (
+            OsString::from("sh"),
+            vec![
+                OsString::from("-c"),
+                OsString::from("head -c 10000 /dev/zero; exit 23"),
+            ],
+        );
         let result = run_command_with_policy(
-            OsStr::new("sh"),
+            binary.as_os_str(),
             &args,
             CapturePolicy {
                 spool_dir: tmp.path().to_path_buf(),

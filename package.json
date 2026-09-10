@@ -102,7 +102,8 @@
     "install:openclaw": "node -e \"if(process.platform==='win32'){console.error('OpenClaw install requires bash (Git Bash or WSL)');process.exit(1)}else{require('child_process').execSync('bash scripts/install-openclaw-plugin.sh',{stdio:'inherit'})}\"",
     "postinstall": "node scripts/postinstall.mjs",
     "native:stage": "node scripts/stage-qc-native.mjs",
-    "test:native": "vitest run tests/qc-native-integration.test.ts tests/qc-native-http.test.ts tests/qc-native-fidelity.test.ts tests/qc-native-repo-corpus.test.ts"
+    "test:native": "vitest run tests/qc-native-integration.test.ts tests/qc-native-http.test.ts tests/qc-native-fidelity.test.ts tests/qc-native-repo-corpus.test.ts",
+    "native:verify": "node scripts/verify-staged-qc-native.mjs"
   },
   "dependencies": {
     "@clack/prompts": "^1.0.1",

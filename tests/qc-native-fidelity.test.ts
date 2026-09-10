@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterAll, describe, expect, test } from "vitest";
 import { runQcNative } from "../src/native-qc.js";
@@ -14,7 +14,7 @@ function fixture(): { root: string; bin: string; env: NodeJS.ProcessEnv } {
   const bin = join(root, "bin"); mkdirSync(bin);
   const env = {
     ...process.env,
-    PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+    PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     QUIET_CONTEXT_NATIVE_BIN: nativeBin!,
     QUIET_CONTEXT_NATIVE_ALLOW_OVERRIDE: "1",
     QUIET_CONTEXT_NATIVE_STATE_DIR: join(root, "state"),
@@ -32,7 +32,7 @@ function script(bin: string, name: string, body: string): void {
 }
 
 suite("qc-native command fidelity corpus", () => {
-  test("small output stays small and exact", async () => {
+  test.skipIf(process.platform === "win32")("small output stays small and exact", async () => {
     const { root, bin, env } = fixture();
     script(bin, "tiny", "printf 'ok\\n'");
     const result = await runQcNative(["tiny"], { cwd: root, env });
@@ -42,7 +42,7 @@ suite("qc-native command fidelity corpus", () => {
     expect(readFileSync(result.stdout.rawPath, "utf8")).toBe("ok\n");
   });
 
-  test("large successful and failing commands preserve exit code and exact raw evidence", async () => {
+  test.skipIf(process.platform === "win32")("large successful and failing commands preserve exit code and exact raw evidence", async () => {
     const { root, bin, env } = fixture();
     script(bin, "cat", "i=1; while [ $i -le 180 ]; do if [ $i -eq 150 ]; then echo UNIQUE_MIDDLE_CANARY_42; else echo line-$i; fi; i=$((i+1)); done");
     const ok = await runQcNative(["cat"], { cwd: root, env });
@@ -57,7 +57,7 @@ suite("qc-native command fidelity corpus", () => {
     expect(`${failed.stdout.compact}\n${failed.stderr.compact}`).toContain("FAILED");
   });
 
-  test("representative filter families never invent a success exit code", async () => {
+  test.skipIf(process.platform === "win32")("representative filter families never invent a success exit code", async () => {
     const { root, bin, env } = fixture();
     const cases = [
       ["cargo", "echo 'error[E0001]: BUILD_CANARY'; exit 17"],
@@ -75,7 +75,7 @@ suite("qc-native command fidelity corpus", () => {
     }
   });
 
-  test("ANSI and non-UTF8 output keep exact raw bytes", async () => {
+  test.skipIf(process.platform === "win32")("ANSI and non-UTF8 output keep exact raw bytes", async () => {
     const { root, bin, env } = fixture();
     script(bin, "ansi-fixture", "printf '\\033[31mRED_CANARY\\033[0m\\n'");
     const ansi = await runQcNative(["ansi-fixture"], { cwd: root, env });
@@ -87,6 +87,19 @@ suite("qc-native command fidelity corpus", () => {
     const binary = await runQcNative(["binary-fixture"], { cwd: root, env });
     expect(binary.exitCode).toBe(0);
     expect([...readFileSync(binary.stdout.rawPath)]).toEqual([0xff, 0xfe, 0x58]);
+  });
+
+  test.runIf(process.platform === "win32")("native Windows execution preserves exact exit status and raw evidence", async () => {
+    const { root, env } = fixture();
+    const receipt = await runQcNative([
+      "cmd.exe", "/d", "/s", "/c",
+      "echo WINDOWS_NATIVE_CANARY& echo WINDOWS_NATIVE_ERR 1>&2& exit /b 23",
+    ], { cwd: root, env });
+    expect(receipt.exitCode).toBe(23);
+    expect(readFileSync(receipt.stdout.rawPath, "utf8")).toContain("WINDOWS_NATIVE_CANARY");
+    expect(readFileSync(receipt.stderr.rawPath, "utf8")).toContain("WINDOWS_NATIVE_ERR");
+    expect(receipt.stdout.rawComplete).toBe(true);
+    expect(receipt.stderr.rawComplete).toBe(true);
   });
 
   test("real git status/diff/log execute in the requested repository root", async () => {
