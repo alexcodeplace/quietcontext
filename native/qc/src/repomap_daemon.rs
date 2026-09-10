@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 #[cfg(unix)]
 use notify::Watcher as NotifyWatcher;
 #[cfg(unix)]
@@ -33,6 +33,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+#[cfg(unix)]
+use std::sync::RwLock;
 
 const SOCKET_REVISION: &str = "v2";
 const MAX_ROOTS: usize = 8;
@@ -436,6 +438,27 @@ impl std::fmt::Display for WatchError {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Debug)]
+struct WatchFilter {
+    root: PathBuf,
+    dependencies: HashSet<PathBuf>,
+}
+
+#[cfg(unix)]
+fn notify_event_matches_filters(
+    event: &NotifyEvent,
+    filters: &HashMap<RootId, WatchFilter>,
+) -> bool {
+    event.paths.iter().any(|path| {
+        filters.values().any(|filter| {
+            path == &filter.root
+                || path.starts_with(&filter.root)
+                || filter.dependencies.contains(path)
+        })
+    })
+}
+
+#[cfg(unix)]
 struct WatchRegistration {
     roots: HashSet<RootId>,
 }
@@ -445,6 +468,7 @@ struct Watcher {
     watcher: Option<RecommendedWatcher>,
     receiver: Receiver<notify::Result<NotifyEvent>>,
     overflow: Arc<AtomicBool>,
+    filters: Arc<RwLock<HashMap<RootId, WatchFilter>>>,
     paths: HashMap<PathBuf, WatchRegistration>,
     roots: HashMap<RootId, Vec<PathBuf>>,
     max_watches: usize,
@@ -453,9 +477,10 @@ struct Watcher {
 #[cfg(unix)]
 fn should_queue_notify_event(event: &notify::Result<NotifyEvent>) -> bool {
     match event {
-        Ok(event) if !event.need_rescan() => {
-            !matches!(&event.kind, EventKind::Access(AccessKind::Open(_)))
-        }
+        // Access notifications are never translated into repository changes.
+        // Drop all non-rescan access traffic before it can consume the bounded
+        // raw-event channel and manufacture a false overflow.
+        Ok(event) if !event.need_rescan() => !matches!(&event.kind, EventKind::Access(_)),
         Ok(_) | Err(_) => true,
     }
 }
@@ -466,8 +491,22 @@ impl Watcher {
         let (sender, receiver) = mpsc::sync_channel(queue_limit.max(1));
         let overflow = Arc::new(AtomicBool::new(false));
         let callback_overflow = Arc::clone(&overflow);
+        let filters = Arc::new(RwLock::new(HashMap::new()));
+        let callback_filters = Arc::clone(&filters);
         let watcher = notify::recommended_watcher(move |event| {
-            if should_queue_notify_event(&event) && sender.try_send(event).is_err() {
+            if !should_queue_notify_event(&event) {
+                return;
+            }
+            let relevant = match &event {
+                Ok(event) if !event.need_rescan() => {
+                    let filters = callback_filters
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    notify_event_matches_filters(event, &filters)
+                }
+                Ok(_) | Err(_) => true,
+            };
+            if relevant && sender.try_send(event).is_err() {
                 callback_overflow.store(true, Ordering::Release);
             }
         })
@@ -476,6 +515,7 @@ impl Watcher {
             watcher: Some(watcher),
             receiver,
             overflow,
+            filters,
             paths: HashMap::new(),
             roots: HashMap::new(),
             max_watches,
@@ -488,6 +528,7 @@ impl Watcher {
             watcher: None,
             receiver,
             overflow: Arc::new(AtomicBool::new(false)),
+            filters: Arc::new(RwLock::new(HashMap::new())),
             paths: HashMap::new(),
             roots: HashMap::new(),
             max_watches,
@@ -502,6 +543,7 @@ impl Watcher {
         &mut self,
         id: &RootId,
         requested: &[PathBuf],
+        dependencies: &[PathBuf],
         per_root_limit: usize,
     ) -> Result<Vec<PathBuf>, WatchError> {
         let Some(watcher) = self.watcher.as_mut() else {
@@ -566,6 +608,16 @@ impl Watcher {
             }
         }
         self.roots.insert(id.clone(), paths.clone());
+        self.filters
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                id.clone(),
+                WatchFilter {
+                    root: id.root.clone(),
+                    dependencies: dependencies.iter().cloned().collect(),
+                },
+            );
         Ok(paths)
     }
 
@@ -584,6 +636,10 @@ impl Watcher {
     }
 
     fn remove_root(&mut self, id: &RootId) {
+        self.filters
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
         if let Some(paths) = self.roots.remove(id) {
             for path in paths {
                 self.remove_root_path(id, &path);
@@ -855,6 +911,10 @@ impl Watcher {
 #[cfg(unix)]
 impl Drop for Watcher {
     fn drop(&mut self) {
+        self.filters
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.paths.clear();
         self.roots.clear();
         self.watcher.take();
@@ -1256,10 +1316,18 @@ fn ignore_event_path(index: &SourceIndex, path: &Path) -> bool {
     let ignore_name = path.file_name().is_some_and(|name| {
         name == std::ffi::OsStr::new(".gitignore") || name == std::ffi::OsStr::new(".ignore")
     });
+    // Dependency parents are watched so creation/removal of a tracked ignore
+    // file can be observed. A generic metadata/content-change notification for
+    // the directory itself is not evidence that every missing child ignore
+    // file changed. Treating it that way makes unrelated sibling activity
+    // invalidate repository generations. Concrete child events carry the file
+    // path and are matched here.
     ignore_name
-        || index.ignore_context().inputs.iter().any(|input| {
-            input.path == path || input.path.parent().is_some_and(|parent| parent == path)
-        })
+        || index
+            .ignore_context()
+            .inputs
+            .iter()
+            .any(|input| input.path == path)
 }
 
 fn retry_scan_error(error: &repomap_index::ScanError) -> bool {
@@ -1472,10 +1540,15 @@ impl Daemon {
             WatchEventKind::Renamed { from, to } => Some((from.as_path(), to.as_path())),
             _ => None,
         };
-        let is_root_boundary =
-            |path: &Path| path == root || root.parent().is_some_and(|parent| path == parent);
-        if is_root_boundary(&event.path)
-            || rename_paths.is_some_and(|(from, to)| is_root_boundary(from) || is_root_boundary(to))
+        // The parent directory is watched so a rename/remove of the root itself can
+        // be observed. A generic change *to the parent directory* is not evidence
+        // that this root was replaced: sibling activity can produce exactly that
+        // notification and used to force unrelated repositories to reconcile.
+        // Only an event that names the root (or an explicit RootReplaced marker)
+        // crosses the root-identity fence.
+        let is_root_path = |path: &Path| path == root;
+        if is_root_path(&event.path)
+            || rename_paths.is_some_and(|(from, to)| is_root_path(from) || is_root_path(to))
             || matches!(event.kind, WatchEventKind::RootReplaced)
         {
             return Some(PathChange::RootReplaced);
@@ -1589,12 +1662,13 @@ impl Daemon {
         &mut self,
         id: &RootId,
         paths: &[PathBuf],
+        dependencies: &[PathBuf],
     ) -> Result<(), DaemonError> {
         #[cfg(unix)]
         {
             let paths = self
                 .watcher
-                .replace_root(id, paths, self.config.max_watches_per_root)
+                .replace_root(id, paths, dependencies, self.config.max_watches_per_root)
                 .map_err(|_| DaemonError::WatchUnavailable)?;
             if let Some(state) = self.roots.get_mut(id) {
                 state.watches = paths;
@@ -1623,7 +1697,7 @@ impl Daemon {
         if let Some(parent) = id.root.parent() {
             paths.push(parent.to_path_buf());
         }
-        self.install_watches_from_paths(id, &paths)
+        self.install_watches_from_paths(id, &paths, &[])
     }
 
     fn next_generation(&mut self, prior: u64) -> u64 {
@@ -1651,7 +1725,13 @@ impl Daemon {
             )?;
             self.check_rss()?;
             let before_paths = watch_paths(&before);
-            self.install_watches_from_paths(id, &before_paths)?;
+            let before_dependencies: Vec<_> = before
+                .ignore_context
+                .inputs
+                .iter()
+                .map(|input| input.path.clone())
+                .collect();
+            self.install_watches_from_paths(id, &before_paths, &before_dependencies)?;
             let candidate_generation = self.next_generation(prior);
             match build_generation(&before, &first_scan, candidate_generation) {
                 Ok(_) => {}
@@ -1669,7 +1749,13 @@ impl Daemon {
             )?;
             self.check_rss()?;
             let second_paths = watch_paths(&second_inputs);
-            self.install_watches_from_paths(id, &second_paths)?;
+            let second_dependencies: Vec<_> = second_inputs
+                .ignore_context
+                .inputs
+                .iter()
+                .map(|input| input.path.clone())
+                .collect();
+            self.install_watches_from_paths(id, &second_paths, &second_dependencies)?;
             let second = match build_generation(&second_inputs, &second_scan, candidate_generation)
             {
                 Ok(index) => index,
@@ -2219,8 +2305,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn notify_queue_filters_only_non_rescan_open_events() {
-        use notify::event::{AccessMode, Flag};
+    fn notify_queue_filters_all_non_rescan_access_events() {
+        use notify::event::{AccessKind, AccessMode, Flag};
 
         let open = Ok(NotifyEvent::new(EventKind::Access(AccessKind::Open(
             AccessMode::Any,
@@ -2239,7 +2325,7 @@ mod tests {
         let close_write = Ok(NotifyEvent::new(EventKind::Access(AccessKind::Close(
             AccessMode::Write,
         ))));
-        assert!(should_queue_notify_event(&close_write));
+        assert!(!should_queue_notify_event(&close_write));
 
         for kind in [
             EventKind::Create(CreateKind::File),
@@ -2252,6 +2338,39 @@ mod tests {
         ] {
             assert!(should_queue_notify_event(&Ok(NotifyEvent::new(kind))));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_prefilter_drops_sibling_noise_but_keeps_root_and_ignore_dependencies() {
+        let root = PathBuf::from("/tmp/project-a");
+        let dependency = PathBuf::from("/tmp/.gitignore");
+        let id = RootId {
+            root: root.clone(),
+            policy: repomap_index::ScanPolicyKey::default(),
+        };
+        let filters = HashMap::from([(
+            id,
+            WatchFilter {
+                root: root.clone(),
+                dependencies: HashSet::from([dependency.clone()]),
+            },
+        )]);
+
+        let sibling = NotifyEvent::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(PathBuf::from("/tmp/project-b/output.log"));
+        assert!(!notify_event_matches_filters(&sibling, &filters));
+
+        let source = NotifyEvent::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(root.join("src/lib.rs"));
+        assert!(notify_event_matches_filters(&source, &filters));
+
+        let ignore = NotifyEvent::new(EventKind::Create(CreateKind::File)).add_path(dependency);
+        assert!(notify_event_matches_filters(&ignore, &filters));
     }
 
     #[cfg(unix)]
@@ -2395,6 +2514,27 @@ mod tests {
         let second = daemon.dispatch(request(&root, LookupOperation::Sym, Some("stable")));
         assert_eq!(first.generation, second.generation);
         assert_eq!(second.status, CacheState::Hit);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parent_directory_noise_does_not_invalidate_child_root() {
+        let root = root();
+        write_file(&root, "main.rs", b"pub fn stable() {}\n");
+        let mut daemon = Daemon::new();
+        let first = daemon.dispatch(request(&root, LookupOperation::Sym, Some("stable")));
+        assert_eq!(first.status, CacheState::Reconciled);
+
+        let id = RootId {
+            root: root.clone(),
+            policy: ScanConfig::from_map(&MapConfig::default()).policy(),
+        };
+        let parent = root.parent().expect("root parent").to_path_buf();
+        daemon.apply_event(Some(id), WatchEvent::directory_changed(parent));
+
+        let second = daemon.dispatch(request(&root, LookupOperation::Sym, Some("stable")));
+        assert_eq!(second.status, CacheState::Hit);
+        assert_eq!(second.generation, first.generation);
         fs::remove_dir_all(root).ok();
     }
 
