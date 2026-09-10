@@ -21,6 +21,7 @@ ignore = "0.4"
 notify = "8"
 dirs = "5"
 libc = "0.2"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

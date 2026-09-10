@@ -7,6 +7,12 @@ import { QcNativeError, repoQcNative, runQcNative, verifyQcNative } from "../src
 const nativeBin = process.env.QUIET_CONTEXT_NATIVE_TEST_BIN;
 const suite = nativeBin ? describe : describe.skip;
 const roots: string[] = [];
+function shellCommand(script: string): string[] {
+  return process.platform === "win32"
+    ? ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
+    : ["sh", "-c", script];
+}
+
 function stopRepoDaemon(stateDir: string): void {
   try {
     const pid = Number(readFileSync(join(stateDir, "repomap", "repomap-v2.pid"), "utf8").trim());
@@ -32,7 +38,7 @@ suite("qc-native real integration", () => {
     const env = envFor(root);
     const status = await verifyQcNative({ env });
     expect(status.product).toBe("QuietContext");
-    const receipt = await runQcNative(["sh", "-c", "printf out; printf err >&2; exit 7"], { env, cwd: root });
+    const receipt = await runQcNative(shellCommand(process.platform === "win32" ? "[Console]::Out.Write('out'); [Console]::Error.Write('err'); exit 7" : "printf out; printf err >&2; exit 7"), { env, cwd: root });
     expect(receipt.exitCode).toBe(7);
     expect(readFileSync(receipt.stdout.rawPath, "utf8")).toBe("out");
     expect(readFileSync(receipt.stderr.rawPath, "utf8")).toBe("err");
@@ -59,7 +65,7 @@ suite("qc-native real integration", () => {
   test("bridge timeout kills the native command tree", async () => {
     const root = mkdtempSync(join(tmpdir(), "qc-native-timeout-")); roots.push(root);
     const env = envFor(root);
-    await expect(runQcNative(["sh", "-c", "sleep 5"], { env, cwd: root, timeoutMs: 50 }))
+    await expect(runQcNative(shellCommand(process.platform === "win32" ? "Start-Sleep -Seconds 5" : "sleep 5"), { env, cwd: root, timeoutMs: 50 }))
       .rejects.toEqual(expect.objectContaining<QcNativeError>({ code: "timeout" }));
   });
 });

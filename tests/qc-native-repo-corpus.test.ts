@@ -70,8 +70,13 @@ suite("qc-native repository navigation corpus", () => {
     const cold = await repoQcNative({ action: "map", root }, { cwd: root, env });
     expect(cold.exitCode).toBe(0);
     const warm = await repoQcNative({ action: "map", root }, { cwd: root, env });
-    expect(["hit", "refreshed"]).toContain(warm.cacheState);
-    expect(warm.generation).toBeGreaterThanOrEqual(cold.generation);
+    if (process.platform === "win32") {
+      expect(warm.cacheState).toBe("bypassed");
+      expect(warm.fallbackReason).toBe("unsupported-platform");
+    } else {
+      expect(["hit", "refreshed"]).toContain(warm.cacheState);
+      expect(warm.generation).toBeGreaterThanOrEqual(cold.generation);
+    }
 
     const app = join(root, "src", "app.ts");
     writeFileSync(app, "export function mutatedNeedle() { return 5; }\nexport const x = mutatedNeedle();\n");
@@ -81,7 +86,7 @@ suite("qc-native repository navigation corpus", () => {
       mutatedGeneration = symbol.generation;
       return symbol.exitCode === 0 && symbol.stdout.includes("src/app.ts");
     });
-    expect(mutatedGeneration).toBeGreaterThanOrEqual(warm.generation);
+    if (process.platform !== "win32") expect(mutatedGeneration).toBeGreaterThanOrEqual(warm.generation);
 
     const renamed = join(root, "src", "renamed.ts");
     renameSync(app, renamed);
@@ -100,12 +105,17 @@ suite("qc-native repository navigation corpus", () => {
     const { root, state, env } = makeRepo();
     const before = await repoQcNative({ action: "map", root }, { cwd: root, env });
     expect(before.stdout).toContain("tsNeedle");
-    const repomapState = join(state, "repomap");
-    const pidFile = readFileSync(join(repomapState, "repomap-v2.pid"), "utf8").trim();
-    const pid = Number(pidFile);
-    expect(Number.isInteger(pid) && pid > 1).toBe(true);
-    try { process.kill(pid, "SIGTERM"); } catch { /* already stopped */ }
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    if (process.platform !== "win32") {
+      const repomapState = join(state, "repomap");
+      const pidFile = readFileSync(join(repomapState, "repomap-v2.pid"), "utf8").trim();
+      const pid = Number(pidFile);
+      expect(Number.isInteger(pid) && pid > 1).toBe(true);
+      try { process.kill(pid, "SIGTERM"); } catch { /* already stopped */ }
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    } else {
+      expect(before.cacheState).toBe("bypassed");
+      expect(before.fallbackReason).toBe("unsupported-platform");
+    }
     const after = await repoQcNative({ action: "map", root }, { cwd: root, env });
     expect(after.exitCode).toBe(0);
     expect(after.stdout).toContain("tsNeedle");
@@ -124,6 +134,7 @@ suite("qc-native repository navigation corpus", () => {
     expect(indexed.exitCode).toBe(0);
     expect(direct.exitCode).toBe(0);
     expect(direct.cacheState).toBe("bypassed");
+    if (process.platform !== "win32") expect(direct.fallbackReason).toBeTruthy();
     expect(direct.stdout).toBe(indexed.stdout);
   });
 });

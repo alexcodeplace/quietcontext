@@ -32,15 +32,14 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.23.0 --activate
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Cache better-sqlite3 native addon
-        uses: actions/cache@v4
-        with:
-          path: node_modules/better-sqlite3/build
-          key: better-sqlite3-${{ runner.os }}-node${{ env.NODE_VERSION }}-${{ hashFiles('package-lock.json') }}
 
       - name: Cache OpenClaw binary
         id: cache-openclaw
@@ -51,9 +50,9 @@ jobs:
 
       - name: Install dependencies and build
         run: |
-          npm install
-          npm run build
-          npm rebuild better-sqlite3
+          pnpm install --no-frozen-lockfile
+          pnpm run build
+          pnpm rebuild better-sqlite3
 
       - name: Install OpenClaw
         if: steps.cache-openclaw.outputs.cache-hit != 'true'

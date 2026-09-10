@@ -9,39 +9,92 @@ permissions:
   contents: write
 
 jobs:
-  linux-x64-package:
-    runs-on: ubuntu-latest
+  native-assets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            key: linux-x64
+          - os: windows-latest
+            key: win32-x64
+    runs-on: ${{ matrix.os }}
+    name: native asset (${{ matrix.key }})
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22.5"
-
       - uses: dtolnay/rust-toolchain@stable
-
       - name: Install dependencies
         run: npm install --no-audit --no-fund
+      - name: Validate native formatting
+        run: cargo fmt --all --check --manifest-path native/qc/Cargo.toml
+      - name: Validate native engine (Linux full unit suite)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --all-targets --manifest-path native/qc/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path native/qc/Cargo.toml
+      - name: Validate native engine (Windows release build)
+        if: runner.os == 'Windows'
+        run: |
+          cargo clippy --bin qc-native --manifest-path native/qc/Cargo.toml -- -D warnings -A dead_code
+          cargo build --locked --release --manifest-path native/qc/Cargo.toml
+      - name: Stage pinned native runtime
+        run: npm run native:stage
+      - name: Verify staged native runtime
+        run: npm run native:verify -- ${{ matrix.key }}
+      - name: Native integration (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          npm run build
+          QUIET_CONTEXT_NATIVE_TEST_BIN="$PWD/vendor/qc-native/linux-x64/qc-native" \
+            QUIET_CONTEXT_NATIVE_ALLOW_OVERRIDE=1 \
+            npm run test:native
+      - name: Native integration (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm run build
+          $env:QUIET_CONTEXT_NATIVE_TEST_BIN = (Resolve-Path "vendor/qc-native/win32-x64/qc-native.exe").Path
+          $env:QUIET_CONTEXT_NATIVE_ALLOW_OVERRIDE = "1"
+          npm run test:native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qc-native-${{ matrix.key }}
+          path: vendor/qc-native/${{ matrix.key }}/
+          if-no-files-found: error
 
-      - name: Validate source and native engine
+  package:
+    needs: native-assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.5"
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - uses: actions/download-artifact@v4
+        with:
+          name: qc-native-linux-x64
+          path: vendor/qc-native/linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: qc-native-win32-x64
+          path: vendor/qc-native/win32-x64
+      - name: Validate package and both native manifests
         run: |
           npm run typecheck
           npm run lint
-          cargo fmt --all --check --manifest-path native/qc/Cargo.toml
-          cargo clippy --all-targets --manifest-path native/qc/Cargo.toml -- -D warnings
-          cargo test --manifest-path native/qc/Cargo.toml
-
-      - name: Stage pinned native runtime
-        run: npm run native:stage
-
-      - name: Validate integrated package
-        run: |
+          npm run native:verify -- linux-x64 win32-x64
           npm test
           QUIET_CONTEXT_NATIVE_TEST_BIN="$PWD/vendor/qc-native/linux-x64/qc-native" \
             QUIET_CONTEXT_NATIVE_ALLOW_OVERRIDE=1 \
             npm run test:native
           npm run benchmark:quiet
-
       - name: Build release tarball
         shell: bash
         run: |
@@ -56,8 +109,9 @@ jobs:
           test -f "$tarball"
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/linux-x64/qc-native$' >/dev/null
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/linux-x64/manifest.json$' >/dev/null
+          tar -tzf "$tarball" | grep 'package/vendor/qc-native/win32-x64/qc-native.exe$' >/dev/null
+          tar -tzf "$tarball" | grep 'package/vendor/qc-native/win32-x64/manifest.json$' >/dev/null
           sha256sum "$tarball" > SHA256SUMS
-
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:

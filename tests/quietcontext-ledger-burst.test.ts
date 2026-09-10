@@ -85,6 +85,17 @@ function send(child: ChildProcessWithoutNullStreams, message: Record<string, unk
   child.stdin.write(JSON.stringify(message) + "\n");
 }
 
+async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+  child.kill("SIGTERM");
+  await Promise.race([closed, new Promise<void>((resolveWait) => setTimeout(resolveWait, 5000))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([closed, new Promise<void>((resolveWait) => setTimeout(resolveWait, 2000))]);
+  }
+}
+
 const BURST_HINT_SUBSTRING = "re-bills this entire conversation at cache-read prices";
 
 describe("honest savings ledger + burst feedback (items 1+2)", () => {
@@ -159,9 +170,9 @@ describe("honest savings ledger + burst feedback (items 1+2)", () => {
         expect(row.counterfactual_bytes).toBe(row.bytes_returned);
       }
     } finally {
-      child.kill();
-      rmSync(dataDir, { recursive: true, force: true });
-      rmSync(projectDir, { recursive: true, force: true });
+      await stopChild(child);
+      rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }, 30_000);
 
@@ -224,9 +235,9 @@ describe("honest savings ledger + burst feedback (items 1+2)", () => {
       expect(row.counterfactual_bytes).toBe(2 * 1024);
       expect(row.bytes_returned).toBeLessThan(row.counterfactual_bytes);
     } finally {
-      child.kill();
-      rmSync(dataDir, { recursive: true, force: true });
-      rmSync(projectDir, { recursive: true, force: true });
+      await stopChild(child);
+      rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }, 30_000);
 });

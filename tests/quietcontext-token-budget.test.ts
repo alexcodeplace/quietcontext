@@ -83,6 +83,17 @@ function resultText(response: Record<string, any>): string {
   return response.result?.content?.[0]?.text ?? "";
 }
 
+async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+  child.kill("SIGTERM");
+  await Promise.race([closed, new Promise<void>((resolveWait) => setTimeout(resolveWait, 5000))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([closed, new Promise<void>((resolveWait) => setTimeout(resolveWait, 2000))]);
+  }
+}
+
 const httpDaemons: ChildProcessWithoutNullStreams[] = [];
 const httpScratchDirs: string[] = [];
 
@@ -149,14 +160,14 @@ afterEach(async () => {
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
   }
   for (const harness of harnesses.splice(0)) {
-    harness.child.kill();
-    rmSync(harness.dataDir, { recursive: true, force: true });
+    await stopChild(harness.child);
+    rmSync(harness.dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   for (const daemon of httpDaemons.splice(0)) {
-    daemon.kill("SIGTERM");
+    await stopChild(daemon);
   }
   for (const dir of httpScratchDirs.splice(0)) {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 

@@ -102,7 +102,8 @@
     "install:openclaw": "node -e \"if(process.platform==='win32'){console.error('OpenClaw install requires bash (Git Bash or WSL)');process.exit(1)}else{require('child_process').execSync('bash scripts/install-openclaw-plugin.sh',{stdio:'inherit'})}\"",
     "postinstall": "node scripts/postinstall.mjs",
     "native:stage": "node scripts/stage-qc-native.mjs",
-    "test:native": "vitest run tests/qc-native-integration.test.ts tests/qc-native-http.test.ts tests/qc-native-fidelity.test.ts tests/qc-native-repo-corpus.test.ts"
+    "test:native": "vitest run tests/qc-native-integration.test.ts tests/qc-native-http.test.ts tests/qc-native-fidelity.test.ts tests/qc-native-repo-corpus.test.ts",
+    "native:verify": "node scripts/verify-staged-qc-native.mjs"
   },
   "dependencies": {
     "@clack/prompts": "^1.0.1",
@@ -126,5 +127,11 @@
   "packageManager": "pnpm@10.23.0+sha512.21c4e5698002ade97e4efe8b8b4a89a8de3c85a37919f957e7a0f30f38fbc5bbdd05980ffe29179b2fb6e6e691242e098d945d1601772cad0fef5fb6411e2a4b",
   "engines": {
     "node": ">=22.5.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
   }
 }
