@@ -1,0 +1,68 @@
+name: Release QuietContext package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Validate source and native engine
+        run: |
+          npm run typecheck
+          npm run lint
+          cargo fmt --all --check --manifest-path native/qc/Cargo.toml
+          cargo clippy --all-targets --manifest-path native/qc/Cargo.toml -- -D warnings
+          cargo test --manifest-path native/qc/Cargo.toml
+
+      - name: Stage pinned native runtime
+        run: npm run native:stage
+
+      - name: Validate integrated package
+        run: |
+          npm test
+          QUIET_CONTEXT_NATIVE_TEST_BIN="$PWD/vendor/qc-native/linux-x64/qc-native" \
+            QUIET_CONTEXT_NATIVE_ALLOW_OVERRIDE=1 \
+            npm run test:native
+          npm run benchmark:quiet
+
+      - name: Build release tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p 'require("./package.json").version')"
+          expected_tag="v$package_version"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $package_version" >&2
+            exit 1
+          fi
+          tarball="$(npm pack --ignore-scripts=false | tail -n 1)"
+          test -f "$tarball"
+          tar -tzf "$tarball" | grep 'package/vendor/qc-native/linux-x64/qc-native$' >/dev/null
+          tar -tzf "$tarball" | grep 'package/vendor/qc-native/linux-x64/manifest.json$' >/dev/null
+          sha256sum "$tarball" > SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            quietcontext-*.tgz
+            SHA256SUMS
