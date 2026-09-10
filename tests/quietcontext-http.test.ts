@@ -179,13 +179,20 @@ describe("quietcontext shared HTTP daemon", () => {
       callTool("execute", { language: "shell", code: "pwd" }, { root: rootB }),
     ]);
     const [a1, b1, a2, b2] = interleaved.map(toolText);
-    expect(a1).toContain(rootA);
+    // Shells on native Windows may render the same working directory through
+    // Git-Bash/MSYS spelling (/d/a/...) rather than Win32 spelling (D:\\a\\...).
+    // The directory basenames plus per-root marker files prove isolation without
+    // binding the contract to one shell's path presentation.
+    expect(a1).toContain("project-a");
     expect(a1).toContain("alpha-marker-content-8271");
-    expect(b1).toContain(rootB);
+    expect(a1).not.toContain("beta-marker-content-9382");
+    expect(b1).toContain("project-b");
     expect(b1).toContain("beta-marker-content-9382");
-    expect(a2).toContain(rootA);
-    expect(a2).not.toContain(rootB);
-    expect(b2).toContain(rootB);
+    expect(b1).not.toContain("alpha-marker-content-8271");
+    expect(a2).toContain("project-a");
+    expect(a2).not.toContain("project-b");
+    expect(b2).toContain("project-b");
+    expect(b2).not.toContain("project-a");
   }, 30_000);
 
   test("index/search stores are isolated per working root", async () => {

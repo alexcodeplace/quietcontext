@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, test } from "vitest";
@@ -13,9 +13,14 @@ function fixture(codexVersion?: string) {
   const home = join(root, "home"); const bin = join(root, "bin"); const tmp = join(root, "tmp");
   mkdirSync(home, { recursive: true }); mkdirSync(bin); mkdirSync(tmp);
   if (codexVersion) {
-    const codex = join(bin, "codex");
-    writeFileSync(codex, `#!/bin/sh\nprintf 'codex-cli ${codexVersion}\\n'\n`);
-    chmodSync(codex, 0o755);
+    const codex = join(bin, process.platform === "win32" ? "codex.cmd" : "codex");
+    writeFileSync(
+      codex,
+      process.platform === "win32"
+        ? `@echo off\r\necho codex-cli ${codexVersion}\r\n`
+        : `#!/bin/sh\nprintf 'codex-cli ${codexVersion}\\n'\n`,
+    );
+    if (process.platform !== "win32") chmodSync(codex, 0o755);
   }
   return {
     root,
@@ -24,7 +29,7 @@ function fixture(codexVersion?: string) {
       HOME: home,
       CLAUDE_CONFIG_DIR: join(home, ".claude"),
       TMPDIR: tmp,
-      PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
       QUIET_CONTEXT_QC_BASH_ROUTING: "1",
     },
   };

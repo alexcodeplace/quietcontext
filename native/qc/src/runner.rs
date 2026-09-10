@@ -280,12 +280,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         #[cfg(windows)]
         let (binary, args) = (
-            OsString::from("cmd.exe"),
+            OsString::from("powershell.exe"),
             vec![
-                OsString::from("/d"),
-                OsString::from("/s"),
-                OsString::from("/c"),
-                OsString::from("<nul set /p =hello & <nul set /p =err 1>&2 & exit /b 7"),
+                OsString::from("-NoLogo"),
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from(
+                    "[Console]::Out.Write('hello'); [Console]::Error.Write('err'); exit 7",
+                ),
             ],
         );
         #[cfg(not(windows))]

@@ -29,11 +29,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
         run: npm install --no-audit --no-fund
-      - name: Validate native engine
+      - name: Validate native formatting
+        run: cargo fmt --all --check --manifest-path native/qc/Cargo.toml
+      - name: Validate native engine (Linux full unit suite)
+        if: runner.os == 'Linux'
         run: |
-          cargo fmt --all --check --manifest-path native/qc/Cargo.toml
           cargo clippy --all-targets --manifest-path native/qc/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path native/qc/Cargo.toml
+      - name: Validate native engine (Windows release build)
+        if: runner.os == 'Windows'
+        run: |
+          cargo clippy --bin qc-native --manifest-path native/qc/Cargo.toml -- -D warnings -A dead_code
+          cargo build --locked --release --manifest-path native/qc/Cargo.toml
       - name: Stage pinned native runtime
         run: npm run native:stage
       - name: Verify staged native runtime

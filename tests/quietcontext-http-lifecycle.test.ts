@@ -125,7 +125,15 @@ describe("quietcontext HTTP daemon store lifecycle", () => {
       daemon.kill("SIGTERM");
       const exitResult = await waitForExit(daemon, 10_000);
       expect(exitResult).not.toBe("TIMEOUT");
-      expect((exitResult as { code: number | null }).code).toBe(0);
+      const exited = exitResult as { code: number | null; signal: NodeJS.Signals | null };
+      if (process.platform === "win32") {
+        // Node's Windows signal emulation may report child.kill("SIGTERM") as
+        // signal termination (code=null) even when the daemon's signal handler
+        // ran. Durability below is the shutdown invariant that matters here.
+        expect(exited.code === 0 || exited.signal === "SIGTERM").toBe(true);
+      } else {
+        expect(exited.code).toBe(0);
+      }
       expect(durableDbFiles()).toHaveLength(3);
     },
     30_000,

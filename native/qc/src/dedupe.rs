@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -186,30 +187,23 @@ impl LockGuard {
     }
 }
 
-#[cfg(unix)]
 impl Drop for LockGuard {
     fn drop(&mut self) {
         if let Some(f) = &self.0 {
-            use std::os::unix::io::AsRawFd;
-            unsafe {
-                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
-            }
+            let _ = FileExt::unlock(f);
         }
     }
 }
 
-#[cfg(unix)]
 fn acquire_lock(lock_path: &Path) -> LockGuard {
-    use std::os::unix::io::AsRawFd;
-
     if let Some(parent) = lock_path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return LockGuard(None);
         }
     }
-    // Concurrent openers must share one inode to contend on the same lock,
-    // so not create_new; and never unlinked, or a later opener could flock an
-    // orphaned inode.
+    // Openers share one persistent lock file. fs2 maps this to flock on Unix
+    // and LockFileEx on Windows, preserving the same advisory-lock contract
+    // across native SpargaxOS platforms without a custom process host.
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -222,25 +216,18 @@ fn acquire_lock(lock_path: &Path) -> LockGuard {
     };
     const MAX_ATTEMPTS: u32 = 200;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
-    let fd = file.as_raw_fd();
     for _ in 0..MAX_ATTEMPTS {
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return LockGuard(Some(file));
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EWOULDBLOCK) => std::thread::sleep(RETRY_DELAY),
-            Some(libc::EINTR) => continue,
-            _ => return LockGuard(None),
+        match file.try_lock_exclusive() {
+            Ok(()) => return LockGuard(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return LockGuard(None),
         }
     }
     // Persistent contention: proceed unlocked rather than block the wrapped
-    // command's output forever.
-    LockGuard(None)
-}
-
-#[cfg(not(unix))]
-fn acquire_lock(_lock_path: &Path) -> LockGuard {
+    // command's output forever. Atomic rename still prevents torn state.
     LockGuard(None)
 }
 

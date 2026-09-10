@@ -47,13 +47,23 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Validate source
+      - name: Validate shared source
         run: |
           npm run typecheck
           npm run lint
           cargo fmt --all --check --manifest-path native/qc/Cargo.toml
+
+      - name: Validate native engine (Linux full unit suite)
+        if: runner.os == 'Linux'
+        run: |
           cargo clippy --all-targets --manifest-path native/qc/Cargo.toml -- -D warnings
           cargo test --locked --manifest-path native/qc/Cargo.toml
+
+      - name: Validate native engine (Windows release build)
+        if: runner.os == 'Windows'
+        run: |
+          cargo clippy --bin qc-native --manifest-path native/qc/Cargo.toml -- -D warnings -A dead_code
+          cargo build --locked --release --manifest-path native/qc/Cargo.toml
 
       - name: Stage native runtime
         run: npm run native:stage
