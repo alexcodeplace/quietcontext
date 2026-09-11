@@ -113,6 +113,7 @@ jobs:
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/linux-x64/manifest.json$' >/dev/null
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/win32-x64/qc-native.exe$' >/dev/null
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/win32-x64/manifest.json$' >/dev/null
+          tar -tzf "$tarball" | grep 'package/npm-shrinkwrap.json$' >/dev/null
           sha256sum "$tarball" > SHA256SUMS
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

@@ -70,6 +70,7 @@
     "scripts/heal-better-sqlite3.mjs",
     "scripts/heal-installed-plugins.mjs",
     "scripts/plugin-cache-integrity.mjs",
+    "npm-shrinkwrap.json",
     "README.md",
     "LICENSE",
     "vendor/qc-native",
