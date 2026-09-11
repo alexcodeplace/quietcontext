@@ -85,6 +85,8 @@ jobs:
         with:
           name: qc-native-win32-x64
           path: vendor/qc-native/win32-x64
+      - name: Restore Linux native executable mode
+        run: chmod 0755 vendor/qc-native/linux-x64/qc-native
       - name: Validate package and both native manifests
         run: |
           npm run typecheck
