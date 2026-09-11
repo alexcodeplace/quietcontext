@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.5"
+          node-version: "22.22.0"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
         run: npm install --no-audit --no-fund
@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.5"
+          node-version: "22.22.0"
       - name: Install dependencies
         run: npm install --no-audit --no-fund
       - uses: actions/download-artifact@v4
@@ -113,6 +113,7 @@ jobs:
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/linux-x64/manifest.json$' >/dev/null
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/win32-x64/qc-native.exe$' >/dev/null
           tar -tzf "$tarball" | grep 'package/vendor/qc-native/win32-x64/manifest.json$' >/dev/null
+          tar -tzf "$tarball" | grep 'package/npm-shrinkwrap.json$' >/dev/null
           sha256sum "$tarball" > SHA256SUMS
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

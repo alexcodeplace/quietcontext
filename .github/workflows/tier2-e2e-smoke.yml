@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: "22"
+  NODE_VERSION: "22.22.0"
   # Pin Haiku 4.5 for tier-2: cheap enough for weekly cron without changing
   # tool-call behavior vs. Sonnet/Opus. Override via workflow_dispatch input
   # if a regression needs to be reproduced on a larger model.

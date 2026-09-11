@@ -1,6 +1,6 @@
 {
   "name": "quietcontext",
-  "version": "1.1.0-rc.2",
+  "version": "1.1.0-rc.3",
   "type": "module",
   "description": "Quiet MCP tools for sandboxed execution, indexing, and search.",
   "author": "Mert Koseoğlu",
@@ -70,6 +70,7 @@
     "scripts/heal-better-sqlite3.mjs",
     "scripts/heal-installed-plugins.mjs",
     "scripts/plugin-cache-integrity.mjs",
+    "npm-shrinkwrap.json",
     "README.md",
     "LICENSE",
     "vendor/qc-native",
