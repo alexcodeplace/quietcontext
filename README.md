@@ -1,17 +1,80 @@
 # QuietContext
 
-QuietContext is a quiet, token-saving fork of [mksglu/context-mode](https://github.com/mksglu/context-mode): an MCP server for keeping raw data outside model context. The seven-tool surface is a deliberately leaner, more token-efficient way of doing what context-mode does — stripping the prompt injection, session-memory narration, analytics, and other context waste that had accumulated in a plugin whose whole purpose is saving tokens.
+QuietContext keeps large command outputs, files and reference material outside an agent's conversation, then returns compact results or searchable references. Its local `qc` command filters shell output and maps repositories; its MCP server exposes seven tools for execution, repository navigation, indexing and retrieval.
 
-No prompt injection. No session-memory narration. No analytics tools. Seven tools only, pinned by contract tests.
+Use it when a failing test run fills the chat with thousands of lines, an agent repeatedly rereads the same documentation, or several worktrees need separate searchable indexes. It reduces what is returned to the model; it does not make an inaccurate answer correct or isolate arbitrary commands from your operating-system permissions.
 
-Served over the stateless operation mode of the MCP Streamable HTTP transport (August 2026 spec revision): one shared local daemon replaces per-session server processes.
+This is a fork of [mksglu/context-mode](https://github.com/mksglu/context-mode). The maintained surface avoids additional session-memory narration and analytics tools. That design choice is not a guarantee against prompt injection in the content an agent reads.
+
+## Install the packaged release
+
+The documented package is **1.1.0-rc.3**, a release candidate, not a stable 1.1.0 release. Use Node.js **22.5 or newer** and npm. The native `qc` release targets are **Linux x64 and Windows x64**; do not assume the same archive supports macOS or ARM. SQLite's native dependency may need a compiler toolchain if a matching prebuilt addon is unavailable.
+
+Open the [release assets](https://github.com/alexcodeplace/quietcontext/releases/tag/v1.1.0-rc.3), download `quietcontext-1.1.0-rc.3.tgz` and `SHA256SUMS`, and compare the archive's SHA-256 with the published value before installing. For example, from the download directory on Linux:
+
+```sh
+sha256sum -c SHA256SUMS
+npm install -g ./quietcontext-1.1.0-rc.3.tgz
+qc --version
+qc status
+```
+
+On Windows, compare `Get-FileHash .\quietcontext-1.1.0-rc.3.tgz -Algorithm SHA256` with `SHA256SUMS`, then run the same npm and `qc` commands. The archive contains the staged native runtime that a plain source clone does not. A source build and a downloaded release package are not interchangeable installation shortcuts.
+
+A successful `qc status` prints the package, native-runtime and protocol versions. It verifies the packaged runtime; it does not establish that an MCP client has connected or a shared daemon is running. `qc doctor` provides a wider diagnostic report whose client/hook findings depend on your setup.
+
+## First use: local CLI
+
+From the project you want to inspect:
+
+```sh
+qc repo map
+qc run -- git status --short
+qc index README.md --source project-readme
+qc search installation --source project-readme --full
+```
+
+Replace `installation` with a word in your README. An empty search is a real no-match result, not an installation error. For a noisy test command, use `qc run -- npm test` (or your actual project test command): the child exit code is preserved, and omitted output remains available through bounded retained evidence/search. `qc repo symbol MyType` and `qc repo references MyType` help locate a symbol without dumping every source file.
+
+## Connect an MCP client
+
+For a simple stdio connection, configure your MCP client to launch **`quietcontext`**, not `qc`; `qc` is the human-facing CLI. The command must resolve on the PATH seen by that client. Confirm its installed location first and use an absolute executable/Node entrypoint when required by the client.
+
+For example, a Codex stdio entry is:
+
+```toml
+[mcp_servers.quietcontext]
+command = "quietcontext"
+```
+
+Start a new client session and confirm discovery of the seven tools below. Ask it to index one non-sensitive document and search for a phrase you know is present before granting a broader workflow. Do not add a second server or rewrite existing client configuration blindly.
+
+The optional shared HTTP daemon replaces per-session server processes. Its Linux user-unit template contains an installation-specific `WorkingDirectory` and `ExecStart`; adapt both to the actual installed package before enabling it. Windows has a separate per-user task installer described below. Keep authentication, an explicit working root and a loopback-only listener; the daemon is not a public service.
+
+## Ask an agent to install and set it up
+
+```text
+Set up QuietContext for this project using
+https://github.com/alexcodeplace/quietcontext and its current README.
+Inspect my OS/architecture, Node/npm and existing MCP or qc installation first.
+Use the documented release archive and verify its published SHA-256; do not
+substitute the unrelated upstream context-mode package or assume macOS/ARM
+has a native qc release. Tell me that the current documented release is an RC.
+Check qc --version and qc status, map a disposable repository, and prove that
+indexing a small text file and searching a known phrase returns that content.
+Configure one stdio quietcontext entry in my selected agent, preserving its
+other settings. Ask before choosing a client, enabling a shared daemon,
+turning on Bash routing, or restarting sessions. Keep daemon auth and loopback
+binding; do not print tokens or index secrets. Finish with usage examples,
+actual verification results, changed paths, and rollback instructions.
+```
 
 ## Why the shared daemon
 
 Measured on a workstation running dozens of concurrent agent sessions (all numbers from real /proc sampling, 2026-08-15):
 
 - Before: 36 resident processes (17 node + 17 bun pairs), 2,214 MiB total RSS — ~130 MiB per session, spawned per session and resident for the session's lifetime. Extrapolated from that measured per-session cost: ~6.5 GiB at 50 sessions.
-- After: 1 process, ~80 MiB, flat regardless of session count. New sessions spawn zero QuietContext processes.
+- After: 1 process, ~80 MiB in that sample. New sessions did not spawn another QuietContext process; memory use can still grow with active work and indexed data.
 - Session-start cost: was a node+bun pair per session; now zero processes spawned.
 - Idle cost: clients hold zero daemon resources while idle — the transport is stateless, sockets close within ~9 s, and no protocol sessions are held.
 
@@ -101,5 +164,9 @@ The packaged Codex plugin keeps its automatic hook manifest empty; installation 
 
 - Per-session usage stats aggregate daemon-wide (the daemon has no per-session identity).
 - A daemon restart interrupts in-flight background executions across all sessions; the outage is bounded by systemd `Restart=on-failure`.
-- A handful of maintenance tools (stats, doctor, upgrade, purge, insight) remain stdio-only for now.
+- Maintenance commands and inherited compatibility code are not additional advertised MCP tools. Use `qc status`/`qc doctor` for local checks; the public discovery contract remains the seven-tool list.
 - Interactive-session lazy connect was not directly measured (the measurement box was serving live sessions continuously); the idle-cost numbers above are the verified equivalent.
+
+## License
+
+Elastic License 2.0, not MIT. Preserve the upstream notices and review [LICENSE](LICENSE) before redistributing or offering a hosted service. The bundled native engine has additional provenance and license notices under `native/qc/`.
