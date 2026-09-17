@@ -36,7 +36,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 #[cfg(unix)]
 use std::sync::RwLock;
 
-const SOCKET_REVISION: &str = "v2";
+const SOCKET_REVISION: &str = "v3";
 const MAX_ROOTS: usize = 8;
 const MAX_CLIENT_QUEUE: usize = 64;
 const MAX_EVENT_QUEUE: usize = 4096;
@@ -114,6 +114,12 @@ impl Hash for MemoKey {
             LookupOperation::Map => 0_u8.hash(state),
             LookupOperation::Sym => 1_u8.hash(state),
             LookupOperation::Refs => 2_u8.hash(state),
+            LookupOperation::Callers => 3_u8.hash(state),
+            LookupOperation::Callees => 4_u8.hash(state),
+            LookupOperation::Impact => 5_u8.hash(state),
+            LookupOperation::Deps => 6_u8.hash(state),
+            LookupOperation::Dependents => 7_u8.hash(state),
+            LookupOperation::Path => 8_u8.hash(state),
         }
         self.query.hash(state);
         self.config.max_bytes.hash(state);
@@ -1920,6 +1926,16 @@ impl Daemon {
                 &root,
                 &config,
             ),
+            operation => repomap::build_semantic_direct(
+                operation,
+                request.query.as_deref().unwrap_or_default(),
+                request.secondary_query.as_deref(),
+                request.file_filter.as_deref(),
+                request.depth.unwrap_or(if operation == LookupOperation::Impact { 3 } else if operation == LookupOperation::Path { 8 } else { 1 }),
+                request.max_nodes.unwrap_or(200),
+                &root,
+                &config,
+            ),
         };
         response_from_result(
             request.operation,
@@ -2012,9 +2028,13 @@ impl Daemon {
         let result = match request.operation {
             LookupOperation::Map => repomap::build_map(&index, &config),
             LookupOperation::Sym => repomap::build_sym(query.unwrap_or_default(), &index, &config),
-            LookupOperation::Refs => {
-                repomap::build_refs(query.unwrap_or_default(), &index, &config)
-            }
+            LookupOperation::Refs => repomap::build_refs(query.unwrap_or_default(), &index, &config),
+            LookupOperation::Callers => repomap::build_callers(query.unwrap_or_default(), request.file_filter.as_deref(), request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Callees => repomap::build_callees(query.unwrap_or_default(), request.file_filter.as_deref(), request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Impact => repomap::build_impact(query.unwrap_or_default(), request.file_filter.as_deref(), request.depth.unwrap_or(3), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Deps => repomap::build_dependencies(query.unwrap_or_default(), request.file_filter.as_deref(), false, request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Dependents => repomap::build_dependencies(query.unwrap_or_default(), request.file_filter.as_deref(), true, request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Path => repomap::build_path(query.unwrap_or_default(), request.secondary_query.as_deref().unwrap_or_default(), request.depth.unwrap_or(8), request.max_nodes.unwrap_or(200), &index, &config),
         };
         let response = response_from_result(
             request.operation,
@@ -2180,18 +2200,18 @@ fn response_from_result(
             ),
             LookupOperation::Refs => (
                 String::new(),
-                format!(
-                    "qc repo references: {} not found\n",
-                    query.unwrap_or_default()
-                ),
+                format!("qc repo references: {} not found\n", query.unwrap_or_default()),
+                1,
+            ),
+            operation => (
+                String::new(),
+                format!("qc repo {}: {} not found\n", operation.as_str(), query.unwrap_or_default()),
                 1,
             ),
         },
         Err(error) => {
             let command = match operation {
-                LookupOperation::Map => "map",
-                LookupOperation::Sym => "sym",
-                LookupOperation::Refs => "refs",
+                operation => operation.as_str(),
             };
             (String::new(), format!("qc repo {command}: {error}\n"), 1)
         }

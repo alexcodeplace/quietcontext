@@ -9,7 +9,7 @@ const suite = nativeBin ? describe : describe.skip;
 const roots: string[] = [];
 function stopRepoDaemon(stateDir: string): void {
   try {
-    const pid = Number(readFileSync(join(stateDir, "repomap", "repomap-v2.pid"), "utf8").trim());
+    const pid = Number(readFileSync(join(stateDir, "repomap", "repomap-v3.pid"), "utf8").trim());
     if (Number.isInteger(pid) && pid > 1) process.kill(pid, "SIGTERM");
   } catch { /* no daemon or already stopped */ }
 }
@@ -27,6 +27,11 @@ function makeRepo() {
   writeFileSync(join(root, "src", "worker.js"), "export function jsNeedle() { return 2; }\n");
   writeFileSync(join(root, "src", "lib.rs"), "pub fn rust_needle() -> i32 { 3 }\n");
   writeFileSync(join(root, "src", "worker.py"), "def py_needle():\n    return 4\n");
+  writeFileSync(join(root, "src", "user.ts"), "export function saveUser() { return 7; }\n");
+  writeFileSync(join(root, "src", "service.ts"), "import { saveUser as persist } from './user';\nexport function submitUser() { return persist(); }\n");
+  writeFileSync(join(root, "src", "collision-a.ts"), "export function collide() { return 'a'; }\n");
+  writeFileSync(join(root, "src", "collision-b.ts"), "export function collide() { return 'b'; }\n");
+  writeFileSync(join(root, "src", "collision-use.ts"), "import { collide } from './collision-a';\nexport function useCollision() { return collide(); }\n");
   writeFileSync(join(root, "ignored.py"), "def SECRET_IGNORED():\n    pass\n");
   writeFileSync(join(root, "node_modules", "ignored", "x.ts"), "export function NODE_MODULE_SECRET() {}\n");
   const env = {
@@ -63,6 +68,73 @@ suite("qc-native repository navigation corpus", () => {
     expect(refs.stdout).toContain("tsNeedle()");
     const outline = await repoQcNative({ action: "outline", path: "src/lib.rs", root }, { cwd: root, env });
     expect(outline.stdout).toContain("rust_needle");
+  });
+
+  test("semantic graph resolves aliases, keeps collisions separate, and traverses dependencies", async () => {
+    const { root, env } = makeRepo();
+
+    const callees = await repoQcNative({ action: "callees", query: "submitUser", root }, { cwd: root, env });
+    expect(callees.exitCode).toBe(0);
+    expect(callees.stdout).toContain("saveUser");
+    expect(callees.stdout).toContain("src/user.ts");
+    expect(callees.stdout).toContain("[calls @");
+
+    const callers = await repoQcNative({ action: "callers", query: "saveUser", root }, { cwd: root, env });
+    expect(callers.exitCode).toBe(0);
+    expect(callers.stdout).toContain("submitUser");
+    expect(callers.stdout).toContain("src/service.ts");
+
+    const impact = await repoQcNative({ action: "impact", query: "saveUser", root, depth: 3 }, { cwd: root, env });
+    expect(impact.exitCode).toBe(0);
+    expect(impact.stdout).toContain("submitUser");
+
+    const path = await repoQcNative({ action: "path", from: "submitUser", to: "saveUser", root, maxDepth: 4 }, { cwd: root, env });
+    expect(path.exitCode).toBe(0);
+    expect(path.stdout).toContain("[qc-path v1]");
+    expect(path.stdout).toContain("[calls @");
+
+    const deps = await repoQcNative({ action: "deps", query: "src/service.ts", root }, { cwd: root, env });
+    expect(deps.exitCode).toBe(0);
+    expect(deps.stdout).toContain("src/user.ts");
+
+    const dependents = await repoQcNative({ action: "dependents", query: "src/user.ts", root }, { cwd: root, env });
+    expect(dependents.exitCode).toBe(0);
+    expect(dependents.stdout).toContain("src/service.ts");
+
+    const collisions = await repoQcNative({ action: "callers", query: "collide", root }, { cwd: root, env });
+    expect(collisions.stdout).toContain("2 definitions");
+    expect(collisions.stdout).toContain("src/collision-a.ts");
+    expect(collisions.stdout).toContain("src/collision-b.ts");
+
+    const onlyA = await repoQcNative({ action: "callers", query: "collide", root, file: "src/collision-a.ts" }, { cwd: root, env });
+    expect(onlyA.stdout).toContain("1 definitions");
+    expect(onlyA.stdout).toContain("useCollision");
+    expect(onlyA.stdout).not.toContain("src/collision-b.ts");
+  });
+
+  test("semantic edges refresh after a watched edit", async () => {
+    const { root, env } = makeRepo();
+    const service = join(root, "src", "service.ts");
+    const before = await repoQcNative({ action: "callers", query: "saveUser", root }, { cwd: root, env });
+    expect(before.stdout).toContain("submitUser");
+
+    writeFileSync(service, "export function submitUser() { return 0; }\n");
+    await waitFor(async () => {
+      const current = await repoQcNative({ action: "callers", query: "saveUser", root }, { cwd: root, env });
+      return current.exitCode === 0 && !current.stdout.includes("submitUser");
+    });
+
+    writeFileSync(service, "import { saveUser } from './user';\nexport function submitUser() { return saveUser(); }\n");
+    await waitFor(async () => {
+      const current = await repoQcNative({ action: "callers", query: "saveUser", root }, { cwd: root, env });
+      return current.exitCode === 0 && current.stdout.includes("submitUser");
+    });
+
+    unlinkSync(join(root, "src", "user.ts"));
+    await waitFor(async () => {
+      const current = await repoQcNative({ action: "callers", query: "saveUser", root }, { cwd: root, env });
+      return current.exitCode !== 0 && !current.stdout.includes("submitUser");
+    });
   });
 
   test("cold cache becomes hit, then mutation/rename/delete reconcile to a newer generation", async () => {
@@ -107,7 +179,7 @@ suite("qc-native repository navigation corpus", () => {
     expect(before.stdout).toContain("tsNeedle");
     if (process.platform !== "win32") {
       const repomapState = join(state, "repomap");
-      const pidFile = readFileSync(join(repomapState, "repomap-v2.pid"), "utf8").trim();
+      const pidFile = readFileSync(join(repomapState, "repomap-v3.pid"), "utf8").trim();
       const pid = Number(pidFile);
       expect(Number.isInteger(pid) && pid > 1).toBe(true);
       try { process.kill(pid, "SIGTERM"); } catch { /* already stopped */ }

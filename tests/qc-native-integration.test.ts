@@ -15,7 +15,7 @@ function shellCommand(script: string): string[] {
 
 function stopRepoDaemon(stateDir: string): void {
   try {
-    const pid = Number(readFileSync(join(stateDir, "repomap", "repomap-v2.pid"), "utf8").trim());
+    const pid = Number(readFileSync(join(stateDir, "repomap", "repomap-v3.pid"), "utf8").trim());
     if (Number.isInteger(pid) && pid > 1) process.kill(pid, "SIGTERM");
   } catch { /* no daemon or already stopped */ }
 }

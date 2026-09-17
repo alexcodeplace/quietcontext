@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::MapConfig;
 use crate::outline;
-use crate::repomap_index::SourceIndex;
+use crate::semantic::{EdgeKind, NodeId, SemanticGraph, TraversalStep};
+use crate::repomap_index::{self, SourceIndex};
 
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -85,6 +86,7 @@ pub(crate) enum ScanError {
     RootUnavailable,
     RootNotDirectory,
     InvalidQuery,
+    Index(String),
     Incomplete {
         diagnostics: WalkDiagnostics,
         truncated: bool,
@@ -98,6 +100,7 @@ impl fmt::Display for ScanError {
             Self::RootUnavailable => write!(f, "scan root is unavailable"),
             Self::RootNotDirectory => write!(f, "scan root is not a directory"),
             Self::InvalidQuery => write!(f, "invalid symbol query"),
+            Self::Index(error) => write!(f, "semantic index unavailable: {error}"),
             Self::Incomplete {
                 diagnostics,
                 truncated,
@@ -357,46 +360,15 @@ enum RefsEntry {
 /// Testable core: builds `qc repo references <name>` output, or `None` when `name` has
 /// no ASCII-identifier-boundary match in any scanned file. Traversal failures
 /// return `Err` so a partial scan is never reported as a complete miss.
+fn direct_snapshot(root: &Path, cfg: &MapConfig) -> Result<SourceIndex, ScanError> {
+    let scan = repomap_index::ScanConfig::from_map(cfg);
+    let inputs = repomap_index::scan_inputs(root, &scan).map_err(|error| ScanError::Index(error.to_string()))?;
+    repomap_index::build_generation(&inputs, &scan, 1).map_err(|error| ScanError::Index(error.to_string()))
+}
+
 pub(crate) fn build_refs_direct(name: &str, root: &Path, cfg: &MapConfig) -> ScanResult {
-    if name.is_empty() {
-        return Ok(None);
-    }
-    let re = match Regex::new(&format!(
-        r"(?:^|[^$A-Za-z0-9_]){}(?:$|[^$A-Za-z0-9_])",
-        regex::escape(name)
-    )) {
-        Ok(re) => re,
-        Err(_) => return Err(ScanError::InvalidQuery),
-    };
-    let walked = prepare_walk(root, cfg)?;
-
-    let mut matches_by_file = Vec::new();
-    for source in &walked.files {
-        let matches: Vec<_> = source
-            .text
-            .lines()
-            .enumerate()
-            .filter_map(|(line_no, line)| {
-                re.is_match(line).then_some(RefLine {
-                    line_no: line_no + 1,
-                    line: line.to_owned(),
-                })
-            })
-            .collect();
-        if !matches.is_empty() {
-            matches_by_file.push((source.rel.clone(), matches));
-        }
-    }
-
-    let scan_note = scan_note(&walked, cfg);
-    render_refs_output(
-        name,
-        &matches_by_file,
-        &scan_note,
-        walked.diagnostics.has_errors() || walked.truncated,
-        cfg,
-    )
-    .map_err(|_| incomplete_error(&walked, cfg))
+    let snapshot = direct_snapshot(root, cfg)?;
+    build_refs(name, &snapshot, cfg)
 }
 
 fn incomplete_error_from_index(snapshot: &SourceIndex, cfg: &MapConfig) -> ScanError {
@@ -741,6 +713,31 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
         return Ok(None);
     }
 
+    let graph = snapshot.semantic_graph();
+    let semantic_roots = graph.select_symbols(name, None);
+    if !semantic_roots.is_empty() {
+        let mut lines = vec![format!("[qc-references v2] {name} - {} definitions\n", semantic_roots.len())];
+        let mut semantic_hits = 0usize;
+        for root in semantic_roots {
+            lines.push(format!("{}\n", semantic_node_label(graph, root)));
+            let mut seen = std::collections::BTreeSet::new();
+            for edge in graph.resolved_reference_edges(root) {
+                if !seen.insert((edge.file.clone(), edge.line)) { continue; }
+                let source_line = snapshot.files().iter()
+                    .find(|file| file.relative_path == edge.file)
+                    .and_then(|file| file.source.lines().nth(edge.line.saturating_sub(1)))
+                    .unwrap_or_default()
+                    .trim();
+                lines.push(format!("  {}:{}: {} [{}]\n", edge.file, edge.line, outline::cap_chars(source_line, 160), edge.kind.as_str()));
+                semantic_hits += 1;
+            }
+        }
+        if semantic_hits == 0 {
+            lines.push("  (no resolved semantic references)\n".to_owned());
+        }
+        return Ok(Some(bounded_graph_output(lines, cfg.max_bytes, "references")));
+    }
+
     let mut matches_by_file = std::collections::BTreeMap::<String, Vec<RefLine>>::new();
     if identifier_chars(name) {
         if let Some(postings) = snapshot.verified_references(name) {
@@ -783,6 +780,195 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
     let incomplete = snapshot.diagnostics().has_errors() || snapshot.truncated();
     render_refs_output(name, &files, &snapshot.scan_note(), incomplete, cfg)
         .map_err(|_| incomplete_error_from_index(snapshot, cfg))
+}
+
+
+fn semantic_node_label(graph: &SemanticGraph, id: NodeId) -> String {
+    let Some(node) = graph.node(id) else { return format!("node:{id}"); };
+    if node.kind == crate::semantic::NodeKind::File {
+        return node.file.clone();
+    }
+    format!("{} [{}] - {}:{}", node.qualified_name, node.kind.as_str(), node.file, node.start_line)
+}
+
+fn bounded_graph_output(mut lines: Vec<String>, max_bytes: usize, label: &str) -> String {
+    let total: usize = lines.iter().map(String::len).sum();
+    if total <= max_bytes { return lines.concat(); }
+    let marker = format!("[qc-{label}: output capped; narrow the query or reduce depth]\n");
+    while lines.len() > 1 && lines.iter().map(String::len).sum::<usize>().saturating_add(marker.len()) > max_bytes {
+        lines.pop();
+    }
+    let retained = lines.iter().map(String::len).sum::<usize>();
+    if retained.saturating_add(marker.len()) > max_bytes {
+        return cap_explanation(label);
+    }
+    let mut out = lines.concat();
+    out.push_str(&marker);
+    out
+}
+
+fn graph_roots(
+    graph: &SemanticGraph,
+    query: &str,
+    file_filter: Option<&str>,
+    target_may_be_file: bool,
+) -> Vec<NodeId> {
+    if target_may_be_file { graph.select_target(query, file_filter) } else { graph.select_symbols(query, file_filter) }
+}
+
+fn render_steps(
+    label: &str,
+    query: &str,
+    roots: &[NodeId],
+    steps: &[TraversalStep],
+    graph: &SemanticGraph,
+    depth: usize,
+    max_bytes: usize,
+) -> String {
+    let mut lines = vec![format!("[qc-{label} v1] {query} - {} definitions, depth {depth}\n", roots.len())];
+    for &root in roots {
+        lines.push(format!("{}\n", semantic_node_label(graph, root)));
+        for step in steps.iter().filter(|step| step.root == root) {
+            lines.push(format!(
+                "  d{} {} {} [{} @{}:{}]\n",
+                step.depth,
+                if label == "callers" || label == "impact" || label == "dependents" { "<-" } else { "->" },
+                semantic_node_label(graph, step.node),
+                step.via.as_str(),
+                step.line,
+                step.column,
+            ));
+        }
+    }
+    bounded_graph_output(lines, max_bytes, label)
+}
+
+fn semantic_incomplete(snapshot: &SourceIndex, cfg: &MapConfig) -> ScanError {
+    incomplete_error_from_index(snapshot, cfg)
+}
+
+pub(crate) fn build_callers(
+    query: &str,
+    file_filter: Option<&str>,
+    depth: usize,
+    max_nodes: usize,
+    snapshot: &SourceIndex,
+    cfg: &MapConfig,
+) -> ScanResult {
+    let graph = snapshot.semantic_graph();
+    let roots = graph_roots(graph, query, file_filter, false);
+    if roots.is_empty() {
+        if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
+        return Ok(None);
+    }
+    let steps = graph.callers(&roots, depth, max_nodes);
+    Ok(Some(render_steps("callers", query, &roots, &steps, graph, depth, cfg.max_bytes)))
+}
+
+pub(crate) fn build_callees(
+    query: &str,
+    file_filter: Option<&str>,
+    depth: usize,
+    max_nodes: usize,
+    snapshot: &SourceIndex,
+    cfg: &MapConfig,
+) -> ScanResult {
+    let graph = snapshot.semantic_graph();
+    let roots = graph_roots(graph, query, file_filter, false);
+    if roots.is_empty() {
+        if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
+        return Ok(None);
+    }
+    let steps = graph.callees(&roots, depth, max_nodes);
+    Ok(Some(render_steps("callees", query, &roots, &steps, graph, depth, cfg.max_bytes)))
+}
+
+pub(crate) fn build_impact(
+    query: &str,
+    file_filter: Option<&str>,
+    depth: usize,
+    max_nodes: usize,
+    snapshot: &SourceIndex,
+    cfg: &MapConfig,
+) -> ScanResult {
+    let graph = snapshot.semantic_graph();
+    let roots = graph_roots(graph, query, file_filter, false);
+    if roots.is_empty() {
+        if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
+        return Ok(None);
+    }
+    let steps = graph.impact(&roots, depth, max_nodes);
+    Ok(Some(render_steps("impact", query, &roots, &steps, graph, depth, cfg.max_bytes)))
+}
+
+pub(crate) fn build_dependencies(
+    query: &str,
+    file_filter: Option<&str>,
+    incoming: bool,
+    depth: usize,
+    max_nodes: usize,
+    snapshot: &SourceIndex,
+    cfg: &MapConfig,
+) -> ScanResult {
+    let graph = snapshot.semantic_graph();
+    let roots = graph_roots(graph, query, file_filter, true);
+    if roots.is_empty() {
+        if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
+        return Ok(None);
+    }
+    let steps = graph.dependencies(&roots, incoming, depth, max_nodes);
+    let label = if incoming { "dependents" } else { "deps" };
+    Ok(Some(render_steps(label, query, &roots, &steps, graph, depth, cfg.max_bytes)))
+}
+
+pub(crate) fn build_path(
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    max_nodes: usize,
+    snapshot: &SourceIndex,
+    cfg: &MapConfig,
+) -> ScanResult {
+    let graph = snapshot.semantic_graph();
+    let starts = graph.select_target(from, None);
+    let targets = graph.select_target(to, None);
+    if starts.is_empty() || targets.is_empty() {
+        if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
+        return Ok(None);
+    }
+    let Some(path) = graph.shortest_path(&starts, &targets, max_depth, max_nodes) else {
+        return Ok(Some(format!("[qc-path v1] {from} -> {to}: no semantic path within depth {max_depth}\n")));
+    };
+    let mut lines = vec![format!("[qc-path v1] {from} -> {to} - {} nodes\n", path.len())];
+    for (i, hop) in path.iter().enumerate() {
+        if i == 0 { lines.push(format!("  {}\n", semantic_node_label(graph, hop.node))); }
+        else {
+            lines.push(format!("  -> {} [{} @{}:{}]\n", semantic_node_label(graph, hop.node), hop.via.map(EdgeKind::as_str).unwrap_or("?"), hop.line, hop.column));
+        }
+    }
+    Ok(Some(bounded_graph_output(lines, cfg.max_bytes, "path")))
+}
+
+pub(crate) fn build_semantic_direct(
+    operation: crate::repomap_protocol::LookupOperation,
+    query: &str,
+    secondary_query: Option<&str>,
+    file_filter: Option<&str>,
+    depth: usize,
+    max_nodes: usize,
+    root: &Path,
+    cfg: &MapConfig,
+) -> ScanResult {
+    let snapshot = direct_snapshot(root, cfg)?;
+    match operation {
+        crate::repomap_protocol::LookupOperation::Callers => build_callers(query, file_filter, depth, max_nodes, &snapshot, cfg),
+        crate::repomap_protocol::LookupOperation::Callees => build_callees(query, file_filter, depth, max_nodes, &snapshot, cfg),
+        crate::repomap_protocol::LookupOperation::Impact => build_impact(query, file_filter, depth, max_nodes, &snapshot, cfg),
+        crate::repomap_protocol::LookupOperation::Deps => build_dependencies(query, file_filter, false, depth, max_nodes, &snapshot, cfg),
+        crate::repomap_protocol::LookupOperation::Dependents => build_dependencies(query, file_filter, true, depth, max_nodes, &snapshot, cfg),
+        crate::repomap_protocol::LookupOperation::Path => build_path(query, secondary_query.unwrap_or_default(), depth, max_nodes, &snapshot, cfg),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1046,9 +1232,22 @@ mod tests {
         let dir = tempdir();
         fixture(&dir);
         let out = output(build_refs_direct("helper", &dir, &cfg()));
-        assert!(out.starts_with("[qc-references v1] helper"));
+        assert!(out.starts_with("[qc-references v2] helper"));
         assert!(out.contains("src/main.rs:2:"));
-        assert!(out.contains("src/main.rs:5:"));
+        assert!(out.contains("src/main.rs:5"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn semantic_refs_do_not_fall_back_to_ambiguous_lexical_hits() {
+        let dir = tempdir();
+        write_file(&dir, "a.ts", "export function save() {}\n");
+        write_file(&dir, "b.ts", "export function save() {}\n");
+        write_file(&dir, "c.ts", "export function run(){ save(); }\n");
+        let out = output(build_refs_direct("save", &dir, &cfg()));
+        assert!(out.starts_with("[qc-references v2] save - 2 definitions"));
+        assert!(out.contains("no resolved semantic references"));
+        assert!(!out.contains("c.ts:"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

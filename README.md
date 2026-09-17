@@ -61,6 +61,11 @@ The package also ships a small local front door for Bash/tool-hook use:
 qc run -- rg -n "needle" src
 qc repo map
 qc repo symbol MyType
+qc callers MyType.method
+qc callees MyType.method --depth 2
+qc impact MyType.method --depth 3
+qc deps src/service.ts
+qc path requestHandler saveRecord
 printf '%s\n' "large reusable context" | qc index --stdin --source notes/demo --project "$PWD"
 qc search reusable --project "$PWD" --full
 qc status
@@ -69,7 +74,7 @@ qc doctor
 
 `context-mode` remains an executable compatibility alias for pre-existing platform hook configurations. `ft` is also shipped as a temporary executable alias to `qc` for Fewtok cutovers; its old repository-navigation spellings (`ft map`, `ft sym`, `ft refs`, `ft outline`) are accepted directly. New hook configurations use `qc hook <platform> <event>`; new user-facing local workflows use `qc`.
 
-`qc run -- ...` executes argv directly through the same native filtering engine used by supported MCP shell commands. It preserves the child exit code. When filtering omits raw text, QuietContext retains bounded exact evidence and indexes searchable text so `search` can recover an omitted line. `qc repo` exposes the same native repository map/symbol/reference/outline engine as the MCP `repo` tool. `qc index` and `qc search` are local front doors to QuietContext's project-scoped FTS5 store; `qc index --stdin` accepts at most the normal per-source indexing cap and rejects invalid UTF-8 instead of silently indexing binary data.
+`qc run -- ...` executes argv directly through the same native filtering engine used by supported MCP shell commands. It preserves the child exit code. When filtering omits raw text, QuietContext retains bounded exact evidence and indexes searchable text so `search` can recover an omitted line. `qc repo` exposes the same native repository engine as the MCP `repo` tool. `qc map` stays a compact orientation view; JavaScript/TypeScript, Python, Rust, and Go are also indexed into a bounded semantic graph for resolved references, callers, callees, impact, dependencies, dependents, and shortest dependency paths. Ambiguous same-named definitions are kept separate rather than guessed, and `--file` can narrow a CLI symbol query. The compact MCP `repo` surface uses `symbol@path` to disambiguate colliding definitions and `from -> to` as the `path` target. `qc index` and `qc search` are local front doors to QuietContext's project-scoped FTS5 store; `qc index --stdin` accepts at most the normal per-source indexing cap and rejects invalid UTF-8 instead of silently indexing binary data.
 
 The existing Claude/Codex `PreToolUse` hook contains an opt-in `qc` routing branch and **does not enable it automatically**. Run `qc routing enable` to activate it (or `qc routing disable` to remove the marker). `QUIET_CONTEXT_QC_BASH_ROUTING=0` is an emergency bypass. When active, simple noisy commands are routed through `qc`; uncertain shell syntax passes through unchanged. Modern Codex can rewrite transparently, while current Claude Code uses an enforceable deny with an exact `qc run -- ...` retry because its Bash hook does not honor command substitution.
 

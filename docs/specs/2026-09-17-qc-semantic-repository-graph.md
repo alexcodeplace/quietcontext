@@ -1,7 +1,7 @@
 # QC Semantic Repository Graph
 
 outcome: QC repository navigation becomes a semantic graph over the same bounded, incremental native repository index that already powers `qc map`, `qc sym`, `qc refs`, and `qc outline`. The graph resolves declarations and relationships so QC can answer callers, callees, impact, dependency, and path questions without dumping source or guessing across ambiguous names.
-status: ACTIVE
+status: COMPLETE
 source request: owner 2026-09-17 — preserve the cheap repository map, add semantic relationships and graph traversal, and complete the native QC implementation without introducing a separate heavyweight product surface.
 
 ## Product contract
@@ -406,4 +406,20 @@ On the existing native corpus fixture set:
 7. fixtures for collisions/import aliases/cycles/incremental edits
 8. full validation and receipts
 
-Next executable action: implement against this specification; change the specification first if an implementation discovery changes a contract.
+## Completion evidence
+
+Implemented in native QC with AST-backed extraction for JavaScript/TypeScript, Python, Rust, and Go; deterministic import/call/type resolution; graph storage in the existing immutable repository generation; semantic references; callers, callees, impact, dependencies, dependents, and shortest-path traversal; protocol-v2/native-handshake upgrade; daemon socket revision fencing; CLI aliases; and the existing seven-tool MCP surface.
+
+Validated on the exact feature worktree through the sanctioned K3s builder:
+
+- native Rust suite: all tests green, including alias resolution, same-name ambiguity, receiver ownership, cycles, inheritance, trait implementation, and semantic-reference fallback guards
+- package build/typecheck/bundle assertions: green
+- QuietContext package suite: 92/92 green
+- native integration/corpus/HTTP suite: 18/18 green with one existing platform-specific fidelity skip
+- `tools/list`: under the existing 4 KiB cap and byte-identical over stdio/HTTP
+- live repository watcher coverage: semantic call edges disappear/reappear after edits and stale semantic definitions disappear after file deletion
+- changed-file audit: no unrelated product branding or attribution strings in spec, code, comments, or tests
+
+The implementation deliberately leaves `.astro`, `.vue`, and `.svelte` on the conservative structural-map fallback until dedicated embedded-script parsing is specified.
+
+Next executable action: none for this specification.

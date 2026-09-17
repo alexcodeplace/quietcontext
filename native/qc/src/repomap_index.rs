@@ -1,5 +1,6 @@
 use crate::config::MapConfig;
 use crate::outline::{self, Decl, Family};
+use crate::semantic::SemanticGraph;
 use ignore::WalkBuilder;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -334,6 +335,7 @@ pub struct SourceIndex {
     map_summaries: Arc<[MapSummary]>,
     declarations_by_name: Arc<BTreeMap<String, Arc<[DeclarationPosting]>>>,
     identifier_refs: Arc<BTreeMap<String, Arc<[ReferenceCoordinate]>>>,
+    semantic_graph: Arc<SemanticGraph>,
     diagnostics: WalkDiagnostics,
     truncated: bool,
     generation: u64,
@@ -353,6 +355,10 @@ impl SourceIndex {
 
     pub fn map_summaries(&self) -> &[MapSummary] {
         &self.map_summaries
+    }
+
+    pub fn semantic_graph(&self) -> &SemanticGraph {
+        &self.semantic_graph
     }
 
     pub fn declarations(&self, name: &str) -> Option<&[DeclarationPosting]> {
@@ -1332,6 +1338,8 @@ fn assemble_index(
         &mut logical_bytes,
         reference_index_logical_bytes(&identifier_refs),
     );
+    let semantic_graph = SemanticGraph::build(&scan_inputs.canonical_root, &files);
+    size_add(&mut logical_bytes, semantic_graph.logical_bytes());
     if logical_bytes > MAX_LOGICAL_INDEX_BYTES {
         return Err(ScanError::TooLarge);
     }
@@ -1362,6 +1370,7 @@ fn assemble_index(
         map_summaries: map_summaries.into(),
         declarations_by_name: Arc::new(declarations_by_name),
         identifier_refs: Arc::new(identifier_refs),
+        semantic_graph: Arc::new(semantic_graph),
         diagnostics,
         truncated,
         generation,

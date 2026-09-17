@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const DAEMON_MODE_ARG: &str = "--repomap-daemon";
 pub(crate) const DAEMON_MODE_ENV: &str = "QUIET_CONTEXT_REPOMAP_DAEMON";
-pub(crate) const SOCKET_REVISION: &str = "v2";
+pub(crate) const SOCKET_REVISION: &str = "v3";
 
 const STARTUP_LOCK_WAIT: Duration = Duration::from_millis(5);
 const EXISTING_CONNECT_WAIT: Duration = Duration::from_millis(2);
@@ -718,6 +718,16 @@ fn direct_lookup(
         repomap_protocol::LookupOperation::Refs => {
             repomap::build_refs_direct(request.query.as_deref().unwrap_or_default(), &root, &config)
         }
+        operation => repomap::build_semantic_direct(
+            operation,
+            request.query.as_deref().unwrap_or_default(),
+            request.secondary_query.as_deref(),
+            request.file_filter.as_deref(),
+            request.depth.unwrap_or(if operation == repomap_protocol::LookupOperation::Impact { 3 } else if operation == repomap_protocol::LookupOperation::Path { 8 } else { 1 }),
+            request.max_nodes.unwrap_or(200),
+            &root,
+            &config,
+        ),
     };
     let response = response_from_result(
         request.operation,
@@ -756,18 +766,18 @@ fn response_from_result(
             ),
             repomap_protocol::LookupOperation::Refs => (
                 String::new(),
-                format!(
-                    "qc repo references: {} not found\n",
-                    query.unwrap_or_default()
-                ),
+                format!("qc repo references: {} not found\n", query.unwrap_or_default()),
+                1,
+            ),
+            operation => (
+                String::new(),
+                format!("qc repo {}: {} not found\n", operation.as_str(), query.unwrap_or_default()),
                 1,
             ),
         },
         Err(error) => {
             let command = match operation {
-                repomap_protocol::LookupOperation::Map => "map",
-                repomap_protocol::LookupOperation::Sym => "sym",
-                repomap_protocol::LookupOperation::Refs => "refs",
+                operation => operation.as_str(),
             };
             (String::new(), format!("qc repo {command}: {error}\n"), 1)
         }

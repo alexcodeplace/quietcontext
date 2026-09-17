@@ -25,7 +25,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
     schemaVersion: 1,
     packageVersion: "9.8.7",
     nativeVersion: "0.1.0",
-    protocolVersion: 1,
+    protocolVersion: 2,
     platform: "linux",
     arch: "x64",
     sha256,

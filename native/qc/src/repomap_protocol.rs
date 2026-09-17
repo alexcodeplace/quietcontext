@@ -4,7 +4,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const FRAME_HEADER_BYTES: usize = std::mem::size_of::<u32>();
 pub const MAX_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 pub const RESPONSE_FRAME_HEADROOM_BYTES: usize = 64 * 1024;
@@ -15,6 +15,12 @@ pub enum LookupOperation {
     Map,
     Sym,
     Refs,
+    Callers,
+    Callees,
+    Impact,
+    Deps,
+    Dependents,
+    Path,
 }
 
 impl LookupOperation {
@@ -23,11 +29,21 @@ impl LookupOperation {
             Self::Map => "map",
             Self::Sym => "sym",
             Self::Refs => "refs",
+            Self::Callers => "callers",
+            Self::Callees => "callees",
+            Self::Impact => "impact",
+            Self::Deps => "deps",
+            Self::Dependents => "dependents",
+            Self::Path => "path",
         }
     }
 
     fn requires_query(self) -> bool {
         !matches!(self, Self::Map)
+    }
+
+    fn requires_secondary_query(self) -> bool {
+        matches!(self, Self::Path)
     }
 }
 
@@ -108,6 +124,14 @@ pub struct LookupRequest {
     pub canonical_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<usize>,
     pub map_config: EffectiveMapConfig,
 }
 
@@ -124,6 +148,10 @@ impl LookupRequest {
             operation,
             canonical_root: canonical_root.into(),
             query,
+            secondary_query: None,
+            file_filter: None,
+            depth: None,
+            max_nodes: None,
             map_config,
         };
         request.validate()?;
@@ -134,11 +162,27 @@ impl LookupRequest {
         validate_version(self.version)?;
         validate_root(&self.canonical_root)?;
         match (self.operation.requires_query(), self.query.as_deref()) {
-            (false, None) => Ok(()),
-            (false, Some(_)) => Err(ProtocolError::InvalidQuery),
-            (true, Some(query)) if valid_query(query) => Ok(()),
-            (true, _) => Err(ProtocolError::InvalidQuery),
+            (false, None) => {}
+            (false, Some(_)) => return Err(ProtocolError::InvalidQuery),
+            (true, Some(query)) if valid_query(query) => {}
+            (true, _) => return Err(ProtocolError::InvalidQuery),
         }
+        match (self.operation.requires_secondary_query(), self.secondary_query.as_deref()) {
+            (true, Some(query)) if valid_query(query) => {}
+            (true, _) => return Err(ProtocolError::InvalidQuery),
+            (false, None) => {}
+            (false, Some(_)) => return Err(ProtocolError::InvalidQuery),
+        }
+        if self.file_filter.as_deref().is_some_and(|value| !valid_query(value)) {
+            return Err(ProtocolError::InvalidQuery);
+        }
+        if self.depth.is_some_and(|value| value == 0 || value > 32) {
+            return Err(ProtocolError::InvalidQuery);
+        }
+        if self.max_nodes.is_some_and(|value| value == 0 || value > 200) {
+            return Err(ProtocolError::InvalidQuery);
+        }
+        Ok(())
     }
 }
 
@@ -520,6 +564,10 @@ mod tests {
             operation: LookupOperation::Map,
             canonical_root: root.clone(),
             query: Some("unexpected".to_owned()),
+            secondary_query: None,
+            file_filter: None,
+            depth: None,
+            max_nodes: None,
             map_config: EffectiveMapConfig::default(),
         };
         assert!(matches!(
@@ -532,6 +580,10 @@ mod tests {
             operation: LookupOperation::Sym,
             canonical_root: root.clone(),
             query: Some(String::new()),
+            secondary_query: None,
+            file_filter: None,
+            depth: None,
+            max_nodes: None,
             map_config: EffectiveMapConfig::default(),
         };
         assert!(matches!(
@@ -545,6 +597,10 @@ mod tests {
             operation: LookupOperation::Map,
             canonical_root: noncanonical,
             query: None,
+            secondary_query: None,
+            file_filter: None,
+            depth: None,
+            max_nodes: None,
             map_config: EffectiveMapConfig::default(),
         };
         assert!(matches!(
@@ -621,15 +677,15 @@ mod tests {
 
     #[test]
     fn response_accepts_legacy_cache_state_key() {
-        let payload = br#"{
-            "version": 1,
+        let payload = format!(r#"{{
+            "version": {PROTOCOL_VERSION},
             "cache_state": "hit",
             "stdout": "",
             "stderr": "",
             "exit_code": 0,
             "generation": 1
-        }"#;
-        let response = decode_response_body(payload, 0).expect("decode response");
+        }}"#);
+        let response = decode_response_body(payload.as_bytes(), 0).expect("decode response");
         assert_eq!(response.status, CacheState::Hit);
         assert_eq!(response.timings, LookupTimings::default());
     }

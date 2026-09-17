@@ -278,11 +278,11 @@ const nativeRegisterTool = server.registerTool.bind(server);
 const QUIET_TOOL_DESCRIPTIONS: Record<string, string> = {
   execute: "Run code.",
   "exec-file": "Process file.",
-  index: "Index content into FTS5.",
-  search: "Search indexed content.",
-  "fetch-index": "Fetch and index URLs.",
-  batch: "Run and search commands.",
-  repo: "Repo navigation.",
+  index: "Index.",
+  search: "Search.",
+  "fetch-index": "Fetch.",
+  batch: "Batch.",
+  repo: "Repo.",
 };
 const quietLanguage = z.enum([
   "javascript",
@@ -357,7 +357,7 @@ const QUIET_TOOL_SCHEMAS: Record<string, z.ZodType> = {
     max_bytes: z.number().optional(),
   }),
   repo: z.object({
-    action: z.enum(["map", "symbol", "references", "outline"]),
+    action: z.enum(["map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
     target: z.string().optional(),
   }),
 };
@@ -1728,24 +1728,51 @@ registerQuietTool(
   {
     title: "Navigate repository structure",
     inputSchema: z.object({
-      action: z.enum(["map", "symbol", "references", "outline"]),
+      action: z.enum(["map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
       target: z.string().optional(),
+      target2: z.string().optional(),
+      file: z.string().optional(),
+      depth: z.number().int().min(1).max(32).optional(),
+      max_nodes: z.number().int().min(1).max(200).optional(),
     }).superRefine((value, ctx) => {
       if (value.action !== "map" && !value.target?.trim()) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["target"], message: "target is required for this action" });
       }
+      if (value.action === "path" && !value.target2?.trim() && !value.target?.includes(" -> ")) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["target"], message: "path target must be 'from -> to'" });
+      }
     }),
   },
-  async ({ action, target }) => {
+  async ({ action, target, target2, file, depth, max_nodes }) => {
     const projectRoot = getProjectDir();
     try {
+      let semanticTarget = target?.trim();
+      let semanticFile = file?.trim();
+      if (!semanticFile && semanticTarget && ["callers", "callees", "impact", "deps", "dependents"].includes(action)) {
+        const split = semanticTarget.lastIndexOf("@");
+        if (split > 0 && split < semanticTarget.length - 1) {
+          semanticFile = semanticTarget.slice(split + 1);
+          semanticTarget = semanticTarget.slice(0, split);
+        }
+      }
+      let pathFrom = semanticTarget;
+      let pathTo = target2?.trim();
+      if (action === "path" && !pathTo && semanticTarget?.includes(" -> ")) {
+        const split = semanticTarget.indexOf(" -> ");
+        pathFrom = semanticTarget.slice(0, split).trim();
+        pathTo = semanticTarget.slice(split + 4).trim();
+      }
       const request = action === "map"
         ? { action: "map" as const, root: projectRoot }
         : action === "symbol"
           ? { action: "symbol" as const, query: String(target), root: projectRoot }
           : action === "references"
             ? { action: "references" as const, query: String(target), root: projectRoot }
-            : { action: "outline" as const, path: String(target), root: projectRoot };
+            : action === "outline"
+              ? { action: "outline" as const, path: String(target), root: projectRoot }
+              : action === "path"
+                ? { action: "path" as const, from: String(pathFrom), to: String(pathTo), root: projectRoot, maxDepth: depth, maxNodes: max_nodes }
+                : { action, query: String(semanticTarget), root: projectRoot, file: semanticFile, depth, maxNodes: max_nodes };
       const receipt = await repoQcNative(request, {
         cwd: projectRoot,
         timeoutMs: 5_000,

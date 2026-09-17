@@ -19,8 +19,13 @@ function help() {
     "  qc repo map [--root <path>]",
     "  qc repo symbol <name> [--root <path>]",
     "  qc repo references <name> [--root <path>]",
+    "  qc repo callers|callees <name> [--file <path>] [--depth N] [--root <path>]",
+    "  qc repo impact <name> [--file <path>] [--depth N] [--root <path>]",
+    "  qc repo deps|dependents <file-or-symbol> [--depth N] [--root <path>]",
+    "  qc repo path <from> <to> [--max-depth N] [--root <path>]",
     "  qc repo outline <file> [--root <path>]",
     "  qc map|sym|refs|outline ...          Compatibility aliases for an ft -> qc symlink",
+    "  qc callers|callees|impact|deps|dependents|path ...",
     "  qc index <path> | --stdin --source <label> [--project <path>]",
     "  qc search <query...> [--project <path>] [--source <label>] [--full]",
     "  qc hook <platform> <event>",
@@ -33,22 +38,33 @@ function help() {
 }
 
 
-function parseRootOption(argv) {
+function parseRepoOptions(argv) {
   const rest = [];
-  let root;
+  const options = {};
+  const numeric = new Set(["depth", "maxDepth", "maxNodes"]);
+  const names = new Map([
+    ["--root", "root"],
+    ["--file", "file"],
+    ["--depth", "depth"],
+    ["--max-depth", "maxDepth"],
+    ["--max-nodes", "maxNodes"],
+  ]);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--root") {
-      root = argv[++i];
-      if (!root) throw new Error("--root requires a path");
-    } else if (arg.startsWith("--root=")) {
-      root = arg.slice("--root=".length);
-      if (!root) throw new Error("--root requires a path");
+    const equals = [...names.entries()].find(([flag]) => arg.startsWith(`${flag}=`));
+    const key = names.get(arg) ?? equals?.[1];
+    if (!key) { rest.push(arg); continue; }
+    const value = equals ? arg.slice(arg.indexOf("=") + 1) : argv[++i];
+    if (!value) throw new Error(`${arg.split("=")[0]} requires a value`);
+    if (numeric.has(key)) {
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${arg.split("=")[0]} requires a positive integer`);
+      options[key] = parsed;
     } else {
-      rest.push(arg);
+      options[key] = value;
     }
   }
-  return { root, rest };
+  return { ...options, rest };
 }
 
 function runContextModeCli(argv) {
@@ -66,7 +82,7 @@ async function runRepo(argv) {
   const actionRaw = argv[0];
   if (!actionRaw) throw new Error("repo requires map, symbol, references, or outline");
   const action = actionRaw === "sym" ? "symbol" : actionRaw === "refs" ? "references" : actionRaw;
-  const { root, rest } = parseRootOption(argv.slice(1));
+  const { root, file, depth, maxDepth, maxNodes, rest } = parseRepoOptions(argv.slice(1));
   let request;
   if (action === "map") {
     if (rest.length > 1) throw new Error("repo map accepts at most one positional root");
@@ -74,6 +90,12 @@ async function runRepo(argv) {
   } else if (action === "symbol" || action === "references") {
     if (rest.length !== 1) throw new Error(`repo ${action} requires exactly one name`);
     request = { action, query: rest[0], root };
+  } else if (["callers", "callees", "impact", "deps", "dependents"].includes(action)) {
+    if (rest.length !== 1) throw new Error(`repo ${action} requires exactly one target`);
+    request = { action, query: rest[0], root, file, depth, maxNodes };
+  } else if (action === "path") {
+    if (rest.length !== 2) throw new Error("repo path requires exactly <from> <to>");
+    request = { action: "path", from: rest[0], to: rest[1], root, maxDepth, maxNodes };
   } else if (action === "outline") {
     if (rest.length !== 1) throw new Error("repo outline requires exactly one file");
     request = { action: "outline", path: rest[0], root };
@@ -131,7 +153,7 @@ async function main() {
   if (args[0] === "repo") {
     return runRepo(args.slice(1));
   }
-  if (["map", "sym", "refs", "outline"].includes(args[0])) {
+  if (["map", "sym", "refs", "outline", "callers", "callees", "impact", "deps", "dependents", "path"].includes(args[0])) {
     return runRepo(args);
   }
   if (args[0] === "hook") {

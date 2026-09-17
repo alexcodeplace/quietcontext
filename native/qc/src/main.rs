@@ -8,6 +8,8 @@ mod repomap_daemon;
 mod repomap_index;
 mod repomap_protocol;
 mod runner;
+mod semantic;
+mod semantic_extract;
 mod util;
 
 use clap::{Parser, Subcommand};
@@ -15,7 +17,7 @@ use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-const NATIVE_PROTOCOL_VERSION: u32 = 1;
+const NATIVE_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Parser)]
 #[command(name = "qc-native", version, about = "QuietContext native engine")]
@@ -60,6 +62,71 @@ enum RepoAction {
         path: PathBuf,
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    Callers {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+    },
+    Callees {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+    },
+    Impact {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+    },
+    Deps {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+    },
+    Dependents {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+    },
+    Path {
+        from: String,
+        to: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long = "max-depth")]
+        max_depth: Option<usize>,
+        #[arg(long)]
+        max_nodes: Option<usize>,
     },
 }
 
@@ -355,28 +422,26 @@ fn repo(action: RepoAction) {
                 ),
             }
         }
-        RepoAction::Map { root } => {
-            lookup_repo(repomap_protocol::LookupOperation::Map, None, root, &cfg.map)
-        }
-        RepoAction::Symbol { query, root } => lookup_repo(
-            repomap_protocol::LookupOperation::Sym,
-            Some(query),
-            root,
-            &cfg.map,
-        ),
-        RepoAction::References { query, root } => lookup_repo(
-            repomap_protocol::LookupOperation::Refs,
-            Some(query),
-            root,
-            &cfg.map,
-        ),
+        RepoAction::Map { root } => lookup_repo(repomap_protocol::LookupOperation::Map, None, None, root, None, None, None, &cfg.map),
+        RepoAction::Symbol { query, root } => lookup_repo(repomap_protocol::LookupOperation::Sym, Some(query), None, root, None, None, None, &cfg.map),
+        RepoAction::References { query, root } => lookup_repo(repomap_protocol::LookupOperation::Refs, Some(query), None, root, None, None, None, &cfg.map),
+        RepoAction::Callers { query, root, file, depth, max_nodes } => lookup_repo(repomap_protocol::LookupOperation::Callers, Some(query), None, root, file, depth, max_nodes, &cfg.map),
+        RepoAction::Callees { query, root, file, depth, max_nodes } => lookup_repo(repomap_protocol::LookupOperation::Callees, Some(query), None, root, file, depth, max_nodes, &cfg.map),
+        RepoAction::Impact { query, root, file, depth, max_nodes } => lookup_repo(repomap_protocol::LookupOperation::Impact, Some(query), None, root, file, depth, max_nodes, &cfg.map),
+        RepoAction::Deps { query, root, file, depth, max_nodes } => lookup_repo(repomap_protocol::LookupOperation::Deps, Some(query), None, root, file, depth, max_nodes, &cfg.map),
+        RepoAction::Dependents { query, root, file, depth, max_nodes } => lookup_repo(repomap_protocol::LookupOperation::Dependents, Some(query), None, root, file, depth, max_nodes, &cfg.map),
+        RepoAction::Path { from, to, root, max_depth, max_nodes } => lookup_repo(repomap_protocol::LookupOperation::Path, Some(from), Some(to), root, None, max_depth, max_nodes, &cfg.map),
     }
 }
 
 fn lookup_repo(
     operation: repomap_protocol::LookupOperation,
     query: Option<String>,
+    secondary_query: Option<String>,
     root: Option<PathBuf>,
+    file_filter: Option<String>,
+    depth: Option<usize>,
+    max_nodes: Option<usize>,
     map_cfg: &config::MapConfig,
 ) {
     let root = match canonical_root(root) {
@@ -388,6 +453,10 @@ fn lookup_repo(
         operation,
         canonical_root: root.to_string_lossy().into_owned(),
         query: query.clone(),
+        secondary_query,
+        file_filter,
+        depth,
+        max_nodes,
         map_config: repomap_protocol::EffectiveMapConfig::from(map_cfg),
     };
     let outcome = repomap_client::lookup(request, repomap_client::ClientBudget::default());

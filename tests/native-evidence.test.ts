@@ -27,7 +27,7 @@ function stream(path: string, content: Buffer, overrides: Partial<QcNativeStream
 
 function receipt(root: string, stdout: QcNativeStreamReceipt, stderr: QcNativeStreamReceipt): QcNativeRunReceipt {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     nativeVersion: "0.1.0",
     kind: "run",
     command: ["cargo", "test"],
