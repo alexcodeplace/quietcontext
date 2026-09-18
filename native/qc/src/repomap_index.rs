@@ -375,6 +375,12 @@ impl SourceIndex {
         &self.map_summaries
     }
 
+    pub fn semantic_graph_if_ready(&self) -> Option<Result<&SemanticGraph, ScanError>> {
+        self.semantic_graph
+            .get()
+            .map(|result| result.as_deref().map_err(Clone::clone))
+    }
+
     pub fn semantic_graph(&self) -> Result<&SemanticGraph, ScanError> {
         let result = self.semantic_graph.get_or_init(|| {
             let graph = SemanticGraph::build(&self.scan_inputs.canonical_root, &self.files);

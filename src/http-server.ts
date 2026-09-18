@@ -26,6 +26,7 @@ import {
   ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
+  QC_SERVER_INSTRUCTIONS,
   REGISTERED_CTX_TOOLS,
   VERSION,
   installStrictClientSchemaCompat,
@@ -129,7 +130,7 @@ function validateRoot(raw: string | undefined): string | null {
 }
 
 function buildRequestServer(projectDir: string | null): McpServer {
-  const mcp = new McpServer({ name: "quietcontext", version: VERSION });
+  const mcp = new McpServer({ name: "quietcontext", version: VERSION }, { instructions: QC_SERVER_INSTRUCTIONS });
   mcp.server.registerCapabilities({
     prompts: { listChanged: false },
     resources: { listChanged: false },

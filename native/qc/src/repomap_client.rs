@@ -19,6 +19,8 @@ const STARTUP_LOCK_WAIT: Duration = Duration::from_millis(5);
 const EXISTING_CONNECT_WAIT: Duration = Duration::from_millis(2);
 const LAZY_START_WAIT: Duration = Duration::from_millis(100);
 const REQUEST_WAIT: Duration = Duration::from_millis(25);
+const EXPLORE_START_WAIT: Duration = Duration::from_millis(500);
+const EXPLORE_REQUEST_WAIT: Duration = Duration::from_millis(500);
 const SEMANTIC_START_WAIT: Duration = Duration::from_secs(30);
 const SEMANTIC_REQUEST_WAIT: Duration = Duration::from_secs(30);
 
@@ -57,7 +59,10 @@ impl ClientBudget {
 
     fn for_operation(self, operation: LookupOperation) -> Self {
         let mut budget = self.bounded();
-        if operation.is_semantic() {
+        if operation == LookupOperation::Explore {
+            budget.startup_wait = EXPLORE_START_WAIT;
+            budget.request_wait = EXPLORE_REQUEST_WAIT;
+        } else if operation.is_semantic() {
             budget.startup_wait = SEMANTIC_START_WAIT;
             budget.request_wait = SEMANTIC_REQUEST_WAIT;
         }
@@ -722,6 +727,11 @@ fn direct_lookup(
     let root = PathBuf::from(&request.canonical_root);
     let config: MapConfig = request.map_config.into();
     let result = match request.operation {
+        repomap_protocol::LookupOperation::Explore => repomap::build_explore_direct(
+            request.query.as_deref().unwrap_or_default(),
+            &root,
+            &config,
+        ),
         repomap_protocol::LookupOperation::Map => repomap::build_map_direct(&root, &config),
         repomap_protocol::LookupOperation::Sym => {
             repomap::build_sym_direct(request.query.as_deref().unwrap_or_default(), &root, &config)

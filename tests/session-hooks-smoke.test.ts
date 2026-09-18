@@ -9,7 +9,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, cpSync, rmSync, existsSync, readdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, cpSync, rmSync, existsSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -185,11 +185,37 @@ describe("Issue #117 — Session hooks without build/session/", () => {
     const result = runHook("userpromptsubmit.mjs", {
       prompt: "fix the login bug",
       session_id: "test-session-117",
+    }, {
+      QUIET_CONTEXT_FRONTLOAD_DISABLE: "1",
+      QUIET_CONTEXT_ADOPTION_TELEMETRY_DISABLE: "1",
     });
 
     expect(result.exitCode).toBe(0);
 
     // DB should be created via bundle
+    expect(getDBFiles().length).toBeGreaterThan(0);
+  });
+
+  test("userpromptsubmit.mjs front-loads structural QC context without blocking capture", () => {
+    writeFileSync(join(fakeProjectDir, "package.json"), "{}");
+
+    const result = runHook("userpromptsubmit.mjs", {
+      prompt: "How does login work?",
+      session_id: "test-session-117-frontload",
+      cwd: fakeProjectDir,
+    }, {
+      QUIET_CONTEXT_ADOPTION_TEST_MODE: "1",
+      QUIET_CONTEXT_FRONTLOAD_TEST_RESPONSE: "[qc-explore v1] login\\n## login - src/auth.ts:10\\n[source]\\n10\\tfunction login() {}\\n",
+      QUIET_CONTEXT_FRONTLOAD_TIMEOUT_MS: "1000",
+      QUIET_CONTEXT_ADOPTION_TELEMETRY_DISABLE: "1",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.hookSpecificOutput?.hookEventName).toBe("UserPromptSubmit");
+    expect(parsed.hookSpecificOutput?.additionalContext).toContain("<qc_context");
+    expect(parsed.hookSpecificOutput?.additionalContext).toContain("[qc-explore v1]");
     expect(getDBFiles().length).toBeGreaterThan(0);
   });
 

@@ -46,7 +46,7 @@ export interface QcNativeRepoReceipt {
   protocolVersion: number;
   nativeVersion: string;
   kind: "repo";
-  operation: "map" | "sym" | "refs" | "outline" | "callers" | "callees" | "impact" | "deps" | "dependents" | "path";
+  operation: "explore" | "map" | "sym" | "refs" | "outline" | "callers" | "callees" | "impact" | "deps" | "dependents" | "path";
   root: string;
   query?: string;
   stdout: string;
@@ -368,6 +368,7 @@ export async function runQcNative(
 export async function repoQcNative(
   request:
     | { action: "map"; root?: string }
+    | { action: "explore"; query: string; root?: string }
     | { action: "symbol" | "references"; query: string; root?: string }
     | { action: "callers" | "callees" | "impact" | "deps" | "dependents"; query: string; root?: string; file?: string; depth?: number; maxNodes?: number }
     | { action: "path"; from: string; to: string; root?: string; maxDepth?: number; maxNodes?: number }
@@ -375,7 +376,7 @@ export async function repoQcNative(
   options: { cwd?: string; timeoutMs?: number; packageRoot?: string; env?: NodeJS.ProcessEnv } = {},
 ): Promise<QcNativeRepoReceipt> {
   const args = ["repo", request.action];
-  if (request.action === "symbol" || request.action === "references") args.push(request.query);
+  if (request.action === "explore" || request.action === "symbol" || request.action === "references") args.push(request.query);
   if (["callers", "callees", "impact", "deps", "dependents"].includes(request.action)) {
     const graphRequest = request as {
       action: "callers" | "callees" | "impact" | "deps" | "dependents";

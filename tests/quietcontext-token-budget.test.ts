@@ -10,6 +10,7 @@ const ROOT = resolve(import.meta.dirname, "..");
 interface Harness {
   child: ChildProcessWithoutNullStreams;
   dataDir: string;
+  initializeResponse: Record<string, any>;
   call(method: string, params: Record<string, unknown>): Promise<Record<string, any>>;
 }
 
@@ -63,13 +64,13 @@ async function startHarness(): Promise<Harness> {
     return response;
   };
 
-  const harness = { child, dataDir, call };
-  harnesses.push(harness);
-  await call("initialize", {
+  const initializeResponse = await call("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
     clientInfo: { name: "quietcontext-budget-test", version: "1.0.0" },
   });
+  const harness = { child, dataDir, initializeResponse, call };
+  harnesses.push(harness);
   child.stdin.write(JSON.stringify({
     jsonrpc: "2.0",
     method: "notifications/initialized",
@@ -138,7 +139,7 @@ async function startHttpHarness(): Promise<HttpHarness> {
   return { port, token, root };
 }
 
-async function httpToolsList(harness: HttpHarness): Promise<Array<Record<string, unknown>>> {
+async function httpRpc(harness: HttpHarness, body: Record<string, unknown>): Promise<Record<string, any>> {
   const res = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
     method: "POST",
     headers: {
@@ -147,11 +148,15 @@ async function httpToolsList(harness: HttpHarness): Promise<Array<Record<string,
       authorization: `Bearer ${harness.token}`,
       "x-quietcontext-root": harness.root,
     },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    body: JSON.stringify(body),
   });
   const text = await res.text();
   const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
-  const body = JSON.parse(dataLine ? dataLine.slice(6) : text);
+  return JSON.parse(dataLine ? dataLine.slice(6) : text);
+}
+
+async function httpToolsList(harness: HttpHarness): Promise<Array<Record<string, unknown>>> {
+  const body = await httpRpc(harness, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
   return body.result.tools;
 }
 
@@ -186,7 +191,30 @@ describe("QuietContext token budgets", () => {
       "repo",
       "search",
     ]);
+    const repo = tools.find((tool: { name: string }) => tool.name === "repo");
+    expect(repo?._meta?.["anthropic/alwaysLoad"]).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(tools))).toBeLessThanOrEqual(4 * 1024);
+  });
+
+  test("MCP initialize tells agents to explore before exploratory Read/Grep", async () => {
+    const harness = await startHarness();
+    const instructions = String(harness.initializeResponse.result?.instructions ?? "");
+    expect(instructions).toContain("action=explore");
+    expect(instructions).toContain("before exploratory Read/Grep");
+    expect(Buffer.byteLength(instructions)).toBeLessThanOrEqual(1_200);
+
+    const httpHarness = await startHttpHarness();
+    const httpInit = await httpRpc(httpHarness, {
+      jsonrpc: "2.0",
+      id: 7,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "quietcontext-budget-http-test", version: "1.0.0" },
+      },
+    });
+    expect(httpInit.result?.instructions).toBe(instructions);
   });
 
   test("serialized tools/list stays within 4 KiB over HTTP and matches stdio byte-for-byte", async () => {
@@ -206,6 +234,8 @@ describe("QuietContext token budgets", () => {
       "repo",
       "search",
     ]);
+    const repo = httpTools.find((tool: any) => tool.name === "repo") as any;
+    expect(repo?._meta?.["anthropic/alwaysLoad"]).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(httpTools))).toBeLessThanOrEqual(4 * 1024);
     // Both transports register from the same REGISTERED_CTX_TOOLS list and
     // run the same strict-client schema pass — their wire schemas must be

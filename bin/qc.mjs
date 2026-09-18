@@ -16,6 +16,7 @@ function help() {
     "",
     "Usage:",
     "  qc run -- <command> [args...]",
+    "  qc repo explore <question-or-symbols> [--root <path>]",
     "  qc repo map [--root <path>]",
     "  qc repo symbol <name> [--root <path>]",
     "  qc repo references <name> [--root <path>]",
@@ -80,11 +81,14 @@ function runContextModeCli(argv) {
 
 async function runRepo(argv) {
   const actionRaw = argv[0];
-  if (!actionRaw) throw new Error("repo requires map, symbol, references, or outline");
+  if (!actionRaw) throw new Error("repo requires explore, map, symbol, references, or outline");
   const action = actionRaw === "sym" ? "symbol" : actionRaw === "refs" ? "references" : actionRaw;
   const { root, file, depth, maxDepth, maxNodes, rest } = parseRepoOptions(argv.slice(1));
   let request;
-  if (action === "map") {
+  if (action === "explore") {
+    if (rest.length < 1) throw new Error("repo explore requires a question or symbol/file names");
+    request = { action: "explore", query: rest.join(" "), root };
+  } else if (action === "map") {
     if (rest.length > 1) throw new Error("repo map accepts at most one positional root");
     request = { action: "map", root: root ?? rest[0] };
   } else if (action === "symbol" || action === "references") {
@@ -153,7 +157,7 @@ async function main() {
   if (args[0] === "repo") {
     return runRepo(args.slice(1));
   }
-  if (["map", "sym", "refs", "outline", "callers", "callees", "impact", "deps", "dependents", "path"].includes(args[0])) {
+  if (["explore", "map", "sym", "refs", "outline", "callers", "callees", "impact", "deps", "dependents", "path"].includes(args[0])) {
     return runRepo(args);
   }
   if (args[0] === "hook") {

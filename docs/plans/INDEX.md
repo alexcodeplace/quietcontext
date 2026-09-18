@@ -7,4 +7,5 @@ audience: AI coding agents first.
 | DONE | [Shared HTTP daemon](2026-08-15-shared-http-daemon.md) | Daemon live on 127.0.0.1:48619; 36 procs/2214 MiB → 1 proc/~80 MiB; 29/29 contract+http tests green |
 | DONE | [Bound indexing CPU and storage](2026-08-11-bound-indexing-cpu-storage.md) | Landed/installed `694821f4`; actual MCP entrypoint bounded rejection and normal index/search proven |
 | COMPLETE | [QC semantic review, landing, and local deployment](2026-09-18-qc-semantic-review-land-deploy.md) | Reviewed runtime landed, pinned by Overdeck, and live locally at exact QC `dd0d9aee` |
+| ACTIVE | [QC agent adoption front-load](2026-09-18-qc-agent-adoption-frontload.md) | external graph-tool style prompt front-load + repo explore + measurable adoption |
 | COMPLETE | [QC semantic repository graph](../specs/2026-09-17-qc-semantic-repository-graph.md) | Exact commit `7500ae2a` acceptance-gated; landing/deployment tracked separately |

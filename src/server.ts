@@ -138,11 +138,20 @@ if (process.env.QUIET_CONTEXT_EMBEDDED_PLUGIN_TOOLS !== "1") {
   });
 }
 
+export const QC_SERVER_INSTRUCTIONS =
+  "# QuietContext repository intelligence\\n\\n" +
+  "For structural code questions, architecture/flow tracing, and before exploratory Read/Grep during code changes, " +
+  "call the existing repo tool with action=explore first. Treat its returned source excerpts and graph relationships " +
+  "as already inspected. Do not re-run grep/read merely to verify unchanged facts; use focused reads only when explore " +
+  "is incomplete, stale after edits, or you need exact edit context. Other repo actions remain available for narrower follow-up queries.";
+
 const runtimes = detectRuntimes();
 const available = getAvailableLanguages(runtimes);
 export const server = new McpServer({
   name: "quietcontext",
   version: VERSION,
+}, {
+  instructions: QC_SERVER_INSTRUCTIONS,
 });
 
 export interface RegisteredCtxTool {
@@ -282,7 +291,7 @@ const QUIET_TOOL_DESCRIPTIONS: Record<string, string> = {
   search: "Search.",
   "fetch-index": "Fetch.",
   batch: "Batch.",
-  repo: "Repo.",
+  repo: "Explore repo first.",
 };
 const quietLanguage = z.enum([
   "javascript",
@@ -357,7 +366,7 @@ const QUIET_TOOL_SCHEMAS: Record<string, z.ZodType> = {
     max_bytes: z.number().optional(),
   }),
   repo: z.object({
-    action: z.enum(["map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
+    action: z.string(),
     target: z.string().optional(),
   }),
 };
@@ -632,11 +641,15 @@ export function installStrictClientSchemaCompat(target: McpServer = server): voi
     if (typeof original !== "function") return;
     target.server.setRequestHandler(ListToolsRequestSchema, async (req, extra) => {
       const result = (await original(req as unknown, extra as unknown)) as
-        | { tools?: Array<{ inputSchema?: unknown }> }
+        | { tools?: Array<{ name?: string; inputSchema?: unknown; _meta?: Record<string, unknown> }> }
         | undefined;
       if (result && Array.isArray(result.tools)) {
         for (const tool of result.tools) {
-          if (!tool || tool.inputSchema == null) continue;
+          if (!tool) continue;
+          if (tool.name === "repo") {
+            tool._meta = { ...(tool._meta ?? {}), "anthropic/alwaysLoad": true };
+          }
+          if (tool.inputSchema == null) continue;
           try {
             tool.inputSchema = sanitizeSchemaForStrictClients(tool.inputSchema);
           } catch {
@@ -1728,7 +1741,7 @@ registerQuietTool(
   {
     title: "Navigate repository structure",
     inputSchema: z.object({
-      action: z.enum(["map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
+      action: z.enum(["explore", "map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
       target: z.string().optional(),
       target2: z.string().optional(),
       file: z.string().optional(),
@@ -1762,8 +1775,10 @@ registerQuietTool(
         pathFrom = semanticTarget.slice(0, split).trim();
         pathTo = semanticTarget.slice(split + 4).trim();
       }
-      const request = action === "map"
-        ? { action: "map" as const, root: projectRoot }
+      const request = action === "explore"
+        ? { action: "explore" as const, query: String(target), root: projectRoot }
+        : action === "map"
+          ? { action: "map" as const, root: projectRoot }
         : action === "symbol"
           ? { action: "symbol" as const, query: String(target), root: projectRoot }
           : action === "references"

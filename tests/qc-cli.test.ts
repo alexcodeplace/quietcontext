@@ -145,6 +145,17 @@ nativeSuite("qc repo CLI", () => {
     expect(map.status, map.stderr).toBe(0);
     expect(map.stdout).toContain("CliNeedle");
 
+    const explore = runQc(["repo", "explore", "how does CliNeedle call PersistUser?"], { cwd: project, env });
+    expect(explore.status, explore.stderr).toBe(0);
+    expect(explore.stdout).toContain("[qc-explore v1]");
+    expect(explore.stdout).toContain("## CliNeedle");
+    expect(explore.stdout).toContain("[callees]");
+    expect(explore.stdout).toContain("PersistUser");
+
+    const directExplore = runQc(["explore", "trace CliNeedle to PersistUser"], { cwd: project, env });
+    expect(directExplore.status, directExplore.stderr).toBe(0);
+    expect(directExplore.stdout).toContain("[qc-explore v1]");
+
     const symbol = runQc(["repo", "sym", "CliNeedle"], { cwd: project, env });
     expect(symbol.status, symbol.stderr).toBe(0);
     expect(symbol.stdout).toContain("src/app.ts");

@@ -745,6 +745,44 @@ describe("Codex userpromptsubmit hook script", () => {
     expect(parsed.hookSpecificOutput).toBeDefined();
     expect(parsed.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
   });
+
+  it("front-loads structural QC context and remains valid JSON", () => {
+    const hookScript = resolve(__dirname, "../../hooks/codex/userpromptsubmit.mjs");
+    const project = mkdtempSync(join(tmpdir(), "qc-codex-frontload-"));
+    try {
+      writeFileSync(join(project, "package.json"), "{}");
+      const input = JSON.stringify({
+        session_id: "test-userprompt-frontload",
+        cwd: project,
+        hook_event_name: "UserPromptSubmit",
+        model: "o3",
+        permission_mode: "default",
+        prompt: "How does login work?",
+        transcript_path: null,
+        turn_id: "t2",
+      });
+
+      const stdout = execFileSync(process.execPath, [hookScript], {
+        input,
+        encoding: "utf-8",
+        timeout: 10000,
+        env: {
+          ...process.env,
+          QUIET_CONTEXT_ADOPTION_TEST_MODE: "1",
+          QUIET_CONTEXT_FRONTLOAD_TEST_RESPONSE: "[qc-explore v1] login\\n## login - src/auth.ts:10\\n[source]\\n10\\tfunction login() {}\\n",
+          QUIET_CONTEXT_FRONTLOAD_TIMEOUT_MS: "1000",
+          QUIET_CONTEXT_ADOPTION_TELEMETRY_DISABLE: "1",
+        },
+      });
+
+      const parsed = JSON.parse(stdout.trim());
+      expect(parsed.hookSpecificOutput?.hookEventName).toBe("UserPromptSubmit");
+      expect(parsed.hookSpecificOutput?.additionalContext).toContain("<qc_context");
+      expect(parsed.hookSpecificOutput?.additionalContext).toContain("[qc-explore v1]");
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("Codex stop hook script", () => {

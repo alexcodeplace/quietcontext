@@ -111,15 +111,16 @@ impl Hash for MemoKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.generation.hash(state);
         match self.operation {
-            LookupOperation::Map => 0_u8.hash(state),
-            LookupOperation::Sym => 1_u8.hash(state),
-            LookupOperation::Refs => 2_u8.hash(state),
-            LookupOperation::Callers => 3_u8.hash(state),
-            LookupOperation::Callees => 4_u8.hash(state),
-            LookupOperation::Impact => 5_u8.hash(state),
-            LookupOperation::Deps => 6_u8.hash(state),
-            LookupOperation::Dependents => 7_u8.hash(state),
-            LookupOperation::Path => 8_u8.hash(state),
+            LookupOperation::Explore => 0_u8.hash(state),
+            LookupOperation::Map => 1_u8.hash(state),
+            LookupOperation::Sym => 2_u8.hash(state),
+            LookupOperation::Refs => 3_u8.hash(state),
+            LookupOperation::Callers => 4_u8.hash(state),
+            LookupOperation::Callees => 5_u8.hash(state),
+            LookupOperation::Impact => 6_u8.hash(state),
+            LookupOperation::Deps => 7_u8.hash(state),
+            LookupOperation::Dependents => 8_u8.hash(state),
+            LookupOperation::Path => 9_u8.hash(state),
         }
         self.query.hash(state);
         self.config.max_bytes.hash(state);
@@ -1941,6 +1942,11 @@ impl Daemon {
         let root = PathBuf::from(&request.canonical_root);
         let config: MapConfig = request.map_config.into();
         let result = match request.operation {
+            LookupOperation::Explore => repomap::build_explore_direct(
+                request.query.as_deref().unwrap_or_default(),
+                &root,
+                &config,
+            ),
             LookupOperation::Map => repomap::build_map_direct(&root, &config),
             LookupOperation::Sym => repomap::build_sym_direct(
                 request.query.as_deref().unwrap_or_default(),
@@ -2052,6 +2058,7 @@ impl Daemon {
         let render_started = Instant::now();
         let config: MapConfig = request.map_config.into();
         let result = match request.operation {
+            LookupOperation::Explore => repomap::build_explore(query.unwrap_or_default(), &index, &config),
             LookupOperation::Map => repomap::build_map(&index, &config),
             LookupOperation::Sym => repomap::build_sym(query.unwrap_or_default(), &index, &config),
             LookupOperation::Refs => repomap::build_refs(query.unwrap_or_default(), &index, &config),

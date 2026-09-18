@@ -12,6 +12,7 @@ pub const RESPONSE_FRAME_HEADROOM_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LookupOperation {
+    Explore,
     Map,
     Sym,
     Refs,
@@ -26,6 +27,7 @@ pub enum LookupOperation {
 impl LookupOperation {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Explore => "explore",
             Self::Map => "map",
             Self::Sym => "sym",
             Self::Refs => "refs",

@@ -3,7 +3,8 @@ import "./platform.mjs";
 import "../suppress-stderr.mjs";
 import "../ensure-deps.mjs";
 /**
- * Codex CLI UserPromptSubmit hook — capture user prompts for continuity.
+ * Codex CLI UserPromptSubmit hook — capture user prompts + semantic front-load.
+ * Both paths are fail-open and independent.
  */
 
 import { readStdin, parseStdin, getSessionId, getSessionDBPath, getInputProjectDir, CODEX_OPTS } from "../session-helpers.mjs";
@@ -15,9 +16,9 @@ const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
 const { loadSessionDB, loadExtract, loadProjectAttribution } = createSessionLoaders(HOOK_DIR);
 const OPTS = CODEX_OPTS;
 
-let rawInput = "";
+let additionalContext = "";
 try {
-  rawInput = await readStdin();
+  const rawInput = await readStdin();
   const input = parseStdin(rawInput);
   const projectDir = getInputProjectDir(input, OPTS);
 
@@ -30,47 +31,54 @@ try {
     || trimmed.startsWith("<tool-result>");
 
   if (trimmed.length > 0 && !isSystemMessage) {
-    const { SessionDB } = await loadSessionDB();
-    const { extractUserEvents } = await loadExtract();
-    const { resolveProjectAttributions } = await loadProjectAttribution();
-    const dbPath = getSessionDBPath(OPTS, projectDir);
-    const db = new SessionDB({ dbPath });
-    const sessionId = getSessionId(input, OPTS);
+    try {
+      const { frontloadPromptContext } = await import("../qc-frontload.mjs");
+      additionalContext = await frontloadPromptContext(trimmed, projectDir);
+    } catch { /* fail open */ }
 
-    db.ensureSession(sessionId, projectDir);
+    try {
+      const { SessionDB } = await loadSessionDB();
+      const { extractUserEvents } = await loadExtract();
+      const { resolveProjectAttributions } = await loadProjectAttribution();
+      const dbPath = getSessionDBPath(OPTS, projectDir);
+      const db = new SessionDB({ dbPath });
+      const sessionId = getSessionId(input, OPTS);
 
-    const promptEvent = {
-      type: "user_prompt",
-      category: "user-prompt",
-      data: prompt,
-      priority: 1,
-    };
-    const promptAttributions = attributeAndInsertEvents(
-      db, sessionId, [promptEvent], input, projectDir, "UserPromptSubmit", resolveProjectAttributions,
-    );
+      db.ensureSession(sessionId, projectDir);
 
-    const userEvents = extractUserEvents(trimmed);
-    const savedLastKnown = promptAttributions[0]?.projectDir || null;
-    const sessionStats = db.getSessionStats(sessionId);
-    const lastKnownProjectDir = typeof db.getLatestAttributedProjectDir === "function"
-      ? db.getLatestAttributedProjectDir(sessionId)
-      : null;
-    const userAttributions = resolveProjectAttributions(userEvents, {
-      sessionOriginDir: sessionStats?.project_dir || projectDir,
-      inputProjectDir: projectDir,
-      workspaceRoots: Array.isArray(input.workspace_roots) ? input.workspace_roots : [],
-      lastKnownProjectDir: savedLastKnown || lastKnownProjectDir,
-    });
-    for (let i = 0; i < userEvents.length; i++) {
-      db.insertEvent(sessionId, userEvents[i], "UserPromptSubmit", userAttributions[i]);
-    }
+      const promptEvent = {
+        type: "user_prompt",
+        category: "user-prompt",
+        data: prompt,
+        priority: 1,
+      };
+      const promptAttributions = attributeAndInsertEvents(
+        db, sessionId, [promptEvent], input, projectDir, "UserPromptSubmit", resolveProjectAttributions,
+      );
 
-    db.close();
+      const userEvents = extractUserEvents(trimmed);
+      const savedLastKnown = promptAttributions[0]?.projectDir || null;
+      const sessionStats = db.getSessionStats(sessionId);
+      const lastKnownProjectDir = typeof db.getLatestAttributedProjectDir === "function"
+        ? db.getLatestAttributedProjectDir(sessionId)
+        : null;
+      const userAttributions = resolveProjectAttributions(userEvents, {
+        sessionOriginDir: sessionStats?.project_dir || projectDir,
+        inputProjectDir: projectDir,
+        workspaceRoots: Array.isArray(input.workspace_roots) ? input.workspace_roots : [],
+        lastKnownProjectDir: savedLastKnown || lastKnownProjectDir,
+      });
+      for (let i = 0; i < userEvents.length; i++) {
+        db.insertEvent(sessionId, userEvents[i], "UserPromptSubmit", userAttributions[i]);
+      }
+
+      db.close();
+    } catch { /* continuity is best effort */ }
   }
 } catch {
   // Codex hooks must not block the session.
 }
 
 process.stdout.write(JSON.stringify({
-  hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "" },
+  hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext },
 }) + "\n");

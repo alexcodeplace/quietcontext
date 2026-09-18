@@ -44,6 +44,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RepoAction {
+    Explore {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     Map {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -422,6 +427,7 @@ fn repo(action: RepoAction) {
                 ),
             }
         }
+        RepoAction::Explore { query, root } => lookup_repo(repomap_protocol::LookupOperation::Explore, Some(query), None, root, None, None, None, &cfg.map),
         RepoAction::Map { root } => lookup_repo(repomap_protocol::LookupOperation::Map, None, None, root, None, None, None, &cfg.map),
         RepoAction::Symbol { query, root } => lookup_repo(repomap_protocol::LookupOperation::Sym, Some(query), None, root, None, None, None, &cfg.map),
         RepoAction::References { query, root } => lookup_repo(repomap_protocol::LookupOperation::Refs, Some(query), None, root, None, None, None, &cfg.map),

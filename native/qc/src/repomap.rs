@@ -1,5 +1,6 @@
 use ignore::WalkBuilder;
 use regex::Regex;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -516,6 +517,11 @@ fn render_sym_output(
     Ok(out)
 }
 
+pub(crate) fn build_explore_direct(query: &str, root: &Path, cfg: &MapConfig) -> ScanResult {
+    let snapshot = direct_snapshot(root, cfg)?;
+    build_explore(query, &snapshot, cfg)
+}
+
 pub(crate) fn build_map(snapshot: &SourceIndex, cfg: &MapConfig) -> ScanResult {
     if snapshot.files().is_empty() {
         if snapshot.diagnostics().has_errors() || snapshot.truncated() {
@@ -790,6 +796,177 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
 }
 
 
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExploreCandidate {
+    file: String,
+    name: String,
+    score: u32,
+}
+
+fn explore_terms(query: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "by", "can", "code", "does", "do",
+        "for", "from", "how", "i", "in", "into", "is", "it", "me", "of", "on", "or",
+        "our", "please", "show", "the", "this", "to", "trace", "use", "what", "where",
+        "which", "who", "why", "with", "work", "works", "working", "explain", "find",
+        "understand", "flow", "architecture", "dependency", "dependencies", "caller",
+        "callers", "callee", "callees", "impact", "repo", "repository",
+    ];
+    let mut tokens = BTreeSet::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, tokens: &mut BTreeSet<String>| {
+        if current.is_empty() { return; }
+        let lowered = current.to_lowercase();
+        if lowered.chars().count() >= 3 && !STOP.contains(&lowered.as_str()) {
+            tokens.insert(lowered.clone());
+        }
+        for part in lowered.split(|ch: char| matches!(ch, '.' | ':' | '/' | '_' | '-')) {
+            if part.chars().count() >= 3 && !STOP.contains(&part) {
+                tokens.insert(part.to_owned());
+            }
+        }
+        current.clear();
+    };
+    for ch in query.chars().take(1200) {
+        if ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.' | ':' | '/' | '-') {
+            current.push(ch);
+        } else {
+            flush(&mut current, &mut tokens);
+        }
+    }
+    flush(&mut current, &mut tokens);
+    tokens.into_iter().take(16).collect()
+}
+
+fn rank_explore_candidates(query: &str, snapshot: &SourceIndex, limit: usize) -> Vec<ExploreCandidate> {
+    let query_lower = query.to_lowercase();
+    let terms = explore_terms(query);
+    if terms.is_empty() { return Vec::new(); }
+    let mut candidates = Vec::new();
+    for summary in snapshot.map_summaries() {
+        let file_lower = summary.relative_path.to_lowercase();
+        let base = Path::new(&summary.relative_path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        for name in &summary.names {
+            let symbol = name.to_lowercase();
+            if symbol.chars().count() < 2 { continue; }
+            let mut score = if symbol.chars().count() >= 3 && query_lower.contains(&symbol) { 120 } else { 0 };
+            for term in &terms {
+                if term == &symbol { score += 100; }
+                else if symbol.contains(term) { score += 42; }
+                else if term.chars().count() >= 4 && symbol.chars().count() >= 3 && term.contains(&symbol) { score += 28; }
+                if term == &base { score += 70; }
+                else if file_lower.contains(term) { score += 20; }
+            }
+            if score > 0 {
+                candidates.push(ExploreCandidate {
+                    file: summary.relative_path.clone(),
+                    name: name.clone(),
+                    score,
+                });
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.score.cmp(&a.score)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    candidates.dedup_by(|a, b| a.file == b.file && a.name == b.name);
+    candidates.truncate(limit);
+    candidates
+}
+
+fn explore_declaration_line(snapshot: &SourceIndex, candidate: &ExploreCandidate) -> Option<usize> {
+    snapshot
+        .declarations(&candidate.name)?
+        .iter()
+        .find(|posting| posting.relative_path == candidate.file)
+        .map(|posting| posting.line_no)
+}
+
+fn explore_source_excerpt(snapshot: &SourceIndex, file: &str, line_no: usize, radius: usize) -> Option<String> {
+    let record = snapshot.files().iter().find(|record| record.relative_path == file)?;
+    let start = line_no.saturating_sub(radius).max(1);
+    let end = line_no.saturating_add(radius);
+    let mut out = String::new();
+    for (index, line) in record.source.lines().enumerate() {
+        let current = index + 1;
+        if current < start { continue; }
+        if current > end { break; }
+        out.push_str(&format!("{current}\t{line}\n"));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn append_warm_relation(
+    out: &mut Vec<String>,
+    label: &str,
+    steps: &[TraversalStep],
+    graph: &SemanticGraph,
+    max_items: usize,
+) {
+    if steps.is_empty() { return; }
+    out.push(format!("[{label}]\n"));
+    for step in steps.iter().take(max_items) {
+        out.push(format!(
+            "  {} {}\n",
+            if label == "callers" || label == "impact" { "<-" } else { "->" },
+            semantic_node_label(graph, step.node),
+        ));
+    }
+}
+
+pub(crate) fn build_explore(query: &str, snapshot: &SourceIndex, cfg: &MapConfig) -> ScanResult {
+    let candidates = rank_explore_candidates(query, snapshot, 3);
+    if candidates.is_empty() {
+        if snapshot.diagnostics().has_errors() || snapshot.truncated() {
+            return Err(incomplete_error_from_index(snapshot, cfg));
+        }
+        return Ok(Some(format!(
+            "[qc-explore v1] {query}\nNo high-confidence symbol/file match. Use a more specific symbol/file name.\n"
+        )));
+    }
+
+    let primary = &candidates[0];
+    let line_no = explore_declaration_line(snapshot, primary).unwrap_or(1);
+    let mut lines = vec![
+        format!("[qc-explore v1] {query}\n"),
+        format!("## {} - {}:{}\n", primary.name, primary.file, line_no),
+    ];
+    if let Some(source) = explore_source_excerpt(snapshot, &primary.file, line_no, 5) {
+        lines.push(format!("[source]\n{source}"));
+    }
+    if candidates.len() > 1 {
+        lines.push("[related candidates]\n".to_owned());
+        for candidate in &candidates[1..] {
+            let line = explore_declaration_line(snapshot, candidate).unwrap_or(1);
+            lines.push(format!("  {} - {}:{}\n", candidate.name, candidate.file, line));
+        }
+    }
+
+    if let Some(Ok(graph)) = snapshot.semantic_graph_if_ready() {
+        let roots = graph.select_symbols(&primary.name, Some(&primary.file));
+        if !roots.is_empty() {
+            let callers = graph.callers(&roots, 1, 8);
+            let callees = graph.callees(&roots, 1, 8);
+            let impact = graph.impact(&roots, 2, 10);
+            append_warm_relation(&mut lines, "callers", &callers, graph, 5);
+            append_warm_relation(&mut lines, "callees", &callees, graph, 5);
+            append_warm_relation(&mut lines, "impact", &impact, graph, 6);
+        }
+    } else {
+        lines.push("[semantic graph cold: use callers/callees/impact for deeper follow-up]\n".to_owned());
+    }
+
+    lines.push("[qc-explore] Repository context above is already inspected; avoid duplicate exploratory Read/Grep unless incomplete or stale.\n".to_owned());
+    Ok(Some(bounded_graph_output(lines, cfg.max_bytes.min(8 * 1024), "explore")))
+}
+
 fn semantic_node_label(graph: &SemanticGraph, id: NodeId) -> String {
     let Some(node) = graph.node(id) else { return format!("node:{id}"); };
     let file = graph.file_path(id).unwrap_or("?");
@@ -798,7 +975,6 @@ fn semantic_node_label(graph: &SemanticGraph, id: NodeId) -> String {
     }
     format!("{} [{}] - {}:{}", node.qualified_name, node.kind.as_str(), file, node.start_line)
 }
-
 fn bounded_graph_output(mut lines: Vec<String>, max_bytes: usize, label: &str) -> String {
     let total: usize = lines.iter().map(String::len).sum();
     if total <= max_bytes { return lines.concat(); }
@@ -1503,6 +1679,64 @@ mod tests {
         let walked = walk(&dir, &c).unwrap();
         assert_eq!(walked.files.len(), 3);
         assert!(!walked.truncated);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explore_ranks_primary_symbol_and_returns_compact_source_without_warming_semantics() {
+        let dir = tempdir();
+        write_file(
+            &dir,
+            "src/auth.ts",
+            "export function PersistUser() { return 1; }\n\nexport function LoginService() { return PersistUser(); }\n",
+        );
+        let c = cfg();
+        let index = repomap_index::scan_root(&dir, &repomap_index::ScanConfig::from(&c)).unwrap();
+        assert!(index.semantic_graph_if_ready().is_none());
+
+        let out = output(build_explore("How does LoginService work?", &index, &c));
+        assert!(out.contains("[qc-explore v1]"));
+        assert!(out.contains("## LoginService - src/auth.ts:3"));
+        assert!(out.contains("3\texport function LoginService()"));
+        assert!(out.contains("[semantic graph cold:"));
+        assert!(index.semantic_graph_if_ready().is_none());
+        assert!(out.len() <= c.max_bytes.min(8 * 1024));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explore_reuses_warm_semantic_graph_for_relationships() {
+        let dir = tempdir();
+        write_file(
+            &dir,
+            "src/store.ts",
+            "export function PersistUser() { return 1; }\n",
+        );
+        write_file(
+            &dir,
+            "src/app.ts",
+            "import { PersistUser } from './store';\nexport function LoginService() { return PersistUser(); }\n",
+        );
+        let c = cfg();
+        let index = repomap_index::scan_root(&dir, &repomap_index::ScanConfig::from(&c)).unwrap();
+        index.semantic_graph().unwrap();
+
+        let out = output(build_explore("trace LoginService", &index, &c));
+        assert!(out.contains("## LoginService - src/app.ts:2"));
+        assert!(out.contains("[callees]"));
+        assert!(out.contains("PersistUser"));
+        assert!(!out.contains("[semantic graph cold:"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explore_no_match_is_explicit_and_bounded() {
+        let dir = tempdir();
+        write_file(&dir, "src/auth.ts", "export function LoginService() {}\n");
+        let c = cfg();
+        let out = output(build_explore_direct("weather forecast tomorrow", &dir, &c));
+        assert!(out.contains("No high-confidence symbol/file match"));
+        assert!(out.len() <= c.max_bytes.min(8 * 1024));
         std::fs::remove_dir_all(&dir).ok();
     }
 
