@@ -76,7 +76,7 @@ Update `docs/specs/2026-09-17-qc-semantic-repository-graph.md` to document:
 - reviewed memory/accounting behavior
 - final acceptance evidence
 
-### R4 Final cleanup and acceptance [ACTIVE]
+### R4 Final cleanup and acceptance [DONE]
 
 - remove new compiler warnings
 - `git diff --check`
@@ -99,7 +99,17 @@ Update `docs/specs/2026-09-17-qc-semantic-repository-graph.md` to document:
 - 2026-09-18: R2 implemented. Added lazy materialization, unchanged-fact reuse/changed-fact reset, dynamic byte accounting, and multi-root lazy-growth eviction regression tests.
 - 2026-09-18: focused Rust gate is 118/118 green on the reviewed dirty worktree.
 - 2026-09-18: R3 implemented. Semantic spec moved to `ACTIVE_REVIEW` and now documents lazy semantics, per-file fact reuse, strict lexical/import/package resolution, split client budgets, and lazy-growth memory accounting.
-- R4 is now the active task.
+- 2026-09-18: R4 exact-commit acceptance passed on clean commit `7500ae2affe914c74471681da1cd2372663ee069`.
+- authoritative K3s job: `overdeck-build-build-20260918050211-1356483-19280`, node `debian4`, streamed source SHA-256 `f1f719026b703e9729a7f868662160819cc334ca4262673e05fd69b998bc27cc`
+- Rust: 118/118 passed
+- native release staged/verified: `linux-x64`, native `0.1.0`, SHA-256 `10964067a98d9bc243e016b677ccdb3418d2cbfcc0db226da0a26f8d0cd66553`
+- production TypeScript/bundle/assert-bundle/asymmetric-drift: green
+- package suite: 14 files, 91 passed, 1 expected platform skip
+- token budget: `tools/list` <= 4 KiB over stdio and HTTP and byte-identical
+- native integration/corpus/HTTP/fidelity: 4 files, 18 passed, 1 platform-specific skip
+- exact-commit benchmark: structural cold map 0.2086 s; structural warm map 0.1334 s; semantic cold 5.8693 s; semantic warm 0.0029 s; one-file semantic refresh 1.7473 s
+- exact-commit acceptance verdict: `ACCEPTANCE_OK`
+- R4 is complete. Current active phase: QuietContext landing to public main.
 
 ## QuietContext landing sequence
 

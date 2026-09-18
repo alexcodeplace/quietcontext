@@ -1,7 +1,7 @@
 # QC Semantic Repository Graph
 
 outcome: QC repository navigation becomes a semantic graph over the same bounded, incremental native repository index that already powers `qc map`, `qc sym`, `qc refs`, and `qc outline`. The graph resolves declarations and relationships so QC can answer callers, callees, impact, dependency, and path questions without dumping source or guessing across ambiguous names.
-status: ACTIVE_REVIEW
+status: COMPLETE
 source request: owner 2026-09-17 — preserve the cheap repository map, add semantic relationships and graph traversal, and complete the native QC implementation without introducing a separate heavyweight product surface.
 
 ## Product contract
@@ -437,10 +437,19 @@ Measured on the QC repository during review:
 - semantic daemon after cold graph build: roughly 105 MiB RSS
 - semantic daemon after edit/restore cycles: roughly 115 MiB RSS
 
-Current focused Rust review gate: 118/118 tests green, including lazy materialization, shared-fact refresh behavior, stricter lexical/package resolution, and daemon-wide lazy-growth memory eviction.
+Final reviewed commit `7500ae2affe914c74471681da1cd2372663ee069` passed exact-commit acceptance through sanctioned K3s job `overdeck-build-build-20260918050211-1356483-19280` on `debian4`, streamed source SHA-256 `f1f719026b703e9729a7f868662160819cc334ca4262673e05fd69b998bc27cc`.
 
-Final package/native/MCP/release acceptance must be rerun on the final reviewed commit before this specification returns to `COMPLETE`.
+Final acceptance evidence:
+
+- Rust suite: 118/118 passed
+- native release stage/verify: linux-x64 native 0.1.0, SHA-256 `10964067a98d9bc243e016b677ccdb3418d2cbfcc0db226da0a26f8d0cd66553`
+- production TypeScript/build/bundle/assert-bundle/asymmetric-drift: green
+- package suite: 14 files, 91 passed, 1 expected platform skip
+- `tools/list`: <= 4 KiB over stdio and HTTP and byte-identical
+- native integration/corpus/HTTP/fidelity: 4 files, 18 passed, 1 platform-specific skip
+- benchmark smoke: structural cold map 0.2086 s; structural warm map 0.1334 s; semantic cold 5.8693 s; semantic warm 0.0029 s; one-file semantic refresh 1.7473 s
+- final acceptance verdict: `ACCEPTANCE_OK`
 
 The implementation deliberately leaves `.astro`, `.vue`, and `.svelte` on the conservative structural-map fallback until dedicated embedded-script parsing is specified.
 
-Next executable action: finish the final reviewed acceptance gates, commit the review changes, land the exact commit to public main, then deploy that SHA through the managed Overdeck path.
+Next executable action: land the accepted semantic commit chain to public main, then deploy the exact landed SHA through the managed Overdeck path.
