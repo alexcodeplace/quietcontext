@@ -38,7 +38,7 @@ for (const key of keys) {
   const expected = {
     schemaVersion: 1,
     packageVersion: pkg.version,
-    protocolVersion: 1,
+    protocolVersion: 2,
     platform: target.platform,
     arch: target.arch,
   };

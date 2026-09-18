@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const QC_NATIVE_PROTOCOL_VERSION = 1;
+export const QC_NATIVE_PROTOCOL_VERSION = 2;
 const MAX_NATIVE_STDOUT_BYTES = 256 * 1024;
 const MAX_NATIVE_STDERR_BYTES = 64 * 1024;
 
@@ -46,7 +46,7 @@ export interface QcNativeRepoReceipt {
   protocolVersion: number;
   nativeVersion: string;
   kind: "repo";
-  operation: "map" | "sym" | "refs" | "outline";
+  operation: "map" | "sym" | "refs" | "outline" | "callers" | "callees" | "impact" | "deps" | "dependents" | "path";
   root: string;
   query?: string;
   stdout: string;
@@ -369,11 +369,32 @@ export async function repoQcNative(
   request:
     | { action: "map"; root?: string }
     | { action: "symbol" | "references"; query: string; root?: string }
+    | { action: "callers" | "callees" | "impact" | "deps" | "dependents"; query: string; root?: string; file?: string; depth?: number; maxNodes?: number }
+    | { action: "path"; from: string; to: string; root?: string; maxDepth?: number; maxNodes?: number }
     | { action: "outline"; path: string; root?: string },
   options: { cwd?: string; timeoutMs?: number; packageRoot?: string; env?: NodeJS.ProcessEnv } = {},
 ): Promise<QcNativeRepoReceipt> {
   const args = ["repo", request.action];
   if (request.action === "symbol" || request.action === "references") args.push(request.query);
+  if (["callers", "callees", "impact", "deps", "dependents"].includes(request.action)) {
+    const graphRequest = request as {
+      action: "callers" | "callees" | "impact" | "deps" | "dependents";
+      query: string;
+      root?: string;
+      file?: string;
+      depth?: number;
+      maxNodes?: number;
+    };
+    args.push(graphRequest.query);
+    if (graphRequest.file) args.push("--file", graphRequest.file);
+    if (graphRequest.depth !== undefined) args.push("--depth", String(graphRequest.depth));
+    if (graphRequest.maxNodes !== undefined) args.push("--max-nodes", String(graphRequest.maxNodes));
+  }
+  if (request.action === "path") {
+    args.push(request.from, request.to);
+    if (request.maxDepth !== undefined) args.push("--max-depth", String(request.maxDepth));
+    if (request.maxNodes !== undefined) args.push("--max-nodes", String(request.maxNodes));
+  }
   if (request.action === "outline") args.push(request.path);
   if (request.root) args.push("--root", request.root);
   const value = await invokeNativeJson(args, options);

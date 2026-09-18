@@ -54,7 +54,7 @@ if (probe.status !== 0) {
 }
 let status;
 try { status = JSON.parse(probe.stdout.trim()); } catch { status = null; }
-if (!status || status.protocolVersion !== 1 || typeof status.nativeVersion !== "string" || status.product !== "QuietContext") {
+if (!status || status.protocolVersion !== 2 || typeof status.nativeVersion !== "string" || status.product !== "QuietContext") {
   console.error("qc-native: staged binary returned incompatible status");
   process.exit(1);
 }

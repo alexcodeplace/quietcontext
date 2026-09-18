@@ -1,7 +1,7 @@
 use crate::config::MapConfig;
 use crate::repomap;
 use crate::repomap_protocol::{
-    self, CacheState, LookupRequest, LookupResponse, LookupTimings, PROTOCOL_VERSION,
+    self, CacheState, LookupOperation, LookupRequest, LookupResponse, LookupTimings, PROTOCOL_VERSION,
 };
 use std::io;
 #[cfg(unix)]
@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 
 pub(crate) const DAEMON_MODE_ARG: &str = "--repomap-daemon";
 pub(crate) const DAEMON_MODE_ENV: &str = "QUIET_CONTEXT_REPOMAP_DAEMON";
-pub(crate) const SOCKET_REVISION: &str = "v2";
+pub(crate) const SOCKET_REVISION: &str = "v3";
 
 const STARTUP_LOCK_WAIT: Duration = Duration::from_millis(5);
 const EXISTING_CONNECT_WAIT: Duration = Duration::from_millis(2);
 const LAZY_START_WAIT: Duration = Duration::from_millis(100);
 const REQUEST_WAIT: Duration = Duration::from_millis(25);
+const SEMANTIC_START_WAIT: Duration = Duration::from_secs(30);
+const SEMANTIC_REQUEST_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ClientBudget {
@@ -51,6 +53,15 @@ impl ClientBudget {
             startup_wait: self.startup_wait.min(LAZY_START_WAIT),
             request_wait: self.request_wait.min(REQUEST_WAIT),
         }
+    }
+
+    fn for_operation(self, operation: LookupOperation) -> Self {
+        let mut budget = self.bounded();
+        if operation.is_semantic() {
+            budget.startup_wait = SEMANTIC_START_WAIT;
+            budget.request_wait = SEMANTIC_REQUEST_WAIT;
+        }
+        budget
     }
 }
 
@@ -346,7 +357,7 @@ pub(crate) fn daemon_mode_active() -> bool {
 
 pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutcome {
     let started = Instant::now();
-    let budget = budget.bounded();
+    let budget = budget.for_operation(request.operation);
     if request.validate().is_err() {
         return direct_lookup(request, FallbackReason::InvalidRequest, started);
     }
@@ -718,6 +729,16 @@ fn direct_lookup(
         repomap_protocol::LookupOperation::Refs => {
             repomap::build_refs_direct(request.query.as_deref().unwrap_or_default(), &root, &config)
         }
+        operation => repomap::build_semantic_direct(
+            operation,
+            request.query.as_deref().unwrap_or_default(),
+            request.secondary_query.as_deref(),
+            request.file_filter.as_deref(),
+            request.depth.unwrap_or(if operation == repomap_protocol::LookupOperation::Impact { 3 } else if operation == repomap_protocol::LookupOperation::Path { 8 } else { 1 }),
+            request.max_nodes.unwrap_or(200),
+            &root,
+            &config,
+        ),
     };
     let response = response_from_result(
         request.operation,
@@ -756,18 +777,18 @@ fn response_from_result(
             ),
             repomap_protocol::LookupOperation::Refs => (
                 String::new(),
-                format!(
-                    "qc repo references: {} not found\n",
-                    query.unwrap_or_default()
-                ),
+                format!("qc repo references: {} not found\n", query.unwrap_or_default()),
+                1,
+            ),
+            operation => (
+                String::new(),
+                format!("qc repo {}: {} not found\n", operation.as_str(), query.unwrap_or_default()),
                 1,
             ),
         },
         Err(error) => {
             let command = match operation {
-                repomap_protocol::LookupOperation::Map => "map",
-                repomap_protocol::LookupOperation::Sym => "sym",
-                repomap_protocol::LookupOperation::Refs => "refs",
+                operation => operation.as_str(),
             };
             (String::new(), format!("qc repo {command}: {error}\n"), 1)
         }
@@ -1043,6 +1064,9 @@ mod tests {
         assert_eq!(budget.existing_connect_wait, Duration::from_millis(2));
         assert_eq!(budget.startup_wait, Duration::from_millis(100));
         assert_eq!(budget.request_wait, Duration::from_millis(25));
+        let semantic = budget.for_operation(LookupOperation::Callers);
+        assert_eq!(semantic.startup_wait, Duration::from_secs(30));
+        assert_eq!(semantic.request_wait, Duration::from_secs(30));
         assert_eq!(
             ClientBudget::new(
                 Duration::from_secs(1),

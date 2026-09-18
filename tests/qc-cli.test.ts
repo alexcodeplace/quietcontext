@@ -127,9 +127,10 @@ nativeSuite("qc repo CLI", () => {
     const root = scratch("qc-cli-repo-");
     const project = join(root, "project");
     mkdirSync(join(project, "src"), { recursive: true });
+    writeFileSync(join(project, "src", "store.ts"), "export function PersistUser() { return 2; }\n");
     writeFileSync(
       join(project, "src", "app.ts"),
-      "export function CliNeedle() { return 1; }\nexport const x = CliNeedle();\n",
+      "import { PersistUser as persist } from './store';\nexport function CliNeedle() { return persist(); }\nexport const x = CliNeedle();\n",
     );
     const env = {
       ...baseEnv(root),
@@ -156,6 +157,26 @@ nativeSuite("qc repo CLI", () => {
     expect(outline.status, outline.stderr).toBe(0);
     expect(outline.stdout).toContain("CliNeedle");
 
+    const callees = runQc(["repo", "callees", "CliNeedle"], { cwd: project, env });
+    expect(callees.status, callees.stderr).toBe(0);
+    expect(callees.stdout).toContain("PersistUser");
+
+    const callers = runQc(["repo", "callers", "PersistUser"], { cwd: project, env });
+    expect(callers.status, callers.stderr).toBe(0);
+    expect(callers.stdout).toContain("CliNeedle");
+
+    const impact = runQc(["repo", "impact", "PersistUser", "--depth", "3"], { cwd: project, env });
+    expect(impact.status, impact.stderr).toBe(0);
+    expect(impact.stdout).toContain("CliNeedle");
+
+    const path = runQc(["repo", "path", "CliNeedle", "PersistUser"], { cwd: project, env });
+    expect(path.status, path.stderr).toBe(0);
+    expect(path.stdout).toContain("[qc-path v1]");
+
+    const directCallers = runQc(["callers", "PersistUser"], { cwd: project, env });
+    expect(directCallers.status, directCallers.stderr).toBe(0);
+    expect(directCallers.stdout).toContain("CliNeedle");
+
     const legacyMap = runQc(["map"], { cwd: project, env });
     expect(legacyMap.status, legacyMap.stderr).toBe(0);
     expect(legacyMap.stdout).toContain("CliNeedle");
@@ -174,7 +195,7 @@ nativeSuite("qc repo CLI", () => {
 
     // The native repo daemon must remain project scoped. Its PID is only a
     // cleanup hint here; the daemon itself is tested more deeply elsewhere.
-    const pidFile = join(root, "native-state", "repomap", "repomap-v2.pid");
+    const pidFile = join(root, "native-state", "repomap", "repomap-v3.pid");
     try {
       const pid = Number(readFileSync(pidFile, "utf8").trim());
       if (Number.isInteger(pid) && pid > 1) process.kill(pid, "SIGTERM");

@@ -36,7 +36,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 #[cfg(unix)]
 use std::sync::RwLock;
 
-const SOCKET_REVISION: &str = "v2";
+const SOCKET_REVISION: &str = "v3";
 const MAX_ROOTS: usize = 8;
 const MAX_CLIENT_QUEUE: usize = 64;
 const MAX_EVENT_QUEUE: usize = 4096;
@@ -114,6 +114,12 @@ impl Hash for MemoKey {
             LookupOperation::Map => 0_u8.hash(state),
             LookupOperation::Sym => 1_u8.hash(state),
             LookupOperation::Refs => 2_u8.hash(state),
+            LookupOperation::Callers => 3_u8.hash(state),
+            LookupOperation::Callees => 4_u8.hash(state),
+            LookupOperation::Impact => 5_u8.hash(state),
+            LookupOperation::Deps => 6_u8.hash(state),
+            LookupOperation::Dependents => 7_u8.hash(state),
+            LookupOperation::Path => 8_u8.hash(state),
         }
         self.query.hash(state);
         self.config.max_bytes.hash(state);
@@ -1632,6 +1638,32 @@ impl Daemon {
         self.roots.values().map(RootState::bytes).sum()
     }
 
+    fn enforce_logical_budget_after_growth(&mut self, active_id: &RootId) -> Result<(), DaemonError> {
+        self.check_rss()?;
+        if self.total_bytes() <= self.config.max_logical_bytes {
+            return Ok(());
+        }
+
+        let mut candidates: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|(id, state)| *id != active_id && state.active == 0)
+            .map(|(id, state)| (id.clone(), state.last_used, state.bytes()))
+            .collect();
+        candidates.sort_by_key(|(_, last_used, _)| *last_used);
+
+        let mut total = self.total_bytes();
+        for (id, _, bytes) in candidates {
+            self.remove_root(&id);
+            total = total.saturating_sub(bytes);
+            if total <= self.config.max_logical_bytes {
+                return Ok(());
+            }
+        }
+
+        Err(DaemonError::Memory)
+    }
+
     fn can_publish(&mut self, id: &RootId, candidate: &SourceIndex) -> bool {
         if self.check_rss().is_err() || candidate.logical_bytes() > self.config.max_logical_bytes {
             return false;
@@ -1920,6 +1952,16 @@ impl Daemon {
                 &root,
                 &config,
             ),
+            operation => repomap::build_semantic_direct(
+                operation,
+                request.query.as_deref().unwrap_or_default(),
+                request.secondary_query.as_deref(),
+                request.file_filter.as_deref(),
+                request.depth.unwrap_or(if operation == LookupOperation::Impact { 3 } else if operation == LookupOperation::Path { 8 } else { 1 }),
+                request.max_nodes.unwrap_or(200),
+                &root,
+                &config,
+            ),
         };
         response_from_result(
             request.operation,
@@ -2012,10 +2054,41 @@ impl Daemon {
         let result = match request.operation {
             LookupOperation::Map => repomap::build_map(&index, &config),
             LookupOperation::Sym => repomap::build_sym(query.unwrap_or_default(), &index, &config),
-            LookupOperation::Refs => {
-                repomap::build_refs(query.unwrap_or_default(), &index, &config)
-            }
+            LookupOperation::Refs => repomap::build_refs(query.unwrap_or_default(), &index, &config),
+            LookupOperation::Callers => repomap::build_callers(query.unwrap_or_default(), request.file_filter.as_deref(), request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Callees => repomap::build_callees(query.unwrap_or_default(), request.file_filter.as_deref(), request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Impact => repomap::build_impact(query.unwrap_or_default(), request.file_filter.as_deref(), request.depth.unwrap_or(3), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Deps => repomap::build_dependencies(query.unwrap_or_default(), request.file_filter.as_deref(), false, request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Dependents => repomap::build_dependencies(query.unwrap_or_default(), request.file_filter.as_deref(), true, request.depth.unwrap_or(1), request.max_nodes.unwrap_or(200), &index, &config),
+            LookupOperation::Path => repomap::build_path(query.unwrap_or_default(), request.secondary_query.as_deref().unwrap_or_default(), request.depth.unwrap_or(8), request.max_nodes.unwrap_or(200), &index, &config),
         };
+
+        if request.operation.is_semantic()
+            && result.is_ok()
+            && self.enforce_logical_budget_after_growth(&id).is_err()
+        {
+            if let Some(state) = self.roots.get_mut(&id) {
+                state.active = state.active.saturating_sub(1);
+                state.last_used = Instant::now();
+            }
+            self.remove_root(&id);
+            return response_from_result(
+                request.operation,
+                query,
+                Err(repomap::ScanError::Index(
+                    "semantic index exceeds daemon logical memory budget".to_owned(),
+                )),
+                status,
+                index.generation(),
+                LookupTimings {
+                    reconcile_us: elapsed_us(reconcile_started.elapsed()),
+                    render_us: elapsed_us(render_started.elapsed()),
+                    total_us: elapsed_us(started.elapsed()),
+                    ..LookupTimings::default()
+                },
+            );
+        }
+
         let response = response_from_result(
             request.operation,
             query,
@@ -2180,18 +2253,18 @@ fn response_from_result(
             ),
             LookupOperation::Refs => (
                 String::new(),
-                format!(
-                    "qc repo references: {} not found\n",
-                    query.unwrap_or_default()
-                ),
+                format!("qc repo references: {} not found\n", query.unwrap_or_default()),
+                1,
+            ),
+            operation => (
+                String::new(),
+                format!("qc repo {}: {} not found\n", operation.as_str(), query.unwrap_or_default()),
                 1,
             ),
         },
         Err(error) => {
             let command = match operation {
-                LookupOperation::Map => "map",
-                LookupOperation::Sym => "sym",
-                LookupOperation::Refs => "refs",
+                operation => operation.as_str(),
             };
             (String::new(), format!("qc repo {command}: {error}\n"), 1)
         }
@@ -2600,6 +2673,52 @@ mod tests {
         let policy = repomap_index::ScanPolicyKey::default();
         assert_eq!(daemon.memo_len(&root, &policy), 1);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lazy_semantic_growth_evicts_inactive_root_to_preserve_global_budget() {
+        let root_a = root();
+        let root_b = root();
+        let source = b"export function target() {}
+export function run(){ target(); }
+";
+        write_file(&root_a, "main.ts", source);
+        write_file(&root_b, "main.ts", source);
+
+        let probe_a = repomap_index::scan_root(&root_a, &ScanConfig::default()).expect("probe a");
+        let structural_a = probe_a.logical_bytes();
+        let probe_b = repomap_index::scan_root(&root_b, &ScanConfig::default()).expect("probe b");
+        let structural_b = probe_b.logical_bytes();
+        probe_b.semantic_graph().expect("semantic b");
+        let semantic_b = probe_b.logical_bytes();
+
+        let structural_pair = structural_a.saturating_add(structural_b);
+        let max_logical_bytes = structural_pair.max(semantic_b);
+        assert!(max_logical_bytes < semantic_b.saturating_add(structural_a));
+
+        let mut daemon = Daemon::with_config(DaemonConfig {
+            max_logical_bytes,
+            ..DaemonConfig::default()
+        });
+        let first = daemon.dispatch(request(&root_a, LookupOperation::Map, None));
+        let second = daemon.dispatch(request(&root_b, LookupOperation::Map, None));
+        assert_eq!(first.exit_code, 0);
+        assert_eq!(second.exit_code, 0);
+        assert_eq!(daemon.roots.len(), 2);
+
+        let semantic = daemon.dispatch(request(
+            &root_b,
+            LookupOperation::Callers,
+            Some("target"),
+        ));
+        assert_eq!(semantic.exit_code, 0);
+        assert!(semantic.stdout.contains("run"));
+        assert_eq!(daemon.roots.len(), 1);
+        assert!(daemon.roots.keys().all(|id| id.root == root_b));
+        assert!(daemon.total_bytes() <= max_logical_bytes);
+
+        fs::remove_dir_all(root_a).ok();
+        fs::remove_dir_all(root_b).ok();
     }
 
     #[test]

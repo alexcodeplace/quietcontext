@@ -76,6 +76,8 @@ beforeAll(async () => {
   mkdirSync(join(rootA, "src"), { recursive: true });
   mkdirSync(join(rootB, "src"), { recursive: true });
   writeFileSync(join(rootA, "src", "a.ts"), "export function alphaOnly() { return 1; }\nexport const a = alphaOnly();\n");
+  writeFileSync(join(rootA, "src", "target.ts"), "export function semanticTarget() { return 3; }\n");
+  writeFileSync(join(rootA, "src", "caller.ts"), "import { semanticTarget as target } from './target';\nexport function semanticCaller() { return target(); }\n");
   writeFileSync(join(rootB, "src", "b.ts"), "export function betaOnly() { return 2; }\nexport const b = betaOnly();\n");
   const lines = Array.from({ length: 180 }, (_, i) => i === 149 ? "RAW_RECOVERY_CANARY_f3e77" : `ordinary line ${i + 1}`);
   writeFileSync(join(rootA, "large.log"), lines.join("\n") + "\n");
@@ -96,7 +98,7 @@ afterAll(() => {
   daemon?.kill("SIGTERM");
   if (scratch) {
     try {
-      const pid = Number(readFileSync(join(scratch, "state", "quietcontext", "native", "repomap", "repomap-v2.pid"), "utf8").trim());
+      const pid = Number(readFileSync(join(scratch, "state", "quietcontext", "native", "repomap", "repomap-v3.pid"), "utf8").trim());
       if (Number.isInteger(pid) && pid > 1) process.kill(pid, "SIGTERM");
     } catch { /* no daemon or already stopped */ }
     rmSync(scratch, { recursive: true, force: true });
@@ -119,6 +121,22 @@ suite("qc native HTTP integration", () => {
     expect(text(await callTool("repo", { action: "symbol", target: "alphaOnly" }, rootA))).toContain("src/a.ts");
     expect(text(await callTool("repo", { action: "references", target: "alphaOnly" }, rootA))).toContain("alphaOnly()");
     expect(text(await callTool("repo", { action: "outline", target: "src/a.ts" }, rootA))).toContain("alphaOnly");
+  });
+
+  test("semantic repository actions traverse the same native generation", async () => {
+    const callees = text(await callTool("repo", { action: "callees", target: "semanticCaller" }, rootA));
+    expect(callees).toContain("semanticTarget");
+    expect(callees).toContain("src/target.ts");
+
+    const callers = text(await callTool("repo", { action: "callers", target: "semanticTarget" }, rootA));
+    expect(callers).toContain("semanticCaller");
+
+    const impact = text(await callTool("repo", { action: "impact", target: "semanticTarget", depth: 3 }, rootA));
+    expect(impact).toContain("semanticCaller");
+
+    const path = text(await callTool("repo", { action: "path", target: "semanticCaller -> semanticTarget" }, rootA));
+    expect(path).toContain("[qc-path v1]");
+    expect(path).toContain("[calls @");
   });
 
   test("execute uses native filtering and search recovers an omitted raw canary", async () => {
