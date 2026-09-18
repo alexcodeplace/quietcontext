@@ -94,6 +94,12 @@ pub(crate) enum ScanError {
     },
 }
 
+impl From<repomap_index::ScanError> for ScanError {
+    fn from(error: repomap_index::ScanError) -> Self {
+        Self::Index(error.to_string())
+    }
+}
+
 impl fmt::Display for ScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -713,7 +719,7 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
         return Ok(None);
     }
 
-    let graph = snapshot.semantic_graph();
+    let graph = snapshot.semantic_graph()?;
     let semantic_roots = graph.select_symbols(name, None);
     if !semantic_roots.is_empty() {
         let mut lines = vec![format!("[qc-references v2] {name} - {} definitions\n", semantic_roots.len())];
@@ -722,13 +728,14 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
             lines.push(format!("{}\n", semantic_node_label(graph, root)));
             let mut seen = std::collections::BTreeSet::new();
             for edge in graph.resolved_reference_edges(root) {
-                if !seen.insert((edge.file.clone(), edge.line)) { continue; }
+                let Some(edge_file) = graph.edge_file_path(edge) else { continue; };
+                if !seen.insert((edge_file.to_owned(), edge.line)) { continue; }
                 let source_line = snapshot.files().iter()
-                    .find(|file| file.relative_path == edge.file)
+                    .find(|file| file.relative_path == edge_file)
                     .and_then(|file| file.source.lines().nth(edge.line.saturating_sub(1)))
                     .unwrap_or_default()
                     .trim();
-                lines.push(format!("  {}:{}: {} [{}]\n", edge.file, edge.line, outline::cap_chars(source_line, 160), edge.kind.as_str()));
+                lines.push(format!("  {}:{}: {} [{}]\n", edge_file, edge.line, outline::cap_chars(source_line, 160), edge.kind.as_str()));
                 semantic_hits += 1;
             }
         }
@@ -785,10 +792,11 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
 
 fn semantic_node_label(graph: &SemanticGraph, id: NodeId) -> String {
     let Some(node) = graph.node(id) else { return format!("node:{id}"); };
+    let file = graph.file_path(id).unwrap_or("?");
     if node.kind == crate::semantic::NodeKind::File {
-        return node.file.clone();
+        return file.to_owned();
     }
-    format!("{} [{}] - {}:{}", node.qualified_name, node.kind.as_str(), node.file, node.start_line)
+    format!("{} [{}] - {}:{}", node.qualified_name, node.kind.as_str(), file, node.start_line)
 }
 
 fn bounded_graph_output(mut lines: Vec<String>, max_bytes: usize, label: &str) -> String {
@@ -855,7 +863,7 @@ pub(crate) fn build_callers(
     snapshot: &SourceIndex,
     cfg: &MapConfig,
 ) -> ScanResult {
-    let graph = snapshot.semantic_graph();
+    let graph = snapshot.semantic_graph()?;
     let roots = graph_roots(graph, query, file_filter, false);
     if roots.is_empty() {
         if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
@@ -873,7 +881,7 @@ pub(crate) fn build_callees(
     snapshot: &SourceIndex,
     cfg: &MapConfig,
 ) -> ScanResult {
-    let graph = snapshot.semantic_graph();
+    let graph = snapshot.semantic_graph()?;
     let roots = graph_roots(graph, query, file_filter, false);
     if roots.is_empty() {
         if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
@@ -891,7 +899,7 @@ pub(crate) fn build_impact(
     snapshot: &SourceIndex,
     cfg: &MapConfig,
 ) -> ScanResult {
-    let graph = snapshot.semantic_graph();
+    let graph = snapshot.semantic_graph()?;
     let roots = graph_roots(graph, query, file_filter, false);
     if roots.is_empty() {
         if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
@@ -910,7 +918,7 @@ pub(crate) fn build_dependencies(
     snapshot: &SourceIndex,
     cfg: &MapConfig,
 ) -> ScanResult {
-    let graph = snapshot.semantic_graph();
+    let graph = snapshot.semantic_graph()?;
     let roots = graph_roots(graph, query, file_filter, true);
     if roots.is_empty() {
         if snapshot.diagnostics().has_errors() || snapshot.truncated() { return Err(semantic_incomplete(snapshot, cfg)); }
@@ -929,7 +937,7 @@ pub(crate) fn build_path(
     snapshot: &SourceIndex,
     cfg: &MapConfig,
 ) -> ScanResult {
-    let graph = snapshot.semantic_graph();
+    let graph = snapshot.semantic_graph()?;
     let starts = graph.select_target(from, None);
     let targets = graph.select_target(to, None);
     if starts.is_empty() || targets.is_empty() {

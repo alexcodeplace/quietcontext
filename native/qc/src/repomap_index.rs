@@ -1,6 +1,7 @@
 use crate::config::MapConfig;
 use crate::outline::{self, Decl, Family};
 use crate::semantic::SemanticGraph;
+use crate::semantic_extract::{self, ExtractedFile};
 use ignore::WalkBuilder;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -8,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const SOURCE_EXTENSION_REVISION: u32 = 1;
 pub const SKIP_DIRECTORY_REVISION: u32 = 1;
@@ -245,6 +246,22 @@ pub struct SourceRecord {
     pub lines: Arc<[LineMetadata]>,
     pub family: Family,
     pub declarations: Arc<[DeclarationPosting]>,
+    semantic_facts: Arc<OnceLock<Option<Arc<ExtractedFile>>>>,
+}
+
+impl SourceRecord {
+    pub(crate) fn semantic_facts(&self) -> Option<&ExtractedFile> {
+        self.semantic_facts
+            .get_or_init(|| semantic_extract::extract(&self.canonical_path, &self.source).map(Arc::new))
+            .as_deref()
+    }
+
+    fn semantic_facts_logical_bytes(&self) -> usize {
+        self.semantic_facts
+            .get()
+            .and_then(Option::as_deref)
+            .map_or(0, ExtractedFile::logical_bytes)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -335,11 +352,12 @@ pub struct SourceIndex {
     map_summaries: Arc<[MapSummary]>,
     declarations_by_name: Arc<BTreeMap<String, Arc<[DeclarationPosting]>>>,
     identifier_refs: Arc<BTreeMap<String, Arc<[ReferenceCoordinate]>>>,
-    semantic_graph: Arc<SemanticGraph>,
+    semantic_graph: Arc<OnceLock<Result<Arc<SemanticGraph>, ScanError>>>,
     diagnostics: WalkDiagnostics,
     truncated: bool,
     generation: u64,
     logical_bytes: usize,
+    max_index_bytes: usize,
     scan_inputs: ScanInputs,
 }
 
@@ -357,8 +375,30 @@ impl SourceIndex {
         &self.map_summaries
     }
 
-    pub fn semantic_graph(&self) -> &SemanticGraph {
-        &self.semantic_graph
+    pub fn semantic_graph(&self) -> Result<&SemanticGraph, ScanError> {
+        let result = self.semantic_graph.get_or_init(|| {
+            let graph = SemanticGraph::build(&self.scan_inputs.canonical_root, &self.files);
+            let fact_bytes = self
+                .files
+                .iter()
+                .map(SourceRecord::semantic_facts_logical_bytes)
+                .fold(0usize, usize::saturating_add);
+            let observed_bytes = self
+                .logical_bytes
+                .saturating_add(fact_bytes)
+                .saturating_add(graph.logical_bytes());
+            if observed_bytes > MAX_LOGICAL_INDEX_BYTES {
+                return Err(ScanError::TooLarge);
+            }
+            if observed_bytes > self.max_index_bytes {
+                return Err(ScanError::BoundsExceeded {
+                    max_bytes: self.max_index_bytes,
+                    observed_bytes,
+                });
+            }
+            Ok(Arc::new(graph))
+        });
+        result.as_deref().map_err(Clone::clone)
     }
 
     pub fn declarations(&self, name: &str) -> Option<&[DeclarationPosting]> {
@@ -402,7 +442,19 @@ impl SourceIndex {
     }
 
     pub fn logical_bytes(&self) -> usize {
+        let fact_bytes = self
+            .files
+            .iter()
+            .map(SourceRecord::semantic_facts_logical_bytes)
+            .fold(0usize, usize::saturating_add);
+        let semantic_bytes = self
+            .semantic_graph
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .map_or(0, |graph| graph.logical_bytes());
         self.logical_bytes
+            .saturating_add(fact_bytes)
+            .saturating_add(semantic_bytes)
     }
 
     #[cfg(test)]
@@ -987,6 +1039,7 @@ fn source_record(
             source: Arc::from(source),
             family,
             declarations: postings.into(),
+            semantic_facts: Arc::new(OnceLock::new()),
         },
         PathDispositionRecord {
             relative_path,
@@ -1106,6 +1159,7 @@ fn build_index(
                     source: Arc::from(source),
                     family,
                     declarations: postings.into(),
+                    semantic_facts: Arc::new(OnceLock::new()),
                 });
                 dispositions.push(PathDispositionRecord {
                     relative_path: rel,
@@ -1338,8 +1392,6 @@ fn assemble_index(
         &mut logical_bytes,
         reference_index_logical_bytes(&identifier_refs),
     );
-    let semantic_graph = SemanticGraph::build(&scan_inputs.canonical_root, &files);
-    size_add(&mut logical_bytes, semantic_graph.logical_bytes());
     if logical_bytes > MAX_LOGICAL_INDEX_BYTES {
         return Err(ScanError::TooLarge);
     }
@@ -1370,11 +1422,12 @@ fn assemble_index(
         map_summaries: map_summaries.into(),
         declarations_by_name: Arc::new(declarations_by_name),
         identifier_refs: Arc::new(identifier_refs),
-        semantic_graph: Arc::new(semantic_graph),
+        semantic_graph: Arc::new(OnceLock::new()),
         diagnostics,
         truncated,
         generation,
         logical_bytes,
+        max_index_bytes,
         scan_inputs,
     })
 }
@@ -1797,6 +1850,97 @@ mod tests {
             .path_dispositions()
             .iter()
             .any(|record| record.disposition == PathDisposition::InvalidUtf8));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn semantic_materialization_is_lazy_and_counted() {
+        let root = temp_root();
+        write_file(
+            &root,
+            "main.ts",
+            b"export function target() {}
+export function run(){ target(); }
+",
+        );
+        let index = scan_root(&root, &config(10, 1024)).expect("scan");
+        let structural_bytes = index.logical_bytes();
+        assert!(index.semantic_graph.get().is_none());
+        assert!(index.files()[0].semantic_facts.get().is_none());
+
+        let graph = index.semantic_graph().expect("semantic graph");
+        assert!(!graph.select_symbols("target", None).is_empty());
+        assert!(index.semantic_graph.get().is_some());
+        assert!(index.files()[0].semantic_facts.get().is_some());
+        assert!(index.logical_bytes() > structural_bytes);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn refresh_reuses_unchanged_semantic_facts_and_resets_changed_file() {
+        let root = temp_root();
+        write_file(&root, "a.ts", b"export function target() {}
+");
+        write_file(
+            &root,
+            "b.ts",
+            b"import { target } from './a';
+export function run(){ target(); }
+",
+        );
+        let index = scan_root(&root, &config(10, 1024)).expect("scan");
+        index.semantic_graph().expect("semantic graph");
+
+        let old_a = index
+            .files()
+            .iter()
+            .find(|file| file.relative_path == "a.ts")
+            .expect("a")
+            .semantic_facts
+            .clone();
+        let old_b = index
+            .files()
+            .iter()
+            .find(|file| file.relative_path == "b.ts")
+            .expect("b")
+            .semantic_facts
+            .clone();
+        assert!(old_a.get().is_some());
+        assert!(old_b.get().is_some());
+
+        write_file(
+            &root,
+            "b.ts",
+            b"export function changed(){ return 1; }
+",
+        );
+        let replacement = match refresh_replacement(
+            &index,
+            &[PathChange::Modified(root.join("b.ts"))],
+            &config(10, 1024),
+        ) {
+            RefreshOutcome::Refreshed(replacement) => replacement,
+            RefreshOutcome::NeedsReconcile(reason) => panic!("refresh failed: {reason:?}"),
+        };
+
+        let new_a = replacement
+            .files()
+            .iter()
+            .find(|file| file.relative_path == "a.ts")
+            .expect("new a");
+        let new_b = replacement
+            .files()
+            .iter()
+            .find(|file| file.relative_path == "b.ts")
+            .expect("new b");
+        assert!(Arc::ptr_eq(&old_a, &new_a.semantic_facts));
+        assert!(!Arc::ptr_eq(&old_b, &new_b.semantic_facts));
+        assert!(new_b.semantic_facts.get().is_none());
+
+        let graph = replacement.semantic_graph().expect("replacement graph");
+        assert!(!graph.select_symbols("changed", None).is_empty());
+        assert!(graph.select_symbols("run", None).is_empty());
+        assert!(new_b.semantic_facts.get().is_some());
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -1,7 +1,5 @@
 use crate::repomap_index::SourceRecord;
-use crate::semantic_extract::{
-    self, ExtractedFile, ExtractedKind, ImportBinding, RawCall, RawTypeRelationKind,
-};
+use crate::semantic_extract::{ExtractedKind, ImportBinding, RawCall, RawTypeRelationKind};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
@@ -39,8 +37,8 @@ impl NodeKind {
         }
     }
 
-    fn callable(self) -> bool {
-        matches!(self, Self::Function | Self::Method | Self::Class)
+    fn bare_callable(self) -> bool {
+        matches!(self, Self::Function | Self::Class)
     }
 
     fn type_like(self) -> bool {
@@ -96,34 +94,18 @@ impl EdgeKind {
 pub enum Confidence {
     Exact,
     Scoped,
-    Unique,
-}
-
-impl Confidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::Scoped => "scoped",
-            Self::Unique => "unique",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct SemanticNode {
-    pub id: NodeId,
     pub kind: NodeKind,
     pub name: String,
     pub qualified_name: String,
-    pub file: String,
+    pub file_id: NodeId,
     pub start_line: usize,
-    pub start_column: usize,
-    pub end_line: usize,
-    pub end_column: usize,
     pub enclosing: Option<NodeId>,
     pub owner_name: Option<String>,
     pub receiver_alias: Option<String>,
-    pub evidence: String,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -131,7 +113,6 @@ pub struct SemanticEdge {
     pub from: NodeId,
     pub to: NodeId,
     pub kind: EdgeKind,
-    pub file: String,
     pub line: usize,
     pub column: usize,
     pub confidence: Confidence,
@@ -150,14 +131,13 @@ pub struct GraphDiagnostics {
 
 #[derive(Clone, Debug)]
 struct ResolvedBinding {
-    target_files: Vec<String>,
+    target_files: Vec<NodeId>,
     imported: Option<String>,
     namespace: bool,
 }
 
 #[derive(Clone, Debug)]
-struct FileFacts {
-    extracted: ExtractedFile,
+struct FileResolutionState {
     local_nodes: Vec<NodeId>,
     bindings: BTreeMap<String, ResolvedBinding>,
 }
@@ -168,7 +148,6 @@ pub struct TraversalStep {
     pub node: NodeId,
     pub via: EdgeKind,
     pub depth: usize,
-    pub file: String,
     pub line: usize,
     pub column: usize,
 }
@@ -177,7 +156,6 @@ pub struct TraversalStep {
 pub struct PathHop {
     pub node: NodeId,
     pub via: Option<EdgeKind>,
-    pub file: Option<String>,
     pub line: usize,
     pub column: usize,
 }
@@ -217,22 +195,15 @@ fn normalize_relative(path: PathBuf) -> Option<String> {
     (!out.is_empty()).then(|| out.join("/"))
 }
 
-fn strip_known_extension(path: &str) -> &str {
-    for ext in [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".py", ".rs", ".go"] {
-        if let Some(value) = path.strip_suffix(ext) { return value; }
-    }
-    path
-}
-
-fn probe_file(candidates: impl IntoIterator<Item = String>, known: &BTreeSet<String>) -> Vec<String> {
+fn probe_file(candidates: impl IntoIterator<Item = String>, known: &BTreeSet<&str>) -> Vec<String> {
     let mut out = Vec::new();
     for candidate in candidates {
-        if known.contains(&candidate) && !out.contains(&candidate) { out.push(candidate); }
+        if known.contains(candidate.as_str()) && !out.contains(&candidate) { out.push(candidate); }
     }
     out
 }
 
-fn js_module_files(current: &str, module: &str, known: &BTreeSet<String>) -> Vec<String> {
+fn js_module_files(current: &str, module: &str, known: &BTreeSet<&str>) -> Vec<String> {
     if !module.starts_with('.') { return Vec::new(); }
     let parent = Path::new(current).parent().unwrap_or_else(|| Path::new(""));
     let Some(base) = normalize_relative(parent.join(module)) else { return Vec::new(); };
@@ -244,7 +215,7 @@ fn js_module_files(current: &str, module: &str, known: &BTreeSet<String>) -> Vec
     probe_file(candidates, known)
 }
 
-fn python_module_files(current: &str, module: &str, known: &BTreeSet<String>) -> Vec<String> {
+fn python_module_files(current: &str, module: &str, known: &BTreeSet<&str>) -> Vec<String> {
     let dots = module.chars().take_while(|c| *c == '.').count();
     let tail = module[dots..].replace('.', "/");
     let mut base = Path::new(current).parent().unwrap_or_else(|| Path::new("")).to_path_buf();
@@ -255,7 +226,7 @@ fn python_module_files(current: &str, module: &str, known: &BTreeSet<String>) ->
     probe_file([format!("{base}.py"), format!("{base}/__init__.py"), base], known)
 }
 
-fn rust_module_files(current: &str, module: &str, known: &BTreeSet<String>) -> Vec<String> {
+fn rust_module_files(current: &str, module: &str, known: &BTreeSet<&str>) -> Vec<String> {
     let mut parts: Vec<_> = module.split("::").filter(|v| !v.is_empty()).collect();
     let current_parent = Path::new(current).parent().unwrap_or_else(|| Path::new(""));
     let mut base = if parts.first() == Some(&"crate") {
@@ -278,15 +249,15 @@ fn go_module_name(root: &Path) -> Option<String> {
     source.lines().find_map(|line| line.trim().strip_prefix("module ").map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned))
 }
 
-fn go_module_files(module: &str, module_name: Option<&str>, known: &BTreeSet<String>) -> Vec<String> {
+fn go_module_files(module: &str, module_name: Option<&str>, known: &BTreeSet<&str>) -> Vec<String> {
     let relative = if let Some(root) = module_name {
         if module == root { "" } else if let Some(rest) = module.strip_prefix(&format!("{root}/")) { rest } else { return Vec::new(); }
     } else { return Vec::new(); };
     let prefix = if relative.is_empty() { String::new() } else { format!("{relative}/") };
-    known.iter().filter(|path| path.starts_with(&prefix) && path.ends_with(".go") && Path::new(path).parent().map(|p| p.to_string_lossy().replace('\\', "/") == relative).unwrap_or(relative.is_empty())).cloned().collect()
+    known.iter().filter(|path| path.starts_with(&prefix) && path.ends_with(".go") && Path::new(path).parent().map(|p| p.to_string_lossy().replace('\\', "/") == relative).unwrap_or(relative.is_empty())).map(|path| (*path).to_owned()).collect()
 }
 
-fn resolve_import_files(root: &Path, current: &str, module: &str, known: &BTreeSet<String>, go_module: Option<&str>) -> Vec<String> {
+fn resolve_import_files(root: &Path, current: &str, module: &str, known: &BTreeSet<&str>, go_module: Option<&str>) -> Vec<String> {
     match Path::new(current).extension().and_then(|v| v.to_str()).unwrap_or_default() {
         "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => js_module_files(current, module, known),
         "py" => python_module_files(current, module, known),
@@ -302,34 +273,29 @@ fn add_index(map: &mut BTreeMap<String, Vec<NodeId>>, key: String, id: NodeId) {
 
 impl SemanticGraph {
     pub fn build(root: &Path, files: &[SourceRecord]) -> Self {
-        let known: BTreeSet<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+        let known: BTreeSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
         let go_module = go_module_name(root);
         let mut graph = Self::default();
-        let mut facts = BTreeMap::<String, FileFacts>::new();
+        let mut states = BTreeMap::<&str, FileResolutionState>::new();
 
         for file in files {
             let id = graph.nodes.len() as NodeId;
             graph.file_nodes.insert(file.relative_path.clone(), id);
             add_index(&mut graph.by_file, file.relative_path.clone(), id);
             graph.nodes.push(SemanticNode {
-                id,
                 kind: NodeKind::File,
                 name: Path::new(&file.relative_path).file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 qualified_name: file.relative_path.clone(),
-                file: file.relative_path.clone(),
+                file_id: id,
                 start_line: 1,
-                start_column: 1,
-                end_line: file.source.lines().count().max(1),
-                end_column: 1,
                 enclosing: None,
                 owner_name: None,
                 receiver_alias: None,
-                evidence: String::new(),
             });
         }
 
         for file in files {
-            let Some(extracted) = semantic_extract::extract(&file.canonical_path, &file.source) else {
+            let Some(extracted) = file.semantic_facts() else {
                 graph.diagnostics.parse_fallback_files += 1;
                 continue;
             };
@@ -342,73 +308,79 @@ impl SemanticGraph {
                 local_nodes.push(id);
                 let enclosing = symbol.enclosing.and_then(|i| local_nodes.get(i).copied()).or(Some(file_node));
                 let node = SemanticNode {
-                    id,
                     kind: symbol.kind.into(),
                     name: symbol.name.clone(),
                     qualified_name: symbol.qualified_name.clone(),
-                    file: file.relative_path.clone(),
+                    file_id: file_node,
                     start_line: symbol.start_line,
-                    start_column: symbol.start_column,
-                    end_line: symbol.end_line,
-                    end_column: symbol.end_column,
                     enclosing,
                     owner_name: symbol.owner_hint.clone(),
                     receiver_alias: symbol.receiver_alias.clone(),
-                    evidence: symbol.evidence.clone(),
                 };
                 add_index(&mut graph.by_name, node.name.clone(), id);
                 add_index(&mut graph.by_qualified, node.qualified_name.clone(), id);
-                add_index(&mut graph.by_file, node.file.clone(), id);
+                add_index(&mut graph.by_file, file.relative_path.clone(), id);
                 graph.nodes.push(node);
-                graph.edges.push(SemanticEdge { from: enclosing.unwrap_or(file_node), to: id, kind: EdgeKind::Contains, file: file.relative_path.clone(), line: symbol.start_line, column: symbol.start_column, confidence: Confidence::Exact });
+                graph.edges.push(SemanticEdge { from: enclosing.unwrap_or(file_node), to: id, kind: EdgeKind::Contains, line: symbol.start_line, column: symbol.start_column, confidence: Confidence::Exact });
             }
-            facts.insert(file.relative_path.clone(), FileFacts { extracted, local_nodes, bindings: BTreeMap::new() });
+            states.insert(file.relative_path.as_str(), FileResolutionState {
+                local_nodes,
+                bindings: BTreeMap::new(),
+            });
         }
 
         for file in files {
-            let Some(file_facts) = facts.get_mut(&file.relative_path) else { continue; };
+            let Some(file_state) = states.get_mut(file.relative_path.as_str()) else { continue; };
+            let Some(extracted) = file.semantic_facts() else { continue; };
             let file_node = graph.file_nodes[&file.relative_path];
-            for import in &file_facts.extracted.imports {
-                let target_files = resolve_import_files(root, &file.relative_path, &import.module, &known, go_module.as_deref());
+            for import in &extracted.imports {
+                let target_paths = resolve_import_files(root, &file.relative_path, &import.module, &known, go_module.as_deref());
+                let target_files: Vec<NodeId> = target_paths
+                    .iter()
+                    .filter_map(|target| graph.file_nodes.get(target).copied())
+                    .collect();
                 if target_files.is_empty() {
                     graph.diagnostics.unresolved_imports += 1;
                     continue;
                 }
-                for target in &target_files {
-                    if let Some(&to) = graph.file_nodes.get(target) {
-                        graph.edges.push(SemanticEdge { from: file_node, to, kind: EdgeKind::Imports, file: file.relative_path.clone(), line: import.line, column: import.column, confidence: Confidence::Exact });
-                    }
+                for &to in &target_files {
+                    graph.edges.push(SemanticEdge { from: file_node, to, kind: EdgeKind::Imports, line: import.line, column: import.column, confidence: Confidence::Exact });
                 }
                 for ImportBinding { local, imported, namespace } in &import.bindings {
-                    file_facts.bindings.insert(local.clone(), ResolvedBinding { target_files: target_files.clone(), imported: imported.clone(), namespace: *namespace });
+                    file_state.bindings.insert(local.clone(), ResolvedBinding { target_files: target_files.clone(), imported: imported.clone(), namespace: *namespace });
                 }
             }
         }
 
-        let file_names: Vec<String> = facts.keys().cloned().collect();
-        for file_name in file_names {
-            let Some(file_facts) = facts.get(&file_name).cloned() else { continue; };
-            for call in &file_facts.extracted.calls {
-                let from = call.enclosing.and_then(|i| file_facts.local_nodes.get(i).copied()).unwrap_or(graph.file_nodes[&file_name]);
-                match graph.resolve_call(&file_name, from, call, &file_facts.bindings) {
-                    Resolution::One(to, confidence) if to != from => graph.edges.push(SemanticEdge { from, to, kind: EdgeKind::Calls, file: file_name.clone(), line: call.line, column: call.column, confidence }),
+        for file in files {
+            let file_name = file.relative_path.as_str();
+            let Some(file_state) = states.get(file_name) else { continue; };
+            let Some(extracted) = file.semantic_facts() else { continue; };
+            for call in &extracted.calls {
+                let from = call.enclosing.and_then(|i| file_state.local_nodes.get(i).copied()).unwrap_or(graph.file_nodes[file_name]);
+                match graph.resolve_call(file_name, from, call, &file_state.bindings) {
+                    Resolution::One(to, confidence) if to != from => graph.edges.push(SemanticEdge { from, to, kind: EdgeKind::Calls, line: call.line, column: call.column, confidence }),
                     Resolution::One(_, _) => {}
                     Resolution::Ambiguous => { graph.diagnostics.ambiguous_relationships += 1; graph.diagnostics.unresolved_calls += 1; }
                     Resolution::None => graph.diagnostics.unresolved_calls += 1,
                 }
             }
-            for relation in &file_facts.extracted.type_relations {
-                let Some(&from) = file_facts.local_nodes.get(relation.source) else { continue; };
-                match graph.resolve_type(&file_name, &relation.target, &file_facts.bindings) {
-                    Resolution::One(to, confidence) if to != from => graph.edges.push(SemanticEdge { from, to, kind: match relation.kind { RawTypeRelationKind::Extends => EdgeKind::Extends, RawTypeRelationKind::Implements => EdgeKind::Implements }, file: file_name.clone(), line: relation.line, column: relation.column, confidence }),
+            for relation in &extracted.type_relations {
+                let Some(&from) = file_state.local_nodes.get(relation.source) else { continue; };
+                match graph.resolve_type(file_name, from, &relation.target, &file_state.bindings) {
+                    Resolution::One(to, confidence) if to != from => graph.edges.push(SemanticEdge { from, to, kind: match relation.kind { RawTypeRelationKind::Extends => EdgeKind::Extends, RawTypeRelationKind::Implements => EdgeKind::Implements }, line: relation.line, column: relation.column, confidence }),
                     Resolution::Ambiguous => graph.diagnostics.ambiguous_relationships += 1,
                     _ => {}
                 }
             }
-            for reference in &file_facts.extracted.references {
-                let from = reference.enclosing.and_then(|i| file_facts.local_nodes.get(i).copied()).unwrap_or(graph.file_nodes[&file_name]);
-                match graph.resolve_reference(&file_name, &reference.name, &file_facts.bindings) {
-                    Resolution::One(to, confidence) if to != from => graph.edges.push(SemanticEdge { from, to, kind: EdgeKind::References, file: file_name.clone(), line: reference.line, column: reference.column, confidence }),
+            for reference in &extracted.references {
+                let from = reference.enclosing.and_then(|i| file_state.local_nodes.get(i).copied()).unwrap_or(graph.file_nodes[file_name]);
+                let start = reference.start_byte as usize;
+                let end = reference.end_byte as usize;
+                let name = file.source.get(start..end).unwrap_or_default().trim();
+                if name.is_empty() { continue; }
+                match graph.resolve_reference(file_name, from, name, &file_state.bindings) {
+                    Resolution::One(to, confidence) if to != from => graph.edges.push(SemanticEdge { from, to, kind: EdgeKind::References, line: reference.line, column: reference.column, confidence }),
                     Resolution::Ambiguous => graph.diagnostics.ambiguous_relationships += 1,
                     _ => {}
                 }
@@ -418,6 +390,7 @@ impl SemanticGraph {
         graph.edges.sort();
         graph.edges.dedup();
         for (index, edge) in graph.edges.iter().enumerate() {
+            if edge.kind == EdgeKind::Contains { continue; }
             graph.outgoing.entry(edge.from).or_default().push(index);
             graph.incoming.entry(edge.to).or_default().push(index);
         }
@@ -426,56 +399,134 @@ impl SemanticGraph {
         graph
     }
 
-    fn candidates_in_files(&self, name: &str, files: &[String], predicate: impl Fn(NodeKind) -> bool) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        for &id in self.by_name.get(name).into_iter().flatten() {
+    fn is_top_level(&self, id: NodeId) -> bool {
+        let Some(enclosing) = self.nodes[id as usize].enclosing else { return false; };
+        self.nodes[enclosing as usize].kind == NodeKind::File
+    }
+
+    fn visible_from(&self, candidate: NodeId, from: NodeId) -> bool {
+        let Some(candidate_scope) = self.nodes[candidate as usize].enclosing else {
+            return false;
+        };
+        if self.nodes[candidate_scope as usize].kind == NodeKind::File {
+            return true;
+        }
+        let mut scope = Some(from);
+        while let Some(id) = scope {
+            if id == candidate_scope {
+                return true;
+            }
+            scope = self.nodes[id as usize].enclosing;
+        }
+        false
+    }
+
+    fn resolution_from_ids(
+        &self,
+        ids: impl Iterator<Item = NodeId>,
+        confidence: Confidence,
+        predicate: impl Fn(NodeId, &SemanticNode) -> bool,
+    ) -> Resolution {
+        let mut found = None;
+        for id in ids {
             let node = &self.nodes[id as usize];
-            if files.contains(&node.file) && predicate(node.kind) { out.push(id); }
+            if !predicate(id, node) {
+                continue;
+            }
+            if found.is_some() {
+                return Resolution::Ambiguous;
+            }
+            found = Some(id);
         }
-        out
+        found.map_or(Resolution::None, |id| Resolution::One(id, confidence))
     }
 
-    fn imported_resolution(&self, local: &str, member: Option<&str>, bindings: &BTreeMap<String, ResolvedBinding>, predicate: impl Fn(NodeKind) -> bool + Copy) -> Resolution {
-        let Some(binding) = bindings.get(local) else { return Resolution::None; };
-        let name = if binding.namespace { member.map(str::to_owned) } else { binding.imported.clone().or_else(|| member.map(str::to_owned)) };
-        let Some(name) = name else { return Resolution::None; };
-        let candidates = self.candidates_in_files(&name, &binding.target_files, predicate);
-        match candidates.as_slice() {
-            [id] => Resolution::One(*id, Confidence::Exact),
-            [] => Resolution::None,
-            _ => Resolution::Ambiguous,
-        }
+    fn imported_resolution(
+        &self,
+        local: &str,
+        member: Option<&str>,
+        bindings: &BTreeMap<String, ResolvedBinding>,
+        predicate: impl Fn(NodeKind) -> bool + Copy,
+    ) -> Resolution {
+        let Some(binding) = bindings.get(local) else {
+            return Resolution::None;
+        };
+        let name = if binding.namespace {
+            member
+        } else {
+            binding.imported.as_deref().or(member)
+        };
+        let Some(name) = name else {
+            return Resolution::None;
+        };
+        self.resolution_from_ids(
+            self.by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .copied(),
+            Confidence::Exact,
+            |id, node| {
+                binding.target_files.contains(&node.file_id)
+                    && self.is_top_level(id)
+                    && predicate(node.kind)
+            },
+        )
     }
 
-    fn same_file_resolution(&self, file: &str, name: &str, predicate: impl Fn(NodeKind) -> bool) -> Resolution {
-        let candidates: Vec<_> = self.by_name.get(name).into_iter().flatten().copied().filter(|id| {
-            let node = &self.nodes[*id as usize]; node.file == file && predicate(node.kind)
-        }).collect();
-        match candidates.as_slice() {
-            [id] => Resolution::One(*id, Confidence::Scoped),
-            [] => Resolution::None,
-            _ => Resolution::Ambiguous,
-        }
+    fn same_file_resolution(
+        &self,
+        file: &str,
+        from: NodeId,
+        name: &str,
+        predicate: impl Fn(NodeKind) -> bool,
+    ) -> Resolution {
+        self.resolution_from_ids(
+            self.by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .copied(),
+            Confidence::Scoped,
+            |id, node| self.file_path(id) == Some(file) && self.visible_from(id, from) && predicate(node.kind),
+        )
     }
 
-    fn unique_resolution(&self, name: &str, predicate: impl Fn(NodeKind) -> bool) -> Resolution {
-        let candidates: Vec<_> = self.by_name.get(name).into_iter().flatten().copied().filter(|id| predicate(self.nodes[*id as usize].kind)).collect();
-        match candidates.as_slice() {
-            [id] => Resolution::One(*id, Confidence::Unique),
-            [] => Resolution::None,
-            _ => Resolution::Ambiguous,
+    fn package_resolution(
+        &self,
+        file: &str,
+        name: &str,
+        predicate: impl Fn(NodeKind) -> bool,
+    ) -> Resolution {
+        if Path::new(file).extension().and_then(|value| value.to_str()) != Some("go") {
+            return Resolution::None;
         }
+        let package_dir = Path::new(file).parent();
+        self.resolution_from_ids(
+            self.by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .copied(),
+            Confidence::Scoped,
+            |id, node| {
+                self.is_top_level(id)
+                    && self.file_path(id).and_then(|candidate| Path::new(candidate).parent()) == package_dir
+                    && predicate(node.kind)
+            },
+        )
     }
 
     fn owner_method(&self, owner: &str, name: &str) -> Resolution {
-        let candidates: Vec<_> = self.by_name.get(name).into_iter().flatten().copied().filter(|id| {
-            let node = &self.nodes[*id as usize]; node.kind == NodeKind::Method && node.owner_name.as_deref() == Some(owner)
-        }).collect();
-        match candidates.as_slice() {
-            [id] => Resolution::One(*id, Confidence::Scoped),
-            [] => Resolution::None,
-            _ => Resolution::Ambiguous,
-        }
+        self.resolution_from_ids(
+            self.by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .copied(),
+            Confidence::Scoped,
+            |_id, node| node.kind == NodeKind::Method && node.owner_name.as_deref() == Some(owner),
+        )
     }
 
     fn caller_owner(&self, from: NodeId) -> Option<&str> {
@@ -491,67 +542,121 @@ impl SemanticGraph {
         })
     }
 
-    fn resolve_call(&self, file: &str, from: NodeId, call: &RawCall, bindings: &BTreeMap<String, ResolvedBinding>) -> Resolution {
-        let callable = |kind: NodeKind| kind.callable();
+    fn resolve_call(
+        &self,
+        file: &str,
+        from: NodeId,
+        call: &RawCall,
+        bindings: &BTreeMap<String, ResolvedBinding>,
+    ) -> Resolution {
+        let callable = |kind: NodeKind| kind.bare_callable();
         if let Some(receiver) = call.receiver.as_deref() {
-            if let Resolution::One(id, confidence) = self.imported_resolution(receiver, Some(&call.name), bindings, callable) { return Resolution::One(id, confidence); }
-            if matches!(self.imported_resolution(receiver, Some(&call.name), bindings, callable), Resolution::Ambiguous) { return Resolution::Ambiguous; }
+            match self.imported_resolution(receiver, Some(&call.name), bindings, callable) {
+                Resolution::One(id, confidence) => return Resolution::One(id, confidence),
+                Resolution::Ambiguous => return Resolution::Ambiguous,
+                Resolution::None => {}
+            }
             let caller = &self.nodes[from as usize];
-            let receiver_is_self = matches!(receiver, "self" | "this") || caller.receiver_alias.as_deref() == Some(receiver);
+            let receiver_is_self = matches!(receiver, "self" | "this")
+                || caller.receiver_alias.as_deref() == Some(receiver);
             if receiver_is_self {
                 if let Some(owner) = self.caller_owner(from) {
                     let result = self.owner_method(owner, &call.name);
-                    if result != Resolution::None { return result; }
+                    if result != Resolution::None {
+                        return result;
+                    }
                 }
             }
-            let receiver_type = receiver.rsplit(['.', ':']).next().unwrap_or(receiver).trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '$');
+            let receiver_type = receiver
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(receiver)
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '$');
             if !receiver_type.is_empty() {
                 let result = self.owner_method(receiver_type, &call.name);
-                if result != Resolution::None { return result; }
+                if result != Resolution::None {
+                    return result;
+                }
             }
             return Resolution::None;
         }
-        if let Resolution::One(id, confidence) = self.imported_resolution(&call.name, None, bindings, callable) { return Resolution::One(id, confidence); }
-        if matches!(self.imported_resolution(&call.name, None, bindings, callable), Resolution::Ambiguous) { return Resolution::Ambiguous; }
-        let same_file = self.same_file_resolution(file, &call.name, callable);
-        if same_file != Resolution::None { return same_file; }
-        self.unique_resolution(&call.name, callable)
+        match self.imported_resolution(&call.name, None, bindings, callable) {
+            Resolution::One(id, confidence) => return Resolution::One(id, confidence),
+            Resolution::Ambiguous => return Resolution::Ambiguous,
+            Resolution::None => {}
+        }
+        let same_file = self.same_file_resolution(file, from, &call.name, callable);
+        if same_file != Resolution::None {
+            return same_file;
+        }
+        self.package_resolution(file, &call.name, callable)
     }
 
-    fn resolve_type(&self, file: &str, name: &str, bindings: &BTreeMap<String, ResolvedBinding>) -> Resolution {
+    fn resolve_type(
+        &self,
+        file: &str,
+        from: NodeId,
+        name: &str,
+        bindings: &BTreeMap<String, ResolvedBinding>,
+    ) -> Resolution {
         let type_like = |kind: NodeKind| kind.type_like();
-        if let Resolution::One(id, confidence) = self.imported_resolution(name, None, bindings, type_like) { return Resolution::One(id, confidence); }
-        if matches!(self.imported_resolution(name, None, bindings, type_like), Resolution::Ambiguous) { return Resolution::Ambiguous; }
-        let local = self.same_file_resolution(file, name, type_like);
-        if local != Resolution::None { return local; }
-        self.unique_resolution(name, type_like)
+        match self.imported_resolution(name, None, bindings, type_like) {
+            Resolution::One(id, confidence) => return Resolution::One(id, confidence),
+            Resolution::Ambiguous => return Resolution::Ambiguous,
+            Resolution::None => {}
+        }
+        let local = self.same_file_resolution(file, from, name, type_like);
+        if local != Resolution::None {
+            return local;
+        }
+        self.package_resolution(file, name, type_like)
     }
 
-    fn resolve_reference(&self, file: &str, name: &str, bindings: &BTreeMap<String, ResolvedBinding>) -> Resolution {
+    fn resolve_reference(
+        &self,
+        file: &str,
+        from: NodeId,
+        name: &str,
+        bindings: &BTreeMap<String, ResolvedBinding>,
+    ) -> Resolution {
         let any_symbol = |kind: NodeKind| kind != NodeKind::File;
-        if let Resolution::One(id, confidence) = self.imported_resolution(name, None, bindings, any_symbol) { return Resolution::One(id, confidence); }
-        if matches!(self.imported_resolution(name, None, bindings, any_symbol), Resolution::Ambiguous) { return Resolution::Ambiguous; }
-        let local = self.same_file_resolution(file, name, any_symbol);
-        if local != Resolution::None { return local; }
-        self.unique_resolution(name, any_symbol)
+        match self.imported_resolution(name, None, bindings, any_symbol) {
+            Resolution::One(id, confidence) => return Resolution::One(id, confidence),
+            Resolution::Ambiguous => return Resolution::Ambiguous,
+            Resolution::None => {}
+        }
+        let local = self.same_file_resolution(file, from, name, any_symbol);
+        if local != Resolution::None {
+            return local;
+        }
+        self.package_resolution(file, name, any_symbol)
     }
 
-    pub fn nodes(&self) -> &[SemanticNode] { &self.nodes }
+    #[cfg(test)]
     pub fn edges(&self) -> &[SemanticEdge] { &self.edges }
+    #[cfg(test)]
     pub fn diagnostics(&self) -> &GraphDiagnostics { &self.diagnostics }
     pub fn node(&self, id: NodeId) -> Option<&SemanticNode> { self.nodes.get(id as usize) }
+
+    pub fn file_path(&self, id: NodeId) -> Option<&str> {
+        let node = self.nodes.get(id as usize)?;
+        let file = self.nodes.get(node.file_id as usize)?;
+        (file.kind == NodeKind::File).then_some(file.qualified_name.as_str())
+    }
+
+    pub fn edge_file_path(&self, edge: &SemanticEdge) -> Option<&str> {
+        self.file_path(edge.from)
+    }
 
     pub fn logical_bytes(&self) -> usize {
         let mut bytes = std::mem::size_of::<Self>();
         for node in &self.nodes {
             bytes = bytes.saturating_add(std::mem::size_of::<SemanticNode>())
                 .saturating_add(node.name.len()).saturating_add(node.qualified_name.len())
-                .saturating_add(node.file.len()).saturating_add(node.evidence.len())
                 .saturating_add(node.owner_name.as_ref().map_or(0, String::len))
                 .saturating_add(node.receiver_alias.as_ref().map_or(0, String::len));
         }
         bytes = bytes.saturating_add(self.edges.len().saturating_mul(std::mem::size_of::<SemanticEdge>()));
-        for edge in &self.edges { bytes = bytes.saturating_add(edge.file.len()); }
         bytes
     }
 
@@ -562,7 +667,7 @@ impl SemanticGraph {
                 for &id in found {
                     if self.nodes[id as usize].kind == NodeKind::File { continue; }
                     if let Some(filter) = file_filter {
-                        let file = &self.nodes[id as usize].file;
+                        let Some(file) = self.file_path(id) else { continue; };
                         if file != filter && !file.ends_with(filter) { continue; }
                     }
                     ids.insert(id);
@@ -601,7 +706,7 @@ impl SemanticGraph {
                     let next = if incoming { edge.from } else { edge.to };
                     if !visited.insert(next) { continue; }
                     let next_depth = current_depth + 1;
-                    result.push(TraversalStep { root, node: next, via: edge.kind, depth: next_depth, file: edge.file.clone(), line: edge.line, column: edge.column });
+                    result.push(TraversalStep { root, node: next, via: edge.kind, depth: next_depth, line: edge.line, column: edge.column });
                     if result.len() >= max_nodes { return result; }
                     queue.push_back((next, next_depth));
                 }
@@ -628,7 +733,7 @@ impl SemanticGraph {
             out.insert(id);
             let node = &self.nodes[id as usize];
             if node.kind == NodeKind::File {
-                if let Some(file_ids) = self.by_file.get(&node.file) { out.extend(file_ids.iter().copied()); }
+                if let Some(file_ids) = self.by_file.get(&node.qualified_name) { out.extend(file_ids.iter().copied()); }
             }
         }
         out.into_iter().collect()
@@ -672,10 +777,10 @@ impl SemanticGraph {
         chain.reverse();
         let mut out = Vec::new();
         for (i, &node) in chain.iter().enumerate() {
-            if i == 0 { out.push(PathHop { node, via: None, file: None, line: 0, column: 0 }); }
+            if i == 0 { out.push(PathHop { node, via: None, line: 0, column: 0 }); }
             else {
                 let (_, index) = previous[&node]; let edge = &self.edges[index];
-                out.push(PathHop { node, via: Some(edge.kind), file: Some(edge.file.clone()), line: edge.line, column: edge.column });
+                out.push(PathHop { node, via: Some(edge.kind), line: edge.line, column: edge.column });
             }
         }
         Some(out)
@@ -695,7 +800,7 @@ mod tests {
             let full = dir.path().join(path); fs::create_dir_all(full.parent().unwrap()).unwrap(); fs::write(full, source).unwrap();
         }
         let index = scan_root(dir.path(), &ScanConfig::default()).expect("index");
-        index.semantic_graph().clone()
+        index.semantic_graph().expect("semantic graph").clone()
     }
 
     #[test]
@@ -708,11 +813,11 @@ mod tests {
         let run = g.select_symbols("run", None)[0];
         let callees = g.callees(&[run], 1, 20);
         assert_eq!(callees.len(), 1);
-        assert_eq!(g.node(callees[0].node).unwrap().file, "src/a.ts");
+        assert_eq!(g.file_path(callees[0].node).unwrap(), "src/a.ts");
     }
 
     #[test]
-    fn ambiguous_bare_call_creates_no_edge() {
+    fn cross_module_bare_call_creates_no_edge() {
         let g = graph(&[
             ("a.ts", "export function save() {}\n"),
             ("b.ts", "export function save() {}\n"),
@@ -720,7 +825,7 @@ mod tests {
         ]);
         let run = g.select_symbols("run", None)[0];
         assert!(g.callees(&[run], 1, 20).is_empty());
-        assert!(g.diagnostics().ambiguous_relationships > 0);
+        assert!(g.diagnostics().unresolved_calls > 0);
     }
 
     #[test]
@@ -730,6 +835,38 @@ mod tests {
         let callees = g.callees(&[run], 1, 20);
         assert_eq!(callees.len(), 1);
         assert_eq!(g.node(callees[0].node).unwrap().qualified_name, "A::finish");
+    }
+
+    #[test]
+    fn bare_call_does_not_bind_to_unrelated_method() {
+        let g = graph(&[(
+            "a.ts",
+            "class Store { save() {} }\nexport function run(){ save(); }\n",
+        )]);
+        let run = g.select_symbols("run", None)[0];
+        assert!(g.callees(&[run], 1, 20).is_empty());
+    }
+
+    #[test]
+    fn bare_call_does_not_escape_another_lexical_scope() {
+        let g = graph(&[(
+            "a.ts",
+            "function owner(){ function hidden(){} }\nexport function run(){ hidden(); }\n",
+        )]);
+        let run = g.select_symbols("run", None)[0];
+        assert!(g.callees(&[run], 1, 20).is_empty());
+    }
+
+    #[test]
+    fn sibling_nested_functions_share_their_parent_scope() {
+        let g = graph(&[(
+            "a.ts",
+            "function outer(){ function a(){ b(); } function b(){} a(); }\n",
+        )]);
+        let a = g.select_symbols("a", None)[0];
+        let callees = g.callees(&[a], 1, 20);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(g.node(callees[0].node).unwrap().name, "b");
     }
 
     #[test]
@@ -750,7 +887,7 @@ mod tests {
         let run = g.select_symbols("run", None)[0];
         let steps = g.callees(&[run], 1, 20);
         assert_eq!(steps.len(), 1);
-        assert_eq!(g.node(steps[0].node).unwrap().file, "util.py");
+        assert_eq!(g.file_path(steps[0].node).unwrap(), "util.py");
     }
 
     #[test]
@@ -762,7 +899,20 @@ mod tests {
         let run = g.select_symbols("run", None)[0];
         let steps = g.callees(&[run], 1, 20);
         assert_eq!(steps.len(), 1);
-        assert_eq!(g.node(steps[0].node).unwrap().file, "src/util.rs");
+        assert_eq!(g.file_path(steps[0].node).unwrap(), "src/util.rs");
+    }
+
+    #[test]
+    fn go_same_package_bare_call_resolves_across_files() {
+        let g = graph(&[
+            ("go.mod", "module example.com/qcfixture\n\ngo 1.24\n"),
+            ("a.go", "package main\nfunc Save() {}\n"),
+            ("b.go", "package main\nfunc Run(){ Save() }\n"),
+        ]);
+        let run = g.select_symbols("Run", None)[0];
+        let steps = g.callees(&[run], 1, 20);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(g.node(steps[0].node).unwrap().name, "Save");
     }
 
     #[test]
@@ -775,7 +925,7 @@ mod tests {
         let run = g.select_symbols("Run", None)[0];
         let steps = g.callees(&[run], 1, 20);
         assert_eq!(steps.len(), 1);
-        assert_eq!(g.node(steps[0].node).unwrap().file, "util/util.go");
+        assert_eq!(g.file_path(steps[0].node).unwrap(), "util/util.go");
     }
 
     #[test]
@@ -800,6 +950,6 @@ mod tests {
         assert_eq!(g.select_symbols("save", None).len(), 2);
         let only_a = g.select_symbols("save", Some("a.ts"));
         assert_eq!(only_a.len(), 1);
-        assert_eq!(g.node(only_a[0]).unwrap().file, "a.ts");
+        assert_eq!(g.file_path(only_a[0]).unwrap(), "a.ts");
     }
 }

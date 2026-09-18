@@ -38,6 +38,13 @@ impl LookupOperation {
         }
     }
 
+    pub fn is_semantic(self) -> bool {
+        matches!(
+            self,
+            Self::Refs | Self::Callers | Self::Callees | Self::Impact | Self::Deps | Self::Dependents | Self::Path
+        )
+    }
+
     fn requires_query(self) -> bool {
         !matches!(self, Self::Map)
     }

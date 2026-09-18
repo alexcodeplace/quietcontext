@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
 
@@ -25,13 +26,10 @@ pub struct ExtractedSymbol {
     pub end_byte: usize,
     pub start_line: usize,
     pub start_column: usize,
-    pub end_line: usize,
-    pub end_column: usize,
     pub owner_hint: Option<String>,
     pub receiver_alias: Option<String>,
     pub enclosing: Option<usize>,
     pub qualified_name: String,
-    pub evidence: String,
 }
 
 #[derive(Clone, Debug)]
@@ -75,12 +73,11 @@ pub struct RawTypeRelation {
 
 #[derive(Clone, Debug)]
 pub struct RawReference {
-    pub name: String,
     pub enclosing: Option<usize>,
     pub line: usize,
     pub column: usize,
-    pub start_byte: usize,
-    pub end_byte: usize,
+    pub start_byte: u32,
+    pub end_byte: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -91,6 +88,43 @@ pub struct ExtractedFile {
     pub type_relations: Vec<RawTypeRelation>,
     pub references: Vec<RawReference>,
     pub parse_had_error: bool,
+}
+
+impl ExtractedFile {
+    pub fn logical_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(self.symbols.capacity().saturating_mul(std::mem::size_of::<ExtractedSymbol>()))
+            .saturating_add(self.imports.capacity().saturating_mul(std::mem::size_of::<RawImport>()))
+            .saturating_add(self.calls.capacity().saturating_mul(std::mem::size_of::<RawCall>()))
+            .saturating_add(self.type_relations.capacity().saturating_mul(std::mem::size_of::<RawTypeRelation>()))
+            .saturating_add(self.references.capacity().saturating_mul(std::mem::size_of::<RawReference>()));
+        for symbol in &self.symbols {
+            bytes = bytes
+                .saturating_add(symbol.name.capacity())
+                .saturating_add(symbol.qualified_name.capacity())
+                .saturating_add(symbol.owner_hint.as_ref().map_or(0, String::capacity))
+                .saturating_add(symbol.receiver_alias.as_ref().map_or(0, String::capacity));
+        }
+        for import in &self.imports {
+            bytes = bytes
+                .saturating_add(import.module.capacity())
+                .saturating_add(import.bindings.capacity().saturating_mul(std::mem::size_of::<ImportBinding>()));
+            for binding in &import.bindings {
+                bytes = bytes
+                    .saturating_add(binding.local.capacity())
+                    .saturating_add(binding.imported.as_ref().map_or(0, String::capacity));
+            }
+        }
+        for call in &self.calls {
+            bytes = bytes
+                .saturating_add(call.name.capacity())
+                .saturating_add(call.receiver.as_ref().map_or(0, String::capacity));
+        }
+        for relation in &self.type_relations {
+            bytes = bytes.saturating_add(relation.target.capacity());
+        }
+        bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,19 +184,6 @@ fn identifier_name(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn evidence(node: Node<'_>, source: &str) -> String {
-    source
-        .get(node.byte_range())
-        .unwrap_or_default()
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(180)
-        .collect()
-}
-
 fn owner_hint_from_ancestor(mut node: Node<'_>, source: &str, language: SourceLanguage) -> Option<String> {
     while let Some(parent) = node.parent() {
         match (language, parent.kind()) {
@@ -212,7 +233,6 @@ fn symbol_for(node: Node<'_>, source: &str, language: SourceLanguage) -> Vec<Ext
         let (name_start_byte, name_end_byte) = name_node
             .map(|n| (n.start_byte(), n.end_byte()))
             .unwrap_or((span.start_byte(), span.start_byte().saturating_add(name.len())));
-        let end = span.end_position();
         out.push(ExtractedSymbol {
             name: name.clone(),
             kind: symbol_kind,
@@ -222,13 +242,10 @@ fn symbol_for(node: Node<'_>, source: &str, language: SourceLanguage) -> Vec<Ext
             end_byte: span.end_byte(),
             start_line: start.row + 1,
             start_column: start.column + 1,
-            end_line: end.row + 1,
-            end_column: end.column + 1,
             owner_hint,
             receiver_alias,
             enclosing: None,
             qualified_name: name,
-            evidence: evidence(span, source),
         });
     };
 
@@ -315,66 +332,96 @@ fn symbol_for(node: Node<'_>, source: &str, language: SourceLanguage) -> Vec<Ext
     out
 }
 
-fn walk_symbols(node: Node<'_>, source: &str, language: SourceLanguage, symbols: &mut Vec<ExtractedSymbol>) {
-    symbols.extend(symbol_for(node, source, language));
+fn type_owner(symbols: &[ExtractedSymbol], mut enclosing: Option<usize>) -> Option<usize> {
+    while let Some(index) = enclosing {
+        let symbol = symbols.get(index)?;
+        if matches!(
+            symbol.kind,
+            ExtractedKind::Class
+                | ExtractedKind::Interface
+                | ExtractedKind::Struct
+                | ExtractedKind::Trait
+        ) {
+            return Some(index);
+        }
+        enclosing = symbol.enclosing;
+    }
+    None
+}
+
+fn qualified_name(
+    name: &str,
+    owner_hint: Option<&str>,
+    symbols: &[ExtractedSymbol],
+    mut enclosing: Option<usize>,
+) -> String {
+    let mut names = vec![name.to_owned()];
+    while let Some(index) = enclosing {
+        let Some(symbol) = symbols.get(index) else { break; };
+        if matches!(
+            symbol.kind,
+            ExtractedKind::Class
+                | ExtractedKind::Interface
+                | ExtractedKind::Struct
+                | ExtractedKind::Trait
+        ) {
+            names.push(symbol.name.clone());
+        }
+        enclosing = symbol.enclosing;
+    }
+    if names.len() == 1 {
+        if let Some(owner) = owner_hint {
+            if owner != name {
+                names.push(owner.to_owned());
+            }
+        }
+    }
+    names.reverse();
+    names.join("::")
+}
+
+fn walk_symbols(
+    node: Node<'_>,
+    source: &str,
+    language: SourceLanguage,
+    symbols: &mut Vec<ExtractedSymbol>,
+    declaration_name_spans: &mut HashSet<(usize, usize)>,
+    enclosing: Option<usize>,
+) {
+    let mut child_enclosing = enclosing;
+    for mut symbol in symbol_for(node, source, language) {
+        symbol.enclosing = enclosing;
+        if symbol.owner_hint.is_none() {
+            if let Some(owner) = type_owner(symbols, enclosing) {
+                symbol.owner_hint = Some(symbols[owner].name.clone());
+                if symbol.kind == ExtractedKind::Function {
+                    symbol.kind = ExtractedKind::Method;
+                }
+            }
+        }
+        symbol.qualified_name = qualified_name(
+            &symbol.name,
+            symbol.owner_hint.as_deref(),
+            symbols,
+            enclosing,
+        );
+        declaration_name_spans.insert((symbol.name_start_byte, symbol.name_end_byte));
+        let index = symbols.len();
+        symbols.push(symbol);
+        child_enclosing = Some(index);
+    }
+
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_symbols(child, source, language, symbols);
+        walk_symbols(
+            child,
+            source,
+            language,
+            symbols,
+            declaration_name_spans,
+            child_enclosing,
+        );
     }
-}
-
-fn finalize_symbol_ownership(symbols: &mut [ExtractedSymbol]) {
-    let snapshot = symbols.to_vec();
-    for i in 0..symbols.len() {
-        let child = &snapshot[i];
-        let mut best: Option<(usize, usize)> = None;
-        for (j, parent) in snapshot.iter().enumerate() {
-            if i == j || parent.start_byte > child.start_byte || parent.end_byte < child.end_byte {
-                continue;
-            }
-            let span = parent.end_byte.saturating_sub(parent.start_byte);
-            if span <= child.end_byte.saturating_sub(child.start_byte) { continue; }
-            if best.map_or(true, |(_, best_span)| span < best_span) { best = Some((j, span)); }
-        }
-        symbols[i].enclosing = best.map(|(j, _)| j);
-        if symbols[i].owner_hint.is_none() {
-            let mut cursor = symbols[i].enclosing;
-            while let Some(j) = cursor {
-                if matches!(snapshot[j].kind, ExtractedKind::Class | ExtractedKind::Interface | ExtractedKind::Struct | ExtractedKind::Trait) {
-                    symbols[i].owner_hint = Some(snapshot[j].name.clone());
-                    if symbols[i].kind == ExtractedKind::Function { symbols[i].kind = ExtractedKind::Method; }
-                    break;
-                }
-                cursor = snapshot[j].enclosing;
-            }
-        }
-    }
-    for i in 0..symbols.len() {
-        let mut names = vec![symbols[i].name.clone()];
-        let mut cursor = symbols[i].enclosing;
-        while let Some(j) = cursor {
-            if matches!(symbols[j].kind, ExtractedKind::Class | ExtractedKind::Interface | ExtractedKind::Struct | ExtractedKind::Trait) {
-                names.push(symbols[j].name.clone());
-            }
-            cursor = symbols[j].enclosing;
-        }
-        if names.len() == 1 {
-            if let Some(owner) = symbols[i].owner_hint.as_ref() {
-                if owner != &symbols[i].name { names.push(owner.clone()); }
-            }
-        }
-        names.reverse();
-        symbols[i].qualified_name = names.join("::");
-    }
-}
-
-fn nearest_symbol(symbols: &[ExtractedSymbol], byte: usize) -> Option<usize> {
-    symbols
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.start_byte <= byte && byte < s.end_byte)
-        .min_by_key(|(_, s)| s.end_byte.saturating_sub(s.start_byte))
-        .map(|(i, _)| i)
 }
 
 fn strip_string_literal(value: &str) -> String {
@@ -521,9 +568,14 @@ fn descendant_identifiers(node: Node<'_>, source: &str, out: &mut Vec<String>) {
     for child in node.named_children(&mut cursor) { descendant_identifiers(child, source, out); }
 }
 
-fn extract_type_relations(node: Node<'_>, source: &str, language: SourceLanguage, symbols: &[ExtractedSymbol], out: &mut Vec<RawTypeRelation>) {
-    let source_symbol = symbols.iter().enumerate().find(|(_, s)| s.start_byte == node.start_byte() && s.end_byte == node.end_byte()).map(|(i, _)| i);
-    let Some(source_symbol) = source_symbol else { return; };
+fn extract_type_relations(
+    node: Node<'_>,
+    source: &str,
+    language: SourceLanguage,
+    symbols: &[ExtractedSymbol],
+    source_symbol: usize,
+    out: &mut Vec<RawTypeRelation>,
+) {
     match language {
         SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx => {
             let mut cursor = node.walk();
@@ -559,26 +611,34 @@ fn rust_impl_relation(node: Node<'_>, source: &str, symbols: &[ExtractedSymbol],
     }
 }
 
-fn node_is_inside_import(mut node: Node<'_>, language: SourceLanguage) -> bool {
-    while let Some(parent) = node.parent() {
-        let k = parent.kind();
-        let yes = match language {
-            SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx => k == "import_statement",
-            SourceLanguage::Python => matches!(k, "import_statement" | "import_from_statement"),
-            SourceLanguage::Rust => k == "use_declaration",
-            SourceLanguage::Go => matches!(k, "import_declaration" | "import_spec"),
-        };
-        if yes { return true; }
-        node = parent;
+fn is_import_node(language: SourceLanguage, kind: &str) -> bool {
+    match language {
+        SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx => {
+            kind == "import_statement"
+        }
+        SourceLanguage::Python => matches!(kind, "import_statement" | "import_from_statement"),
+        SourceLanguage::Rust => kind == "use_declaration",
+        SourceLanguage::Go => matches!(kind, "import_declaration" | "import_spec"),
     }
-    false
 }
 
-fn is_declaration_name(node: Node<'_>, symbols: &[ExtractedSymbol]) -> bool {
-    symbols.iter().any(|s| node.start_byte() == s.name_start_byte && node.end_byte() == s.name_end_byte)
-}
+fn walk_facts(
+    node: Node<'_>,
+    source: &str,
+    language: SourceLanguage,
+    symbols: &[ExtractedSymbol],
+    symbol_spans: &HashMap<(usize, usize), usize>,
+    declaration_name_spans: &HashSet<(usize, usize)>,
+    enclosing: Option<usize>,
+    inside_import: bool,
+    out: &mut ExtractedFile,
+) {
+    let own_symbol = symbol_spans
+        .get(&(node.start_byte(), node.end_byte()))
+        .copied();
+    let current_enclosing = own_symbol.or(enclosing);
+    let inside_import = inside_import || is_import_node(language, node.kind());
 
-fn walk_facts(node: Node<'_>, source: &str, language: SourceLanguage, symbols: &[ExtractedSymbol], out: &mut ExtractedFile) {
     match (language, node.kind()) {
         (SourceLanguage::JavaScript | SourceLanguage::TypeScript | SourceLanguage::Tsx, "import_statement") => {
             if let Some(import) = parse_js_import(node, source) { out.imports.push(import); }
@@ -593,30 +653,79 @@ fn walk_facts(node: Node<'_>, source: &str, language: SourceLanguage, symbols: &
 
     let call_like = matches!(node.kind(), "call_expression" | "call" | "new_expression");
     if call_like {
-        let callee = node.child_by_field_name("function").or_else(|| node.child_by_field_name("constructor")).or_else(|| node.named_child(0));
+        let callee = node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor"))
+            .or_else(|| node.named_child(0));
         if let Some(callee) = callee {
             if let Some((receiver, name)) = callee_parts(text(callee, source)) {
                 let p = callee.start_position();
-                out.calls.push(RawCall { name, receiver, enclosing: nearest_symbol(symbols, node.start_byte()), line: p.row + 1, column: p.column + 1 });
+                out.calls.push(RawCall {
+                    name,
+                    receiver,
+                    enclosing: current_enclosing,
+                    line: p.row + 1,
+                    column: p.column + 1,
+                });
             }
         }
     }
 
-    if matches!(node.kind(), "class_declaration" | "abstract_class_declaration" | "interface_declaration" | "class_definition") {
-        extract_type_relations(node, source, language, symbols, &mut out.type_relations);
+    if let Some(source_symbol) = own_symbol {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+                | "class_definition"
+        ) {
+            extract_type_relations(
+                node,
+                source,
+                language,
+                symbols,
+                source_symbol,
+                &mut out.type_relations,
+            );
+        }
     }
-    if language == SourceLanguage::Rust && node.kind() == "impl_item" { rust_impl_relation(node, source, symbols, &mut out.type_relations); }
+    if language == SourceLanguage::Rust && node.kind() == "impl_item" {
+        rust_impl_relation(node, source, symbols, &mut out.type_relations);
+    }
 
-    if matches!(node.kind(), "identifier" | "type_identifier") && !node_is_inside_import(node, language) && !is_declaration_name(node, symbols) {
+    if matches!(node.kind(), "identifier" | "type_identifier")
+        && !inside_import
+        && !declaration_name_spans.contains(&(node.start_byte(), node.end_byte()))
+    {
         let name = text(node, source).trim();
         if !name.is_empty() {
             let p = node.start_position();
-            out.references.push(RawReference { name: name.to_owned(), enclosing: nearest_symbol(symbols, node.start_byte()), line: p.row + 1, column: p.column + 1, start_byte: node.start_byte(), end_byte: node.end_byte() });
+            let Ok(start_byte) = u32::try_from(node.start_byte()) else { return; };
+            let Ok(end_byte) = u32::try_from(node.end_byte()) else { return; };
+            out.references.push(RawReference {
+                enclosing: current_enclosing,
+                line: p.row + 1,
+                column: p.column + 1,
+                start_byte,
+                end_byte,
+            });
         }
     }
 
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) { walk_facts(child, source, language, symbols, out); }
+    for child in node.named_children(&mut cursor) {
+        walk_facts(
+            child,
+            source,
+            language,
+            symbols,
+            symbol_spans,
+            declaration_name_spans,
+            current_enclosing,
+            inside_import,
+            out,
+        );
+    }
 }
 
 pub fn extract(path: &Path, source: &str) -> Option<ExtractedFile> {
@@ -624,12 +733,38 @@ pub fn extract(path: &Path, source: &str) -> Option<ExtractedFile> {
     let mut parser = Parser::new();
     parser.set_language(&language.grammar()).ok()?;
     let tree = parser.parse(source, None)?;
-    let mut out = ExtractedFile { parse_had_error: tree.root_node().has_error(), ..ExtractedFile::default() };
-    walk_symbols(tree.root_node(), source, language, &mut out.symbols);
-    out.symbols.sort_by_key(|s| (s.start_byte, std::cmp::Reverse(s.end_byte)));
-    finalize_symbol_ownership(&mut out.symbols);
-    let symbols = out.symbols.clone();
-    walk_facts(tree.root_node(), source, language, &symbols, &mut out);
+    let mut out = ExtractedFile {
+        parse_had_error: tree.root_node().has_error(),
+        ..ExtractedFile::default()
+    };
+    let mut declaration_name_spans = HashSet::new();
+    walk_symbols(
+        tree.root_node(),
+        source,
+        language,
+        &mut out.symbols,
+        &mut declaration_name_spans,
+        None,
+    );
+    let symbol_spans: HashMap<_, _> = out
+        .symbols
+        .iter()
+        .enumerate()
+        .map(|(index, symbol)| ((symbol.start_byte, symbol.end_byte), index))
+        .collect();
+    let symbols = std::mem::take(&mut out.symbols);
+    walk_facts(
+        tree.root_node(),
+        source,
+        language,
+        &symbols,
+        &symbol_spans,
+        &declaration_name_spans,
+        None,
+        false,
+        &mut out,
+    );
+    out.symbols = symbols;
     Some(out)
 }
 
