@@ -330,6 +330,28 @@ Performance review verdict:
 
 The performance-based DO_NOT_LAND hold is cleared. Full package/native acceptance, main landing, Overdeck pin/hook rollout, and live behavioral canaries remain before the overall plan can become COMPLETE.
 
+
+## Full exact-SHA acceptance receipt
+
+Runtime/test head accepted: `479014bb2483dff81c27a53c90d670ae782f4b2c`.
+
+Authoritative job:
+
+- K3s job: `overdeck-build-build-20260918125908-3071308-31556`
+- node: `debian1`
+- source: exact GitHub branch SHA `479014bb2483dff81c27a53c90d670ae782f4b2c`
+- Rust unit/integration suite: 121/121 passed
+- release native staged/verified: linux-x64 native `0.1.0`, SHA-256 `317ac29205061e87c2857c19e9e9e24661c224ef4e8ef7430b6bd6b25fab834e`
+- production TypeScript/build/bundle/assert-bundle/asymmetric-drift: green
+- package suite with native CLI coverage: 14 files, 93/93 passed
+- focused adoption/session suite: 3 files, 73/73 passed
+- native integration/corpus/HTTP/fidelity: 4 files, 18 passed, 1 platform-specific skip
+- final marker: `QC_ADOPTION_FULL_ACCEPTANCE_OK`
+
+The earlier full-gate failure on `c55d33fd...` was a stale test expectation that incorrectly required semantic callees on a deliberately cold structural `explore`; the runtime behavior was correct. Commit `479014bb...` corrects that test to require the cold-fast contract.
+
+QC implementation acceptance is complete. Remaining work for the overall goal is public-main integration, exact Overdeck pin + additive UserPromptSubmit rollout, local deployment, and live structural/non-structural behavioral canaries.
+
 ## Definition of done
 
 Complete only when the front-load/explore implementation is accepted, landed to QC main, pinned/landed in Overdeck, deployed locally, and a live structural-prompt canary proves QC context is supplied automatically while non-structural prompts remain untouched.
