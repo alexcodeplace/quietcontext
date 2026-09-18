@@ -149,8 +149,9 @@ nativeSuite("qc repo CLI", () => {
     expect(explore.status, explore.stderr).toBe(0);
     expect(explore.stdout).toContain("[qc-explore v1]");
     expect(explore.stdout).toContain("## CliNeedle");
-    expect(explore.stdout).toContain("[callees]");
     expect(explore.stdout).toContain("PersistUser");
+    expect(explore.stdout).toContain("[semantic graph cold:");
+    expect(explore.stdout).not.toContain("[callees]");
 
     const directExplore = runQc(["explore", "trace CliNeedle to PersistUser"], { cwd: project, env });
     expect(directExplore.status, directExplore.stderr).toBe(0);
