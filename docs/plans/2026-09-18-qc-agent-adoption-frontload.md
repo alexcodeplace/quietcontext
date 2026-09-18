@@ -159,7 +159,7 @@ Overdeck:
 
 ## Self-review checkpoint — token efficiency and performance
 
-status: DO_NOT_LAND_CURRENT_IMPLEMENTATION
+status: PERFORMANCE_REVIEW_ACCEPTED
 
 The adoption architecture remains correct, but the first implementation pass is not efficient enough to land unchanged.
 
@@ -276,6 +276,59 @@ Change before landing:
 - zero extra persistent processes
 - public MCP tools/list remains <= 4 KiB and tool count remains 7
 - explicit `repo explore` may return up to 8 KiB because it is agent-requested rather than automatically injected
+
+
+## Optimized rewrite acceptance checkpoint
+
+The rejected multi-process draft was replaced before landing.
+
+Current architecture:
+
+- UserPromptSubmit performs only a cheap local classifier for non-structural prompts.
+- Eligible prompts make one authenticated request to the already-running shared QC HTTP daemon.
+- The MCP `repo action=explore` handler makes one native QC request.
+- Native `Explore` ranks candidates directly from `SourceIndex`; it does not serialize/parse the full textual map through Node.
+- Cold explore is structural-only and deliberately does not materialize the semantic graph.
+- If that generation's semantic graph is already warm, explore reuses it for compact callers/callees/impact without rebuilding it.
+- Automatic context hard cap is 4 KiB.
+- Automatic hook default deadline is 650 ms.
+- Native explore gets a 500 ms daemon request/start budget, preventing the 25 ms ordinary-structural duplicate-scan race.
+- Non-structural prompts perform no telemetry write and no daemon request.
+- Telemetry records only eligible outcomes (injected/no-match/timeout/error), never the prompt body.
+- No Read/Grep denial was added.
+
+Exact feature SHA acceptance before final docs update:
+
+- feature commit: `74b8a01f855624c7d407f44914ff52d0d5843a2f`
+- exact K3s acceptance job: `overdeck-build-build-20260918124230-2971463-16534`, node `debian1`
+- Rust: 121/121 passed
+- production TypeScript/bundle/assert-bundle/asymmetric-drift: green
+- focused adoption/session/token tests: 86/86 passed
+- MCP public surface remains 7 tools; stdio/HTTP tools/list remain byte-identical and <= 4 KiB
+- `repo` carries `anthropic/alwaysLoad` metadata through the shared tools/list compatibility wrapper
+- MCP initialize guidance tells agents to use `action=explore` before exploratory Read/Grep
+
+Production-shaped benchmark job:
+
+- job: `overdeck-build-build-20260918124635-2999403-28584`, node `debian1`
+- build: exact GitHub SHA `74b8a01f...`, release native staged through the normal vendor path, production shared HTTP daemon
+- non-structural hook, n=50: average 0.2 ms, p50 0.1 ms, p95 0.5 ms, max 2.9 ms, 0 injected bytes
+- cold structural first request: 655.9 ms, fail-open, 0 injected bytes
+- warm structural hook, n=20: average 59.9 ms, p50 34.6 ms, p95 41.3 ms, one startup outlier 530.6 ms
+- warm automatic payload: average 1,099 bytes
+- direct native explore, n=20: average 5.4 ms, p50 5.4 ms, p95 5.5 ms
+- benchmark verdict: `QC_ADOPTION_PERF_OK`
+
+Performance review verdict:
+
+- no-op overhead is far below the <=10 ms target
+- warm p95 is far below the <=500 ms target
+- cold path fails open within the <=750 ms hard deadline
+- automatic payload is materially below the <=3.5 KiB target
+- one daemon/native explore request is used per eligible prompt
+- no additional persistent process is introduced
+
+The performance-based DO_NOT_LAND hold is cleared. Full package/native acceptance, main landing, Overdeck pin/hook rollout, and live behavioral canaries remain before the overall plan can become COMPLETE.
 
 ## Definition of done
 
