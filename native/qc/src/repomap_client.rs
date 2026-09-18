@@ -1130,7 +1130,17 @@ mod tests {
             std::process::id()
         ));
         fs::remove_dir_all(&missing).ok();
-        let req = request(&missing, LookupOperation::Explore, Some("Needle"));
+        let req = LookupRequest {
+            version: PROTOCOL_VERSION,
+            operation: LookupOperation::Explore,
+            canonical_root: missing.to_string_lossy().into_owned(),
+            query: Some("Needle".to_owned()),
+            secondary_query: None,
+            file_filter: None,
+            depth: None,
+            max_nodes: None,
+            map_config: EffectiveMapConfig::default(),
+        };
         let outcome = fallback_lookup(
             req,
             FallbackReason::RequestTimeout,
