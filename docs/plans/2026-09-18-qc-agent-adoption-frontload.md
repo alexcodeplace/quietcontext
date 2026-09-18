@@ -387,6 +387,33 @@ Acceptance required before replacing the deployed pin:
 - after daemon warming completes, the same structural prompt injects non-empty bounded QC context
 - non-structural prompt remains a no-op
 
+
+## Daemon-only correction acceptance
+
+Accepted exact source: `eb7507bd2c19fdc2062b45752f236fbe731ab304`.
+
+Authoritative K3s gate:
+
+- job: `overdeck-build-build-20260918151216-4011844-10043`
+- pod: `overdeck-build-build-20260918151216-4011844-10043-vf9kz`
+- node: `debian1`
+- source: exact GitHub branch SHA `eb7507bd2c19fdc2062b45752f236fbe731ab304`
+- Rust: 123/123 passed
+- production TypeScript/bundle/assert-bundle/asymmetric-drift: green
+- focused front-load/session/token suite: 3 files, 26/26 passed
+- public MCP tools/list remains exactly 7 tools, <=4 KiB, and byte-identical over stdio/HTTP
+- final marker: `QC_FRONTLOAD_DAEMON_ONLY_ACCEPTANCE_OK`
+
+Regression contract now proven:
+
+- `QUIET_CONTEXT_REPOMAP_DAEMON_ONLY` activates only for exact value `1`
+- a daemon-only fallback returns a bounded nonzero receipt and does not create/scan a missing root
+- ordinary explicit Explore retains its existing fallback behavior
+- UserPromptSubmit sends the private internal `frontload` action
+- public tool schema remains unchanged; agents still see/use `action=explore`
+
+Remaining acceptance is live large-Overdeck behavior after deploying this exact fix: cold structural front-load must fail open without a foreground direct scan, then warm structural front-load must inject bounded non-empty context.
+
 ## Definition of done
 
 Complete only when the front-load/explore implementation is accepted, landed to QC main, pinned/landed in Overdeck, deployed locally, and a live structural-prompt canary proves QC context is supplied automatically while non-structural prompts remain untouched.
