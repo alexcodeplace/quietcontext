@@ -352,6 +352,41 @@ The earlier full-gate failure on `c55d33fd...` was a stale test expectation that
 
 QC implementation acceptance is complete. Remaining work for the overall goal is public-main integration, exact Overdeck pin + additive UserPromptSubmit rollout, local deployment, and live structural/non-structural behavioral canaries.
 
+
+## Large-repository live regression and daemon-only correction
+
+The first live workstation canary on the real Overdeck repository exposed a cold-root behavior that the smaller benchmark repository did not:
+
+- live QC was correctly deployed at `2e5bbe05...` with native SHA `317ac292...`
+- structural UserPromptSubmit prompts injected zero context
+- explicit `qc repo explore "How does open_session work?" --root ~/Projects/overdeck` exceeded 5–8 seconds
+- process inspection showed the native client had fallen back to a foreground/direct `qc-native repo explore ...` scan while the shared `qc-native --repomap-daemon` independently scanned the same root
+- this duplicated CPU/filesystem work and violated the automatic front-load contract even though the outer hook eventually failed open
+
+Root cause:
+
+- Explore has a 500 ms daemon request/start budget
+- the native client historically treats daemon timeout/unavailability as permission to run `direct_lookup`
+- that fallback is useful for explicit CLI/MCP use, but it is wrong for automatic UserPromptSubmit because a cold large root can outlive the 650 ms hook budget and continue expensive duplicate work after the caller has already moved on
+
+Correction in `feat/qc-frontload-daemon-only-20260918`:
+
+1. add private native env `QUIET_CONTEXT_REPOMAP_DAEMON_ONLY=1`
+2. when that marker is exact `1`, every daemon fallback path returns a bounded nonzero repo receipt instead of running `direct_lookup`
+3. leave ordinary explicit `repo explore` fallback unchanged
+4. add a private MCP source action `frontload` that maps internally to native Explore with daemon-only env; the compact public repo schema remains unchanged and agents are still instructed to use `action=explore`
+5. UserPromptSubmit uses the private `frontload` action
+6. a cold/busy daemon may keep warming the root, but automatic prompt handling never starts a second full scan
+7. tests require exact marker semantics and prove daemon-only fallback does not create/scan a missing root
+
+Acceptance required before replacing the deployed pin:
+
+- Rust + production build + focused front-load/token tests green on exact published SHA
+- public tool count remains 7 and stdio/HTTP tools/list remain byte-identical <=4 KiB
+- real Overdeck cold front-load returns within the hook deadline with no foreground `qc-native repo explore` process
+- after daemon warming completes, the same structural prompt injects non-empty bounded QC context
+- non-structural prompt remains a no-op
+
 ## Definition of done
 
 Complete only when the front-load/explore implementation is accepted, landed to QC main, pinned/landed in Overdeck, deployed locally, and a live structural-prompt canary proves QC context is supplied automatically while non-structural prompts remain untouched.

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const DAEMON_MODE_ARG: &str = "--repomap-daemon";
 pub(crate) const DAEMON_MODE_ENV: &str = "QUIET_CONTEXT_REPOMAP_DAEMON";
+pub(crate) const DAEMON_ONLY_ENV: &str = "QUIET_CONTEXT_REPOMAP_DAEMON_ONLY";
 pub(crate) const SOCKET_REVISION: &str = "v3";
 
 const STARTUP_LOCK_WAIT: Duration = Duration::from_millis(5);
@@ -360,30 +361,77 @@ pub(crate) fn daemon_mode_active() -> bool {
     )
 }
 
+fn daemon_only_active_from(env: Option<std::ffi::OsString>) -> bool {
+    env.is_some_and(|value| value == std::ffi::OsStr::new("1"))
+}
+
+fn daemon_only_active() -> bool {
+    daemon_only_active_from(std::env::var_os(DAEMON_ONLY_ENV))
+}
+
+fn daemon_only_outcome(
+    request: LookupRequest,
+    reason: FallbackReason,
+    started: Instant,
+) -> LookupOutcome {
+    let elapsed = started.elapsed();
+    let response = LookupResponse {
+        version: PROTOCOL_VERSION,
+        status: CacheState::Bypassed,
+        stdout: String::new(),
+        stderr: format!(
+            "qc repo {}: daemon-only lookup unavailable ({})\n",
+            request.operation.as_str(),
+            reason.as_str(),
+        ),
+        exit_code: 1,
+        generation: 0,
+        timings: LookupTimings {
+            total_us: elapsed_us(elapsed),
+            ..LookupTimings::default()
+        },
+    };
+    LookupOutcome::direct(response, reason, elapsed)
+}
+
+fn fallback_lookup(
+    request: LookupRequest,
+    reason: FallbackReason,
+    started: Instant,
+    daemon_only: bool,
+) -> LookupOutcome {
+    if daemon_only {
+        daemon_only_outcome(request, reason, started)
+    } else {
+        direct_lookup(request, reason, started)
+    }
+}
+
 pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutcome {
     let started = Instant::now();
     let budget = budget.for_operation(request.operation);
+    let daemon_only = daemon_only_active();
     if request.validate().is_err() {
-        return direct_lookup(request, FallbackReason::InvalidRequest, started);
+        return fallback_lookup(request, FallbackReason::InvalidRequest, started, daemon_only);
     }
     if daemon_mode_active() {
-        return direct_lookup(request, FallbackReason::DaemonMode, started);
+        return fallback_lookup(request, FallbackReason::DaemonMode, started, daemon_only);
     }
 
     #[cfg(not(unix))]
     {
         let _ = budget;
-        return direct_lookup(request, FallbackReason::UnsupportedPlatform, started);
+        return fallback_lookup(request, FallbackReason::UnsupportedPlatform, started, daemon_only);
     }
 
     #[cfg(unix)]
     {
         let paths = match RuntimePaths::discover() {
             Ok(paths) => paths,
-            Err(_) => return direct_lookup(request, FallbackReason::RuntimeUnavailable, started),
+            Err(_) => return fallback_lookup(request, FallbackReason::RuntimeUnavailable, started, daemon_only),
         };
         if let Err(error) = paths.ensure_private() {
-            return direct_lookup(request, fallback_reason(&error), started);
+            return fallback_lookup(request, fallback_reason(&error), started, daemon_only);
         }
 
         match request_once(
@@ -394,10 +442,10 @@ pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutc
         ) {
             Ok(response) => return LookupOutcome::cached(response, started.elapsed()),
             Err(error) if protocol_timeout(&error) => {
-                return direct_lookup(request, FallbackReason::RequestTimeout, started)
+                return fallback_lookup(request, FallbackReason::RequestTimeout, started, daemon_only)
             }
             Err(error) if terminal_error(&error) => {
-                return direct_lookup(request, fallback_reason(&error), started)
+                return fallback_lookup(request, fallback_reason(&error), started, daemon_only)
             }
             Err(_) => {}
         }
@@ -412,16 +460,16 @@ pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutc
                 ) {
                     Ok(response) => return LookupOutcome::cached(response, started.elapsed()),
                     Err(error) if protocol_timeout(&error) => {
-                        return direct_lookup(request, FallbackReason::RequestTimeout, started)
+                        return fallback_lookup(request, FallbackReason::RequestTimeout, started, daemon_only)
                     }
                     Err(error) if terminal_error(&error) => {
-                        return direct_lookup(request, fallback_reason(&error), started)
+                        return fallback_lookup(request, fallback_reason(&error), started, daemon_only)
                     }
                     Err(_) => {}
                 }
 
                 if let Err(error) = start_daemon() {
-                    return direct_lookup(request, fallback_reason(&error), started);
+                    return fallback_lookup(request, fallback_reason(&error), started, daemon_only);
                 }
 
                 let deadline = Instant::now() + budget.startup_wait;
@@ -434,7 +482,7 @@ pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutc
                         } else {
                             fallback_reason(&error)
                         };
-                        direct_lookup(request, reason, started)
+                        fallback_lookup(request, reason, started, daemon_only)
                     }
                 };
                 drop(lock);
@@ -443,7 +491,7 @@ pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutc
             Err(error) => {
                 let startup_reason = fallback_reason(&error);
                 if terminal_error(&error) && !matches!(error, ClientError::StartupBusy) {
-                    return direct_lookup(request, startup_reason, started);
+                    return fallback_lookup(request, startup_reason, started, daemon_only);
                 }
 
                 let deadline = Instant::now() + budget.startup_wait;
@@ -455,7 +503,7 @@ pub(crate) fn lookup(request: LookupRequest, budget: ClientBudget) -> LookupOutc
                         } else {
                             fallback_reason(&error)
                         };
-                        direct_lookup(request, reason, started)
+                        fallback_lookup(request, reason, started, daemon_only)
                     }
                 }
             }
@@ -1068,12 +1116,45 @@ mod tests {
     }
 
     #[test]
+    fn daemon_only_marker_requires_exact_one() {
+        assert!(daemon_only_active_from(Some(std::ffi::OsString::from("1"))));
+        assert!(!daemon_only_active_from(None));
+        assert!(!daemon_only_active_from(Some(std::ffi::OsString::from("0"))));
+        assert!(!daemon_only_active_from(Some(std::ffi::OsString::from("true"))));
+    }
+
+    #[test]
+    fn daemon_only_fallback_returns_bounded_error_without_scanning() {
+        let missing = std::env::temp_dir().join(format!(
+            "qc-daemon-only-missing-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&missing).ok();
+        let req = request(&missing, LookupOperation::Explore, Some("Needle"));
+        let outcome = fallback_lookup(
+            req,
+            FallbackReason::RequestTimeout,
+            Instant::now(),
+            true,
+        );
+        assert_eq!(outcome.response.exit_code, 1);
+        assert_eq!(outcome.response.status, CacheState::Bypassed);
+        assert!(outcome.response.stdout.is_empty());
+        assert!(outcome.response.stderr.contains("daemon-only lookup unavailable"));
+        assert_eq!(outcome.fallback_reason, Some(FallbackReason::RequestTimeout));
+        assert!(!missing.exists(), "daemon-only fallback must not create or scan the root");
+    }
+
+    #[test]
     fn budget_defaults_are_contract_bounds() {
         let budget = ClientBudget::default();
         assert_eq!(budget.startup_lock_wait, Duration::from_millis(5));
         assert_eq!(budget.existing_connect_wait, Duration::from_millis(2));
         assert_eq!(budget.startup_wait, Duration::from_millis(100));
         assert_eq!(budget.request_wait, Duration::from_millis(25));
+        let explore = budget.for_operation(LookupOperation::Explore);
+        assert_eq!(explore.startup_wait, Duration::from_millis(500));
+        assert_eq!(explore.request_wait, Duration::from_millis(500));
         let semantic = budget.for_operation(LookupOperation::Callers);
         assert_eq!(semantic.startup_wait, Duration::from_secs(30));
         assert_eq!(semantic.request_wait, Duration::from_secs(30));

@@ -1741,7 +1741,7 @@ registerQuietTool(
   {
     title: "Navigate repository structure",
     inputSchema: z.object({
-      action: z.enum(["explore", "map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
+      action: z.enum(["frontload", "explore", "map", "symbol", "references", "outline", "callers", "callees", "impact", "deps", "dependents", "path"]),
       target: z.string().optional(),
       target2: z.string().optional(),
       file: z.string().optional(),
@@ -1775,7 +1775,8 @@ registerQuietTool(
         pathFrom = semanticTarget.slice(0, split).trim();
         pathTo = semanticTarget.slice(split + 4).trim();
       }
-      const request = action === "explore"
+      const isFrontload = action === "frontload";
+      const request = isFrontload || action === "explore"
         ? { action: "explore" as const, query: String(target), root: projectRoot }
         : action === "map"
           ? { action: "map" as const, root: projectRoot }
@@ -1788,9 +1789,13 @@ registerQuietTool(
               : action === "path"
                 ? { action: "path" as const, from: String(pathFrom), to: String(pathTo), root: projectRoot, maxDepth: depth, maxNodes: max_nodes }
                 : { action, query: String(semanticTarget), root: projectRoot, file: semanticFile, depth, maxNodes: max_nodes };
+      const nativeEnv = isFrontload
+        ? { ...process.env, QUIET_CONTEXT_REPOMAP_DAEMON_ONLY: "1" }
+        : process.env;
       const receipt = await repoQcNative(request, {
         cwd: projectRoot,
-        timeoutMs: 5_000,
+        timeoutMs: isFrontload ? 1_200 : 5_000,
+        env: nativeEnv,
       });
       const text = receipt.exitCode === 0 ? receipt.stdout : receipt.stderr || receipt.stdout;
       return trackResponse("repo", {

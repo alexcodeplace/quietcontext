@@ -104,7 +104,7 @@ function tokenFilePath() {
     || resolve(homedir(), ".local", "state", "quietcontext", "daemon.token");
 }
 
-async function daemonExplore(prompt, root, timeoutMs) {
+export async function daemonExplore(prompt, root, timeoutMs) {
   if (process.env.QUIET_CONTEXT_ADOPTION_TEST_MODE === "1" && process.env.QUIET_CONTEXT_FRONTLOAD_TEST_RESPONSE) {
     return process.env.QUIET_CONTEXT_FRONTLOAD_TEST_RESPONSE;
   }
@@ -126,7 +126,7 @@ async function daemonExplore(prompt, root, timeoutMs) {
       },
       body: JSON.stringify({
         jsonrpc: "2.0", id: 1, method: "tools/call",
-        params: { name: "repo", arguments: { action: "explore", target: String(prompt).slice(0, 1200) } },
+        params: { name: "repo", arguments: { action: "frontload", target: String(prompt).slice(0, 1200) } },
       }),
     });
     if (!response.ok) return "";

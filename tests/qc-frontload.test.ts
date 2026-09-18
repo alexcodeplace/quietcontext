@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const mod = await import(pathToFileURL(join(process.cwd(), "hooks", "qc-frontload.mjs")).href);
-const { shouldFrontloadPrompt, resolveSafeFrontloadRoot, frontloadPromptContext } = mod;
+const { shouldFrontloadPrompt, resolveSafeFrontloadRoot, frontloadPromptContext, daemonExplore } = mod;
 
 const oldEnv = { ...process.env };
 afterEach(() => {
@@ -33,6 +33,37 @@ describe("QC prompt front-load", () => {
       mkdirSync(child);
       expect(resolveSafeFrontloadRoot(child)).toBe(root);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("daemon request marks explore as private front-load mode", async () => {
+    const root = mkdtempSync(join(tmpdir(), "qc-frontload-wire-"));
+    const tokenFile = join(root, "token");
+    const oldFetch = globalThis.fetch;
+    try {
+      writeFileSync(tokenFile, "synthetic-token\n");
+      process.env.QUIET_CONTEXT_DAEMON_TOKEN_FILE = tokenFile;
+      process.env.QUIET_CONTEXT_DAEMON_PORT = "48619";
+      let body: any = null;
+      globalThis.fetch = (async (_url: any, init: any) => {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: "[qc-explore v1] ok" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch;
+
+      const out = await daemonExplore("How does login work?", root, 500);
+      expect(out).toContain("[qc-explore v1]");
+      expect(body?.params?.name).toBe("repo");
+      expect(body?.params?.arguments).toEqual({
+        action: "frontload",
+        target: "How does login work?",
+      });
+    } finally {
+      globalThis.fetch = oldFetch;
       rmSync(root, { recursive: true, force: true });
     }
   });
