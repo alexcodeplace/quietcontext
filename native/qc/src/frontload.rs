@@ -512,7 +512,7 @@ fn read_live(root: &Path, relative: &str) -> Result<String, FrontloadError> {
         return Err(FrontloadError::Io("unsafe cached path".to_owned()));
     }
     let path = root.join(relative_path);
-    let mut file = open_live(&path)?;
+    let file = open_live(&path)?;
     let metadata = file.metadata().map_err(|e| FrontloadError::Io(e.to_string()))?;
     if !metadata.is_file() || metadata.len() > MAX_LIVE_FILE_BYTES as u64 {
         return Err(FrontloadError::Io("cached source is unavailable or oversized".to_owned()));
@@ -645,8 +645,9 @@ mod tests {
     fn terms_extract_symbol_parts() {
         let got = terms("How does AuthService.open_session work?");
         assert!(got.contains(&"authservice.open_session".to_owned()));
-        assert!(got.contains(&"open_session".to_owned()));
+        assert!(got.contains(&"open".to_owned()));
         assert!(got.contains(&"session".to_owned()));
+        assert!(terms("How does open_session work?").contains(&"open_session".to_owned()));
     }
 
     #[test]
