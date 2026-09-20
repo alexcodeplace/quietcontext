@@ -188,6 +188,14 @@ await runHook(async () => {
     const input = parseStdin(raw);
     const source = input.source ?? "startup";
 
+    // Start the lightweight repository declaration cache before the first
+    // structural prompt. The request itself is bounded/fail-open; cache build
+    // continues in a detached native process when needed.
+    try {
+      const { warmFrontloadCache } = await import("./qc-frontload.mjs");
+      await warmFrontloadCache(getInputProjectDir(input));
+    } catch { /* best effort, never block session start */ }
+
     if (source === "compact") {
       // Session was compacted — write events to file for auto-indexing, inject directive only
       const { SessionDB } = await loadSessionDB();

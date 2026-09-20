@@ -144,6 +144,19 @@ export async function daemonExplore(prompt, root, timeoutMs) {
   }
 }
 
+export async function warmFrontloadCache(projectDir, options = {}) {
+  if (process.env.QUIET_CONTEXT_NO_PROMPT_HOOK === "1" || process.env.QUIET_CONTEXT_FRONTLOAD_DISABLE === "1") return;
+  const root = resolveSafeFrontloadRoot(projectDir);
+  if (!root) return;
+  const timeoutMs = Math.max(100, Math.min(Number(options.timeoutMs ?? 350), 1000));
+  try {
+    const requestExplore = options.requestExplore ?? daemonExplore;
+    await requestExplore("__qc_session_warm__", root, timeoutMs);
+  } catch {
+    // Cache warming is best-effort and must never delay or block SessionStart.
+  }
+}
+
 export async function frontloadPromptContext(prompt, projectDir, options = {}) {
   const started = Date.now();
   if (process.env.QUIET_CONTEXT_NO_PROMPT_HOOK === "1" || process.env.QUIET_CONTEXT_FRONTLOAD_DISABLE === "1") return "";

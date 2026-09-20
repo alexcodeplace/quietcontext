@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const mod = await import(pathToFileURL(join(process.cwd(), "hooks", "qc-frontload.mjs")).href);
-const { shouldFrontloadPrompt, resolveSafeFrontloadRoot, frontloadPromptContext, daemonExplore } = mod;
+const { shouldFrontloadPrompt, resolveSafeFrontloadRoot, frontloadPromptContext, daemonExplore, warmFrontloadCache } = mod;
 
 const oldEnv = { ...process.env };
 afterEach(() => {
@@ -64,6 +64,25 @@ describe("QC prompt front-load", () => {
       });
     } finally {
       globalThis.fetch = oldFetch;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("SessionStart prewarm triggers cache build without structural classification", async () => {
+    const root = mkdtempSync(join(tmpdir(), "qc-frontload-prewarm-"));
+    try {
+      writeFileSync(join(root, "package.json"), "{}");
+      let calls = 0;
+      await warmFrontloadCache(root, {
+        requestExplore: async (prompt: string, resolvedRoot: string) => {
+          calls += 1;
+          expect(prompt).toBe("__qc_session_warm__");
+          expect(resolvedRoot).toBe(root);
+          return "";
+        },
+      });
+      expect(calls).toBe(1);
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });

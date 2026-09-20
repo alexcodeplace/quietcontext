@@ -414,6 +414,41 @@ Regression contract now proven:
 
 Remaining acceptance is live large-Overdeck behavior after deploying this exact fix: cold structural front-load must fail open without a foreground direct scan, then warm structural front-load must inject bounded non-empty context.
 
+
+## Large-repository persistent front-load cache
+
+The daemon-only safety correction eliminated duplicate scans but live Overdeck acceptance still showed that a full repository structural generation is too expensive for automatic prompt use:
+
+- one shared repomap daemon remained the only scanner, proving duplicate foreground fallback was fixed
+- on Overdeck the full structural generation still required minutes, so warm front-load could not meet the user-facing adoption goal
+- filesystem content scans and Git content grep were also too slow in this VM (roughly 1–3+ seconds)
+
+Final hot-path design:
+
+1. private automatic `frontload` no longer depends on the full repomap generation
+2. a root-scoped declaration cache is persisted under the existing QC native state directory
+3. cache build enumerates tracked source blobs from Git's index and streams content through one `git cat-file --batch` process, parsing declarations once
+4. first cache miss returns `cache warming` immediately and starts exactly one detached builder under a root-scoped lock
+5. cache entries store only file path, declaration name and line; query ranking is in-memory after loading the compact cache
+6. selected candidates are revalidated against the current working-tree file before source is injected, so ordinary tracked-file edits use live bytes
+7. stale caches remain usable while a bounded background refresh runs; brand-new untracked symbols may fail open until explicit exploration or a later rebuild
+8. SessionStart triggers a best-effort prewarm so the cache build normally begins before the first structural user prompt
+9. explicit `repo explore` and semantic graph behavior are unchanged
+
+Exact source benchmark before SessionStart prewarm:
+
+- source: `8ea103d690228223f69a8bd5ab467314d19e5374`
+- K3s gate: Rust 131/131; production build/bundles green; front-load/session/token tests 26/26
+- staged native SHA: `9f7471105bc8ad0f7974b8f87fc49f8a794565207ad4cc95d78f849d07a30ec2`
+- real Overdeck cache-miss request: 50 ms; returned bounded `cache warming` receipt and spawned one background builder
+- real Overdeck cache build: ready after ~8 seconds
+- persisted cache size: ~1.63 MiB
+- real Overdeck cache-hit benchmark, n=12: average 85.5 ms, p50 77.5 ms, p95-ish 98.4 ms, max 146.6 ms
+- automatic context sample: 1,022 bytes and selected the real `open_session` declaration with live source
+- target remains <=600 ms server-side and <=650 ms hook-side; cache-hit measurements have large margin
+
+Final acceptance must rerun after SessionStart prewarm and dead-code cleanup, then deploy the exact accepted cache-backed runtime and repeat live cold/warm/noop canaries.
+
 ## Definition of done
 
 Complete only when the front-load/explore implementation is accepted, landed to QC main, pinned/landed in Overdeck, deployed locally, and a live structural-prompt canary proves QC context is supplied automatically while non-structural prompts remain untouched.
