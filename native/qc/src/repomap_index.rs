@@ -1,5 +1,5 @@
 use crate::config::MapConfig;
-use crate::outline::{self, Family};
+use crate::outline;
 use crate::semantic::SemanticGraph;
 use crate::semantic_extract::{self, ExtractedFile};
 use ignore::WalkBuilder;
@@ -245,7 +245,6 @@ pub struct SourceRecord {
     pub relative_path: String,
     pub source: Arc<str>,
     pub lines: Arc<[LineMetadata]>,
-    pub family: Family,
     pub declarations: Arc<[DeclarationPosting]>,
     semantic_facts: Arc<OnceLock<Option<Arc<ExtractedFile>>>>,
 }
@@ -1104,7 +1103,6 @@ fn source_record(
             relative_path: relative_path.clone(),
             lines: lines(&source).into(),
             source: Arc::from(source),
-            family,
             declarations: postings.into(),
             semantic_facts: Arc::new(OnceLock::new()),
         },
@@ -1225,7 +1223,6 @@ fn build_index(
                     relative_path: rel.clone(),
                     lines: lines(&source).into(),
                     source: Arc::from(source),
-                    family,
                     declarations: postings.into(),
                     semantic_facts: Arc::new(OnceLock::new()),
                 });
