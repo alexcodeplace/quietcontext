@@ -449,6 +449,48 @@ Exact source benchmark before SessionStart prewarm:
 
 Final acceptance must rerun after SessionStart prewarm and dead-code cleanup, then deploy the exact accepted cache-backed runtime and repeat live cold/warm/noop canaries.
 
+
+## Final cache-backed acceptance
+
+Accepted runtime/source commit: `64b726a2cc8dde479eaef5e65b0a9d466e55c46d`.
+
+Authoritative exact-SHA K3s gate:
+
+- job: `overdeck-build-build-20260920092919-1866328-18831`
+- node: `debian1`
+- source: exact GitHub SHA `64b726a2cc8dde479eaef5e65b0a9d466e55c46d`
+- Rust: 128/128 passed
+- release native stage + verify: green
+- production TypeScript/bundle/assert-bundle/asymmetric-drift: green
+- package suite: 14 files, 93/93 passed
+- focused front-load/session/token suite: 3 files, 27/27 passed
+- native integration/corpus/HTTP/fidelity: 18 passed, 1 platform-specific skip
+- public MCP surface remains exactly 7 tools; tools/list remains <=4 KiB and byte-identical over stdio/HTTP
+- final marker: `QC_FRONTLOAD_FINAL_ACCEPTANCE_OK`
+- release native SHA-256: `47880da2d72995eb8a84e63b161c38215f8402edaa2aa0b76ec33c4403f98c45`
+
+Real Overdeck benchmark using that exact release artifact with an isolated native state directory:
+
+- cold cache miss: 169 ms, bounded `cache warming` result
+- exactly one detached `frontload-build` process started
+- cache ready after ~12 seconds
+- cache size: 1,630,764 bytes
+- cache-hit benchmark, n=12:
+  - average 131.0 ms
+  - p50 107.4 ms
+  - p95-ish 188.4 ms
+  - max 384.6 ms
+  - context bytes: 1,022
+- selected the live `open_session` declaration in `modules/systray/k3s_dispatch.py` and re-read current working-tree source for the excerpt
+- every cache-hit measurement stays below the 600 ms server timeout and 650 ms UserPromptSubmit deadline
+- SessionStart prewarm is included in this exact accepted SHA so cache construction normally begins before the first structural user prompt
+
+Integration:
+
+- current QuietContext main had only generated-bundle movement after the accepted source
+- accepted `64b726a2...` was merged with that current main without runtime-source overlap
+- integrated head is `94f0ddfcf7710436b58b70423ec2422deb96a60c`; `64b726a2...` remains an ancestor
+
 ## Definition of done
 
 Complete only when the front-load/explore implementation is accepted, landed to QC main, pinned/landed in Overdeck, deployed locally, and a live structural-prompt canary proves QC context is supplied automatically while non-structural prompts remain untouched.
