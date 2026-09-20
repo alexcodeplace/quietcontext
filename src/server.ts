@@ -1776,8 +1776,10 @@ registerQuietTool(
         pathTo = semanticTarget.slice(split + 4).trim();
       }
       const isFrontload = action === "frontload";
-      const request = isFrontload || action === "explore"
-        ? { action: "explore" as const, query: String(target), root: projectRoot }
+      const request = isFrontload
+        ? { action: "frontload" as const, query: String(target), root: projectRoot }
+        : action === "explore"
+          ? { action: "explore" as const, query: String(target), root: projectRoot }
         : action === "map"
           ? { action: "map" as const, root: projectRoot }
         : action === "symbol"
@@ -1789,13 +1791,9 @@ registerQuietTool(
               : action === "path"
                 ? { action: "path" as const, from: String(pathFrom), to: String(pathTo), root: projectRoot, maxDepth: depth, maxNodes: max_nodes }
                 : { action, query: String(semanticTarget), root: projectRoot, file: semanticFile, depth, maxNodes: max_nodes };
-      const nativeEnv = isFrontload
-        ? { ...process.env, QUIET_CONTEXT_REPOMAP_DAEMON_ONLY: "1" }
-        : process.env;
       const receipt = await repoQcNative(request, {
         cwd: projectRoot,
-        timeoutMs: isFrontload ? 1_200 : 5_000,
-        env: nativeEnv,
+        timeoutMs: isFrontload ? 600 : 5_000,
       });
       const text = receipt.exitCode === 0 ? receipt.stdout : receipt.stderr || receipt.stdout;
       return trackResponse("repo", {

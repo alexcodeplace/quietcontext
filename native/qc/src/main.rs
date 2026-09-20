@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const NATIVE_PROTOCOL_VERSION: u32 = 2;
 
@@ -44,6 +45,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RepoAction {
+    Frontload {
+        query: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     Explore {
         query: String,
         #[arg(long)]
@@ -427,6 +433,7 @@ fn repo(action: RepoAction) {
                 ),
             }
         }
+        RepoAction::Frontload { query, root } => frontload_repo(query, root, &cfg.map),
         RepoAction::Explore { query, root } => lookup_repo(repomap_protocol::LookupOperation::Explore, Some(query), None, root, None, None, None, &cfg.map),
         RepoAction::Map { root } => lookup_repo(repomap_protocol::LookupOperation::Map, None, None, root, None, None, None, &cfg.map),
         RepoAction::Symbol { query, root } => lookup_repo(repomap_protocol::LookupOperation::Sym, Some(query), None, root, None, None, None, &cfg.map),
@@ -440,6 +447,41 @@ fn repo(action: RepoAction) {
     }
 }
 
+fn frontload_repo(query: String, root: Option<PathBuf>, map_cfg: &config::MapConfig) {
+    let root = match canonical_root(root) {
+        Ok(root) => root,
+        Err(error) => return repo_error("frontload", "", Some(query), error),
+    };
+    let started = Instant::now();
+    let result = repomap::build_frontload_direct(&query, &root, map_cfg);
+    let elapsed = started.elapsed();
+    let (stdout, stderr, exit_code) = match result {
+        Ok(Some(stdout)) => (stdout, String::new(), 0),
+        Ok(None) => (String::new(), String::new(), 0),
+        Err(error) => (String::new(), format!("qc repo frontload: {error}\n"), 1),
+    };
+    let total_us = elapsed.as_micros().min(u32::MAX as u128) as u32;
+    print_json(&RepoReceipt {
+        protocol_version: NATIVE_PROTOCOL_VERSION,
+        native_version: env!("CARGO_PKG_VERSION"),
+        kind: "repo",
+        operation: "frontload".to_owned(),
+        root: root.to_string_lossy().into_owned(),
+        query: Some(query),
+        stdout,
+        stderr,
+        exit_code,
+        generation: 0,
+        cache_state: "bypassed".to_owned(),
+        fallback_reason: None,
+        timings: repomap_protocol::LookupTimings {
+            render_us: total_us,
+            total_us,
+            ..repomap_protocol::LookupTimings::default()
+        },
+        total_latency_us: elapsed.as_micros().min(u64::MAX as u128) as u64,
+    });
+}
 fn lookup_repo(
     operation: repomap_protocol::LookupOperation,
     query: Option<String>,
