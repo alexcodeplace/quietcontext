@@ -2070,7 +2070,7 @@ impl Daemon {
             LookupOperation::Path => repomap::build_path(query.unwrap_or_default(), request.secondary_query.as_deref().unwrap_or_default(), request.depth.unwrap_or(8), request.max_nodes.unwrap_or(200), &index, &config),
         };
 
-        if request.operation.is_semantic()
+        if (request.operation.is_semantic() || request.operation == LookupOperation::Refs)
             && result.is_ok()
             && self.enforce_logical_budget_after_growth(&id).is_err()
         {
@@ -2083,7 +2083,7 @@ impl Daemon {
                 request.operation,
                 query,
                 Err(repomap::ScanError::Index(
-                    "semantic index exceeds daemon logical memory budget".to_owned(),
+                    "lazy repository index exceeds daemon logical memory budget".to_owned(),
                 )),
                 status,
                 index.generation(),

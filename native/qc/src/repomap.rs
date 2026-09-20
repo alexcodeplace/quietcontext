@@ -753,7 +753,7 @@ pub(crate) fn build_refs(name: &str, snapshot: &SourceIndex, cfg: &MapConfig) ->
 
     let mut matches_by_file = std::collections::BTreeMap::<String, Vec<RefLine>>::new();
     if identifier_chars(name) {
-        if let Some(postings) = snapshot.verified_references(name) {
+        if let Some(postings) = snapshot.verified_references(name)? {
             for posting in postings {
                 matches_by_file
                     .entry(posting.relative_path)

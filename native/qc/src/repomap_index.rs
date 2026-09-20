@@ -1,5 +1,5 @@
 use crate::config::MapConfig;
-use crate::outline::{self, Decl, Family};
+use crate::outline::{self, Family};
 use crate::semantic::SemanticGraph;
 use crate::semantic_extract::{self, ExtractedFile};
 use ignore::WalkBuilder;
@@ -215,6 +215,7 @@ pub struct DeclarationPosting {
     pub relative_path: String,
     pub line_no: usize,
     pub rendered: String,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,7 +352,7 @@ pub struct SourceIndex {
     path_dispositions: Arc<[PathDispositionRecord]>,
     map_summaries: Arc<[MapSummary]>,
     declarations_by_name: Arc<BTreeMap<String, Arc<[DeclarationPosting]>>>,
-    identifier_refs: Arc<BTreeMap<String, Arc<[ReferenceCoordinate]>>>,
+    identifier_refs: Arc<OnceLock<Result<Arc<BTreeMap<String, Arc<[ReferenceCoordinate]>>>, ScanError>>>,
     semantic_graph: Arc<OnceLock<Result<Arc<SemanticGraph>, ScanError>>>,
     diagnostics: WalkDiagnostics,
     truncated: bool,
@@ -389,8 +390,14 @@ impl SourceIndex {
                 .iter()
                 .map(SourceRecord::semantic_facts_logical_bytes)
                 .fold(0usize, usize::saturating_add);
+            let reference_bytes = self
+                .identifier_refs
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, |refs| frozen_reference_index_logical_bytes(refs));
             let observed_bytes = self
                 .logical_bytes
+                .saturating_add(reference_bytes)
                 .saturating_add(fact_bytes)
                 .saturating_add(graph.logical_bytes());
             if observed_bytes > MAX_LOGICAL_INDEX_BYTES {
@@ -411,13 +418,56 @@ impl SourceIndex {
         self.declarations_by_name.get(name).map(AsRef::as_ref)
     }
 
-    pub fn verified_references(&self, query: &str) -> Option<Vec<ReferencePosting>> {
+    fn identifier_refs(&self) -> Result<&BTreeMap<String, Arc<[ReferenceCoordinate]>>, ScanError> {
+        let result = self.identifier_refs.get_or_init(|| {
+            let mut refs: BTreeMap<String, Vec<ReferenceCoordinate>> = BTreeMap::new();
+            for (source_index, file) in self.files.iter().enumerate() {
+                let source_index = u32::try_from(source_index).map_err(|_| ScanError::TooLarge)?;
+                for line_metadata in file.lines.iter() {
+                    let Some(line) = source_line(file, line_metadata.line_no) else {
+                        continue;
+                    };
+                    let tokens: BTreeSet<String> = identifier_tokens(line).into_iter().collect();
+                    for token in tokens {
+                        let line_no = u32::try_from(line_metadata.line_no).map_err(|_| ScanError::TooLarge)?;
+                        refs.entry(token)
+                            .or_default()
+                            .push(ReferenceCoordinate { source_index, line_no });
+                    }
+                }
+            }
+            let ref_bytes = reference_index_logical_bytes(&refs);
+            let observed_bytes = self.dynamic_logical_bytes_without_refs().saturating_add(ref_bytes);
+            if observed_bytes > MAX_LOGICAL_INDEX_BYTES {
+                return Err(ScanError::TooLarge);
+            }
+            if observed_bytes > self.max_index_bytes {
+                return Err(ScanError::BoundsExceeded {
+                    max_bytes: self.max_index_bytes,
+                    observed_bytes,
+                });
+            }
+            let frozen = refs
+                .into_iter()
+                .map(|(token, postings)| (token, Arc::<[ReferenceCoordinate]>::from(postings)))
+                .collect();
+            Ok(Arc::new(frozen))
+        });
+        result.as_deref().map_err(Clone::clone)
+    }
+
+    pub fn verified_references(&self, query: &str) -> Result<Option<Vec<ReferencePosting>>, ScanError> {
         if !identifier_chars(query) {
-            return None;
+            return Ok(None);
         }
-        let postings = self.identifier_refs.get(query)?;
-        let regex = reference_regex(query)?;
-        Some(
+        let refs = self.identifier_refs()?;
+        let Some(postings) = refs.get(query) else {
+            return Ok(None);
+        };
+        let Some(regex) = reference_regex(query) else {
+            return Ok(None);
+        };
+        Ok(Some(
             postings
                 .iter()
                 .filter_map(|posting| {
@@ -432,7 +482,7 @@ impl SourceIndex {
                     })
                 })
                 .collect(),
-        )
+        ))
     }
 
     pub fn diagnostics(&self) -> &WalkDiagnostics {
@@ -447,7 +497,7 @@ impl SourceIndex {
         self.generation
     }
 
-    pub fn logical_bytes(&self) -> usize {
+    fn dynamic_logical_bytes_without_refs(&self) -> usize {
         let fact_bytes = self
             .files
             .iter()
@@ -461,6 +511,16 @@ impl SourceIndex {
         self.logical_bytes
             .saturating_add(fact_bytes)
             .saturating_add(semantic_bytes)
+    }
+
+    pub fn logical_bytes(&self) -> usize {
+        let reference_bytes = self
+            .identifier_refs
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .map_or(0, |refs| frozen_reference_index_logical_bytes(refs));
+        self.dynamic_logical_bytes_without_refs()
+            .saturating_add(reference_bytes)
     }
 
     #[cfg(test)]
@@ -1035,6 +1095,7 @@ fn source_record(
             relative_path: relative_path.clone(),
             line_no: decl.line_no,
             rendered: decl.rendered.clone(),
+            name: decl.name.clone(),
         })
         .collect::<Vec<_>>();
     (
@@ -1156,6 +1217,7 @@ fn build_index(
                         relative_path: rel.clone(),
                         line_no: decl.line_no,
                         rendered: decl.rendered.clone(),
+                        name: decl.name.clone(),
                     })
                     .collect();
                 files.push(SourceRecord {
@@ -1252,6 +1314,27 @@ fn reference_index_logical_bytes(
     bytes
 }
 
+fn frozen_reference_index_logical_bytes(
+    identifier_refs: &BTreeMap<String, Arc<[ReferenceCoordinate]>>,
+) -> usize {
+    let mut bytes = std::mem::size_of::<BTreeMap<String, Arc<[ReferenceCoordinate]>>>();
+    for (token, postings) in identifier_refs {
+        size_add(
+            &mut bytes,
+            std::mem::size_of::<(String, Arc<[ReferenceCoordinate]>)>(),
+        );
+        size_add(&mut bytes, token.capacity());
+        size_add(&mut bytes, std::mem::size_of::<[usize; 2]>());
+        size_add(
+            &mut bytes,
+            postings
+                .len()
+                .saturating_mul(std::mem::size_of::<ReferenceCoordinate>()),
+        );
+    }
+    bytes
+}
+
 fn context_logical_bytes(context: &IgnoreContextKey) -> usize {
     let mut bytes = context
         .home
@@ -1302,7 +1385,6 @@ fn assemble_index(
     });
     let mut map_summaries = Vec::with_capacity(files.len());
     let mut declarations_by_name: BTreeMap<String, Vec<DeclarationPosting>> = BTreeMap::new();
-    let mut identifier_refs: BTreeMap<String, Vec<ReferenceCoordinate>> = BTreeMap::new();
     let mut logical_bytes = std::mem::size_of::<SourceIndex>();
     size_add(
         &mut logical_bytes,
@@ -1318,12 +1400,11 @@ fn assemble_index(
     for path in &scan_inputs.dependency_parents {
         size_add(&mut logical_bytes, path.as_os_str().len());
     }
-    for (source_index, file) in files.iter().enumerate() {
-        let source_index = u32::try_from(source_index).map_err(|_| ScanError::TooLarge)?;
-        let declarations: Vec<Decl> = outline::decls_in(&file.source, file.family);
-        let names: Vec<String> = declarations
+    for file in files.iter() {
+        let names: Vec<String> = file
+            .declarations
             .iter()
-            .filter_map(|decl| decl.name.clone())
+            .filter_map(|posting| posting.name.clone())
             .collect();
         let mut summary_bytes = file
             .relative_path
@@ -1337,32 +1418,15 @@ fn assemble_index(
         map_summaries.push(MapSummary {
             relative_path: file.relative_path.clone(),
             line_count: file.source.lines().count(),
-            declaration_count: declarations.len(),
+            declaration_count: file.declarations.len(),
             names,
         });
-        for (posting, declaration) in file.declarations.iter().zip(declarations.iter()) {
-            if let Some(name) = declaration.name.clone() {
+        for posting in file.declarations.iter() {
+            if let Some(name) = posting.name.clone() {
                 declarations_by_name
                     .entry(name)
                     .or_default()
                     .push(posting.clone());
-            }
-        }
-        for line_metadata in file.lines.iter() {
-            let Some(line) = source_line(file, line_metadata.line_no) else {
-                continue;
-            };
-            let tokens: BTreeSet<String> = identifier_tokens(line).into_iter().collect();
-            for token in tokens {
-                let line_no =
-                    u32::try_from(line_metadata.line_no).map_err(|_| ScanError::TooLarge)?;
-                identifier_refs
-                    .entry(token)
-                    .or_default()
-                    .push(ReferenceCoordinate {
-                        source_index,
-                        line_no,
-                    });
             }
         }
         size_add(&mut logical_bytes, file.source.len());
@@ -1381,6 +1445,7 @@ fn assemble_index(
                     .relative_path
                     .len()
                     .saturating_add(posting.rendered.len())
+                    .saturating_add(posting.name.as_ref().map_or(0, String::len))
                     .saturating_add(std::mem::size_of::<DeclarationPosting>()),
             );
         }
@@ -1394,10 +1459,6 @@ fn assemble_index(
                 .saturating_add(std::mem::size_of::<PathDispositionRecord>()),
         );
     }
-    size_add(
-        &mut logical_bytes,
-        reference_index_logical_bytes(&identifier_refs),
-    );
     if logical_bytes > MAX_LOGICAL_INDEX_BYTES {
         return Err(ScanError::TooLarge);
     }
@@ -1411,10 +1472,6 @@ fn assemble_index(
         .into_iter()
         .map(|(name, postings)| (name, postings.into()))
         .collect();
-    let identifier_refs = identifier_refs
-        .into_iter()
-        .map(|(token, postings)| (token, postings.into()))
-        .collect();
     let root = RootKey {
         canonical_root: scan_inputs.canonical_root.clone(),
         identity: scan_inputs.root_identity,
@@ -1427,7 +1484,7 @@ fn assemble_index(
         path_dispositions: dispositions.into(),
         map_summaries: map_summaries.into(),
         declarations_by_name: Arc::new(declarations_by_name),
-        identifier_refs: Arc::new(identifier_refs),
+        identifier_refs: Arc::new(OnceLock::new()),
         semantic_graph: Arc::new(OnceLock::new()),
         diagnostics,
         truncated,
@@ -1831,7 +1888,14 @@ mod tests {
             ["a.rs", "z.rs"]
         );
         assert_eq!(index.declarations("target").expect("decls").len(), 2);
-        assert_eq!(index.verified_references("target").expect("refs").len(), 3);
+        assert_eq!(
+            index
+                .verified_references("target")
+                .expect("reference index")
+                .expect("refs")
+                .len(),
+            3
+        );
         assert_eq!(index.generation(), 1);
         assert!(index.logical_bytes() >= 45);
         std::fs::remove_dir_all(root).ok();
@@ -2034,6 +2098,60 @@ export function run(){ target(); }
     }
 
     #[test]
+    fn structural_scan_keeps_reference_index_lazy_until_requested() {
+        let root = temp_root();
+        write_file(
+            &root,
+            "main.rs",
+            b"pub fn target() {}\nfn caller() { target(); }\n",
+        );
+        let index = scan_root(&root, &config(10, 1024)).expect("scan");
+        let structural_bytes = index.logical_bytes();
+
+        assert!(index.identifier_refs.get().is_none());
+        assert_eq!(index.declarations("target").expect("decls").len(), 1);
+        assert_eq!(index.map_summaries().len(), 1);
+        assert!(index.identifier_refs.get().is_none());
+        assert_eq!(index.logical_bytes(), structural_bytes);
+
+        let refs = index
+            .verified_references("target")
+            .expect("reference index")
+            .expect("refs");
+        assert_eq!(refs.len(), 2);
+        assert!(index.identifier_refs.get().is_some());
+        assert!(index.logical_bytes() > structural_bytes);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lazy_reference_index_respects_post_publication_byte_bound() {
+        let root = temp_root();
+        let mut source = String::from("pub fn target() {}\n");
+        for _ in 0..256 {
+            source.push_str("fn caller() { target(); target(); }\n");
+        }
+        write_file(&root, "main.rs", source.as_bytes());
+
+        let base_cfg = config(10, source.len() + 1);
+        let probe = scan_root(&root, &base_cfg).expect("probe scan");
+        let structural_bytes = probe.logical_bytes();
+        assert!(probe.identifier_refs.get().is_none());
+
+        let mut bounded_cfg = base_cfg.clone();
+        bounded_cfg.max_index_bytes = structural_bytes.saturating_add(1);
+        let index = scan_root(&root, &bounded_cfg).expect("bounded structural scan");
+        assert_eq!(index.logical_bytes(), structural_bytes);
+        assert!(matches!(
+            index.verified_references("target"),
+            Err(ScanError::BoundsExceeded { .. })
+        ));
+        assert!(index.identifier_refs.get().is_some());
+        assert_eq!(index.logical_bytes(), structural_bytes);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn verified_reference_postings_keep_ascii_boundary_rules() {
         let root = temp_root();
         write_file(
@@ -2042,11 +2160,16 @@ export function run(){ target(); }
             b"let $foo = 1;\nlet foo = 2;\nlet prefixfoo = 3;\nlet foobar = 4;\n",
         );
         let index = scan_root(&root, &config(10, 1024)).expect("scan");
-        let postings = index.verified_references("foo").expect("refs");
+        assert!(index.identifier_refs.get().is_none());
+        let postings = index
+            .verified_references("foo")
+            .expect("reference index")
+            .expect("refs");
         assert_eq!(postings.len(), 1);
         assert_eq!(postings[0].line_no, 2);
-        assert!(index.verified_references("not-found").is_none());
-        assert!(index.verified_references("foo-").is_none());
+        assert!(index.identifier_refs.get().is_some());
+        assert!(index.verified_references("not-found").expect("reference index").is_none());
+        assert!(index.verified_references("foo-").expect("invalid identifier").is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2058,7 +2181,15 @@ export function run(){ target(); }
         let source = repeated_line.repeat(4096);
         write_file(&root, relative_path, source.as_bytes());
         let index = scan_root(&root, &config(10, source.len() + 1)).expect("scan");
-        let postings = index.identifier_refs.get("target").expect("postings");
+        assert!(index.identifier_refs.get().is_none());
+        index.verified_references("target").expect("reference index");
+        let refs = index
+            .identifier_refs
+            .get()
+            .expect("reference index cell")
+            .as_ref()
+            .expect("reference index");
+        let postings = refs.get("target").expect("postings");
         let coordinate_bytes = postings.len() * std::mem::size_of::<ReferenceCoordinate>();
         let duplicated_payload_bytes =
             postings.len() * (relative_path.len() + repeated_line.trim_end().len());
@@ -2083,7 +2214,7 @@ export function run(){ target(); }
         let index = scan_root(&root, &config(10, 1024)).expect("scan");
 
         assert_eq!(
-            index.verified_references("target"),
+            index.verified_references("target").expect("reference index"),
             Some(vec![
                 ReferencePosting {
                     relative_path: "a.rs".to_owned(),
