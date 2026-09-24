@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "1.1.0-rc.3",
+  "nativeVersion": "0.1.0",
+  "protocolVersion": 2,
+  "platform": "linux",
+  "arch": "x64",
+  "sha256": "b030e8e819b8a5d46c688d2d4bd0aab97f06c190259216166138ab3eb5558e03"
+}
