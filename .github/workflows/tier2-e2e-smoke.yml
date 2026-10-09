@@ -97,13 +97,6 @@ jobs:
           PI_MAX_TOKENS: "2000"
         run: bash scripts/tier2-smoke/run-pi-smoke.sh
 
-      - name: Upload Pi logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tier2-pi-logs
-          path: ${{ runner.temp }}/tier2-smoke-pi/
-          if-no-files-found: ignore
 
   claude-code:
     if: contains(github.event.inputs.host, 'claude-code') || github.event.inputs.host == 'all'

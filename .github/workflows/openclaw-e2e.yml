@@ -99,27 +99,3 @@ jobs:
         env:
           OPENCLAW_HOME: ${{ github.workspace }}
           QUIET_CONTEXT_SESSION_SUFFIX: ""
-
-      - name: Upload session DBs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: session-dbs-${{ matrix.os }}
-          path: ~/.openclaw/context-mode/sessions/
-          if-no-files-found: ignore
-
-      - name: Upload OpenClaw logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: openclaw-logs-${{ matrix.os }}
-          path: ${{ env.OPENCLAW_STATE_DIR }}/logs/
-          if-no-files-found: ignore
-
-      - name: Upload test output on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-output-${{ matrix.os }}
-          path: ${{ runner.temp }}/e2e-output.log
-          if-no-files-found: ignore
