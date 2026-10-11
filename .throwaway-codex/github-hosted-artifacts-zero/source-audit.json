@@ -1,0 +1,21 @@
+{
+  "source_sha": "c7028424b0cf79f92421f4365b48be9d2662442b",
+  "git_diff_check": 0,
+  "github_producers_or_consumers": [
+    {
+      "path": ".github/workflows/release.yml",
+      "line": 64,
+      "text": "- uses: actions/upload-artifact@v4"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "line": 80,
+      "text": "- uses: actions/download-artifact@v4"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "line": 84,
+      "text": "- uses: actions/download-artifact@v4"
+    }
+  ]
+}

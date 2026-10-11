@@ -1,0 +1,27 @@
+{
+  "repository": "quietmode",
+  "implementation_sha": "c7028424b0cf79f92421f4365b48be9d2662442b",
+  "source_audit": "/home/user/Projects/quietmode/.worktrees/github-hosted-artifacts-zero-20261009/.throwaway-codex/github-hosted-artifacts-zero/source-audit.json",
+  "git_diff_check": 0,
+  "hosted_action_references_remaining": [
+    {
+      "path": ".github/workflows/release.yml",
+      "line": 64,
+      "text": "- uses: actions/upload-artifact@v4"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "line": 80,
+      "text": "- uses: actions/download-artifact@v4"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "line": 84,
+      "text": "- uses: actions/download-artifact@v4"
+    }
+  ],
+  "full_application_or_release_suite": "not run by this diagnostic-removal leaf; existing landing gates remain required",
+  "verification_kind": "source review of pure YAML diagnostic-step removal",
+  "tests": null,
+  "runtime_execution": "not needed for these reversible YAML-only edits; no matching pre-existing source contract found, and no new mirror test was added"
+}
